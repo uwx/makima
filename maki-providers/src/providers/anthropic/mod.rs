@@ -503,6 +503,8 @@ struct ApiModelInfo {
 #[derive(Deserialize)]
 struct ModelsPage {
     data: Vec<ApiModelInfo>,
+    /// OpenAI-shaped `/v1/models` replies (older LiteLLM) omit it: one page.
+    #[serde(default)]
     has_more: bool,
     last_id: Option<String>,
 }
@@ -1006,6 +1008,17 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         assert!(model.id.ends_with(shared::LONG_CONTEXT_SUFFIX));
         // The API has never heard of `-1m`, so strip it before sending.
         assert_eq!(shared::strip_long_context(&model.id), "claude-opus-4-8");
+    }
+
+    #[test]
+    fn models_page_without_has_more_is_one_page() {
+        let page: ModelsPage = serde_json::from_str(
+            r#"{"object": "list", "data": [{"id": "claude-opus-5", "object": "model"}]}"#,
+        )
+        .unwrap();
+
+        assert!(!page.has_more);
+        assert_eq!(page.data[0].id, "claude-opus-5");
     }
 
     #[test]
