@@ -14,6 +14,9 @@ check *ARGS:
 run *ARGS:
     cargo run {{ARGS}}
 
+install *ARGS:
+    cargo install --locked --path . {{ARGS}}
+
 test *ARGS:
     cargo nextest run --workspace {{ARGS}}
 
