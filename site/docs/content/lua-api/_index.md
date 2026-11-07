@@ -2513,6 +2513,32 @@ if not maki.env.no_project() then
 end
 ```
 
+---
+
+### `maki.env.shell()` {#maki-env-shell}
+
+```lua
+maki.env.shell()
+```
+
+Which shell `maki.fn.jobstart` and the `bash` tool run on Windows:
+`"bash"`, `"cmd"` or `"powershell"`. Always `"bash"` elsewhere.
+
+A plugin that builds command text should match this: quoting, syntax
+highlighting and command parsing all follow the shell that will run it.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Returns:** (`string`) The shell name.
+
+**Example:**
+
+```lua
+if maki.env.shell() ~= "bash" then
+  return { llm_output = "this tool needs bash", is_error = true }
+end
+```
+
 
 ## maki.fn {#maki-fn}
 
@@ -2535,8 +2561,9 @@ maki.fn.jobstart({cmd}, {opts?})
 ```
 
 Run a shell command in the background. The command runs through
-`bash -c` on Unix or `cmd /C` on Windows. You get back a job id
-that you can pass to `jobstop` or `jobwait` to control the process.
+`bash -c` on Unix, and on Windows through whatever `agent.shell` selects
+(Git Bash by default). You get back a job id that you can pass to
+`jobstop` or `jobwait` to control the process.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 

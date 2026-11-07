@@ -50,6 +50,7 @@ pub mod session_checkpoint;
 pub mod session_coordinator;
 pub mod session_defaults;
 pub mod session_options;
+pub mod shell;
 pub mod template;
 pub mod tools;
 pub use tools::ToolFilter;

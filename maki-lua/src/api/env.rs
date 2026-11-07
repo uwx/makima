@@ -73,6 +73,26 @@ fn no_project(lua: &Lua) -> mlua::Result<bool> {
     Ok(lua.app_data_ref::<NoProject>().is_some())
 }
 
+/// Which shell `maki.fn.jobstart` and the `bash` tool run on Windows:
+/// `"bash"`, `"cmd"` or `"powershell"`. Always `"bash"` elsewhere.
+///
+/// A plugin that builds command text should match this: quoting, syntax
+/// highlighting and command parsing all follow the shell that will run it.
+///
+/// @return (string) The shell name.
+/// @example
+/// if maki.env.shell() ~= "bash" then
+///   return { llm_output = "this tool needs bash", is_error = true }
+/// end
+#[lua_fn(guard = Env)]
+fn shell(lua: &Lua) -> mlua::Result<&'static str> {
+    let shell = lua
+        .app_data_ref::<maki_config::Shell>()
+        .map(|shell| *shell)
+        .unwrap_or_default();
+    Ok(maki_agent::shell::name(shell))
+}
+
 lua_table! {
     /// Paths to makima's own directories (config, state, logs), and whether
     /// the project's `.makima` directory is off limits.
@@ -83,6 +103,24 @@ lua_table! {
     /// local cfg = maki.env.config_dir()
     /// ```
     "maki.env" => pub(crate) fn create_env_table(perms: &PluginPermissions), DOCS [
-        state_dir(perms), config_dir(perms), logs_dir(perms), no_project(perms),
+        state_dir(perms), config_dir(perms), logs_dir(perms), no_project(perms), shell(perms),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_reflects_the_configured_value() {
+        let lua = Lua::new();
+        assert_eq!(shell(&lua).unwrap(), "bash");
+        #[cfg(windows)]
+        {
+            lua.set_app_data(maki_config::Shell::Cmd);
+            assert_eq!(shell(&lua).unwrap(), "cmd");
+            lua.set_app_data(maki_config::Shell::Powershell);
+            assert_eq!(shell(&lua).unwrap(), "powershell");
+        }
+    }
 }
