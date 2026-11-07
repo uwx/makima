@@ -236,6 +236,12 @@ maki.setup({
 })
 ```
 
+### `plugins.autosleep`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `idle_secs` | integer | `120` | 5 | Seconds every makima instance must stay idle before the machine sleeps. |
+
 ### `plugins.bash`
 
 | Field | Type | Default | Min | Description |

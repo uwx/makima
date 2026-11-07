@@ -43,6 +43,7 @@ Bundled Lua plugins register these commands at startup. Plugin commands have hig
 | Command | Description | Mode | Arguments | Frontends |
 |---------|-------------|------|-----------|-----------|
 | `/automode` | Toggle bash auto mode (classifier gates every bash command) | none |  | all |
+| `/autosleep` | Sleep the machine once every makima instance finishes working | none |  | TUI only |
 | `/build` | Switch to build mode (full tool access) | none |  | all |
 | `/inherit` | Import rules, skills, MCP servers, memories and conversations left by other coding harnesses | raw (optional) |  | TUI only |
 | `/memory` | View, edit, and delete memory files | none |  | TUI only |
