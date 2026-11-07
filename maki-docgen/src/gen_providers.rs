@@ -393,6 +393,10 @@ fn format_auth(kind: ProviderKind) -> String {
         format!("`OLLAMA_HOST` for local/remote (e.g. `http://localhost:11434`), `{env}` for auth")
     } else if kind == ProviderKind::Aperture {
         "`APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)".into()
+    } else if kind == ProviderKind::CliproxyApi {
+        format!(
+            "`CLIPROXYAPI_BASE_URL` (default `http://127.0.0.1:8317`), `{env}` if your deployment sets one"
+        )
     } else {
         format!("`{env}`")
     }
@@ -521,6 +525,13 @@ fn no_catalog_note(kind: ProviderKind) -> &'static str {
         ProviderKind::Aperture => {
             "Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture \
              endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth."
+        }
+        ProviderKind::CliproxyApi => {
+            "CLIProxyAPI is a local gateway that serves every upstream account you have wired into it \
+             over one OpenAI-compatible endpoint. Start it, run `makima auth login cliproxyapi`, and \
+             the model list comes from the gateway itself: context windows, vision and the reasoning \
+             levels each model advertises. Any model id it serves works, e.g. \
+             `cliproxyapi/claude-sonnet-4-5-20250929` or `cliproxyapi/glm-5.3-flash`."
         }
         ProviderKind::OpenRouter => {
             "OpenRouter aggregates models from many providers behind a single API key. \

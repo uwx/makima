@@ -24,6 +24,7 @@ use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, S
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
 use super::aperture::Aperture;
+use super::cliproxyapi::CliproxyApi;
 use super::copilot::Copilot;
 use super::deepseek::DeepSeek;
 use super::google::Google;
@@ -612,6 +613,10 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
         ),
         ProviderKind::Aperture => Box::new(
             Aperture::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
+        ProviderKind::CliproxyApi => Box::new(
+            CliproxyApi::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
     };

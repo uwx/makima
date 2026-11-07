@@ -1,8 +1,8 @@
 use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::providers::{
-    anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
-    openai, openrouter, regolo, requesty, synthetic, tensorx, vertex, zai,
+    anthropic, aperture, cliproxyapi, copilot, custom, deepseek, dynamic, google, llama_cpp,
+    mistral, ollama, openai, openrouter, regolo, requesty, synthetic, tensorx, vertex, zai,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -236,6 +236,18 @@ const APERTURE: ProviderManifest = ProviderManifest {
     pricing_schedule: None,
 };
 
+const CLIPROXYAPI: ProviderManifest = ProviderManifest {
+    slug: "cliproxyapi",
+    display_name: "CLIProxyAPI",
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: None,
+    fallback_context_window: 128_000,
+    models: cliproxyapi::models(),
+    pricing_schedule: None,
+};
+
 const BUILTINS: &[ProviderManifest] = &[
     ANTHROPIC,
     OPENAI,
@@ -255,6 +267,7 @@ const BUILTINS: &[ProviderManifest] = &[
     OPENCODE,
     OPENCODE_GO,
     APERTURE,
+    CLIPROXYAPI,
 ];
 
 pub struct ManifestRegistry;

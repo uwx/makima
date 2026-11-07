@@ -340,6 +340,14 @@ The default is `false`.
 
 Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
 
+### CLIProxyAPI
+
+- **Env var**: `CLIPROXYAPI_BASE_URL` (default `http://127.0.0.1:8317`), `CLIPROXYAPI_API_KEY` if your deployment sets one
+- **API**: `http://127.0.0.1:8317/v1 (set CLIPROXYAPI_BASE_URL)`
+- **Features**: Local CLIProxyAPI gateway: its whole model catalog behind one key, with live context windows, vision and reasoning levels
+
+CLIProxyAPI is a local gateway that serves every upstream account you have wired into it over one OpenAI-compatible endpoint. Start it, run `makima auth login cliproxyapi`, and the model list comes from the gateway itself: context windows, vision and the reasoning levels each model advertises. Any model id it serves works, e.g. `cliproxyapi/claude-sonnet-4-5-20250929` or `cliproxyapi/glm-5.3-flash`.
+
 ### Opencode Go
 
 - **Env var**: `OPENCODE_API_KEY`
@@ -510,7 +518,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo`, `tensorx`, `opencode`, `aperture`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo`, `tensorx`, `opencode`, `aperture`, `cliproxyapi`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

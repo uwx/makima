@@ -72,6 +72,7 @@ TODO
 * OpenCode Zen - `OPENCODE_API_KEY`, or the free `public` key for zero-cost models. Models from the models.dev catalog.
 * OpenCode Go - `OPENCODE_API_KEY`. Models from the models.dev catalog.
 * Aperture - `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
+* CLIProxyAPI - a local gateway over your existing subscriptions. Set `CLIPROXYAPI_BASE_URL` (default `http://127.0.0.1:8317`) and `CLIPROXYAPI_API_KEY` if the gateway sets one.
 
 **Dynamic providers** - drop an executable script into `~/.config/makima/providers/` to add custom providers or proxies. See [docs](https://makima.ln4.net/docs/providers/#dynamic-providers) for details.
 

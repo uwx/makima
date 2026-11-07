@@ -20,6 +20,7 @@ use crate::providers::aperture::Aperture;
 use crate::providers::catalog::{
     OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
+use crate::providers::cliproxyapi::CliproxyApi;
 use crate::providers::copilot::Copilot;
 use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
@@ -62,6 +63,8 @@ pub enum ProviderKind {
     #[strum(serialize = "opencode")]
     Opencode,
     Aperture,
+    #[strum(serialize = "cliproxyapi")]
+    CliproxyApi,
 }
 
 impl ProviderKind {
@@ -84,6 +87,7 @@ impl ProviderKind {
             Self::TensorX => "TensorX",
             Self::Opencode => "Opencode Zen",
             Self::Aperture => "Aperture",
+            Self::CliproxyApi => "CLIProxyAPI",
         }
     }
 
@@ -106,6 +110,7 @@ impl ProviderKind {
             Self::TensorX => "TENSORX_API_KEY",
             Self::Opencode => "OPENCODE_API_KEY",
             Self::Aperture => "",
+            Self::CliproxyApi => "CLIPROXYAPI_API_KEY",
         }
     }
 
@@ -130,6 +135,7 @@ impl ProviderKind {
             Self::TensorX => "https://api.tensorx.ai/v1",
             Self::Opencode => "https://opencode.ai/zen/v1",
             Self::Aperture => "Aperture gateway (set APERTURE_HOST)",
+            Self::CliproxyApi => "http://127.0.0.1:8317/v1 (set CLIPROXYAPI_BASE_URL)",
         }
     }
 
@@ -169,6 +175,9 @@ impl ProviderKind {
             Self::Aperture => Some(
                 "Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml",
             ),
+            Self::CliproxyApi => Some(
+                "Local CLIProxyAPI gateway: its whole model catalog behind one key, with live context windows, vision and reasoning levels",
+            ),
             _ => None,
         }
     }
@@ -191,6 +200,7 @@ impl ProviderKind {
             Self::TensorX => ModelFamily::Generic,
             Self::Opencode => ModelFamily::Generic,
             Self::Aperture => ModelFamily::Generic,
+            Self::CliproxyApi => ModelFamily::Generic,
         }
     }
 
@@ -217,6 +227,7 @@ impl ProviderKind {
             Self::TensorX => None,
             Self::Opencode => Some(128_000),
             Self::Aperture => Some(16_384),
+            Self::CliproxyApi => None,
         }
     }
 
@@ -238,6 +249,7 @@ impl ProviderKind {
             Self::TensorX => 200_000,
             Self::Opencode => 256_000,
             Self::Aperture => 128_000,
+            Self::CliproxyApi => 128_000,
         }
     }
 
@@ -266,6 +278,7 @@ impl ProviderKind {
             Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
             Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
+            Self::CliproxyApi => Ok(Box::new(CliproxyApi::new(timeouts)?)),
         }
     }
 }
