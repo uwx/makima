@@ -505,11 +505,24 @@ maki.api.register_command({
   name = "/inherit",
   description = "Import rules, skills, MCP servers, memories and conversations left by other coding harnesses",
   tui_only = true,
-  arguments = { raw = true },
+  arguments = {
+    {
+      name = "subcommand",
+      type = "string",
+      optional = true,
+      completion = {
+        items = {
+          { label = "all", insertion = "all", description = "Import every kind at once" },
+          { label = "conversations", insertion = "conversations", description = "Import every chat on the machine" },
+          { label = "import-mcp", insertion = "import-mcp", description = "Append MCP servers to mcp.toml" },
+        },
+      },
+    },
+  },
   handler = function(opts, ctx)
     local cwd = cwd_of(ctx)
     local model = selection_spec(ctx)
-    local sub = (opts.args or ""):match("^%s*(%S+)")
+    local sub = opts.values.subcommand
     if sub then
       local run = SUBCOMMANDS[sub]
       if not run then

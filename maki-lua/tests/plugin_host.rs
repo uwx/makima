@@ -3988,6 +3988,28 @@ fn inherit_rejects_an_unknown_argument_without_opening_the_picker() {
         "unexpected flash: {msg}"
     );
 }
+
+#[test]
+fn inherit_offers_subcommand_completion() {
+    let (_reg, host) = builtins_host();
+    let registry = host.command_registry();
+    let target = registry.bind_target(
+        maki_commands::TargetCapabilities::ALL,
+        Arc::new(FakeCommandHost),
+    );
+    let command = registry.resolve_for(&target, "/inherit").unwrap();
+    let session = registry.open_completion(command, target.id()).unwrap();
+    let maki_commands::CompletionResult::Items(items) =
+        smol::block_on(session.complete(Arc::from(""), Arc::from(""), 0, Arc::from("build")))
+    else {
+        panic!("expected subcommand completions");
+    };
+    let labels = items
+        .iter()
+        .map(|candidate| candidate.item().label.as_ref())
+        .collect::<Vec<_>>();
+    assert_eq!(labels, ["all", "conversations", "import-mcp"]);
+}
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
     "non-empty" ; "empty_name"
