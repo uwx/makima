@@ -25,17 +25,26 @@ Makima already loads the first of `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.wi
 
 ## Using it
 
-Type `/inherit` to browse and import one item at a time from a picker. `/inherit import-mcp` appends every discovered MCP server to `mcp.toml` in one step; restart Makima afterwards so the servers connect.
+Type `/inherit` to browse and import one item at a time from a picker.
 
-The agent can use the `inherit` tool the same way. Ask it to scan, then to import a named item. Conversations import one at a time, since each one becomes a whole session.
+`/inherit all` does everything in one pass: every rule, skill, memory and MCP server, plus this project's conversations. Conversations are scoped to the project you run it from, so a machine with hundreds of unrelated chats does not turn into hundreds of sessions. If new MCP servers were added, restart Makima afterwards so they connect.
+
+`/inherit conversations` imports every conversation on the machine instead. Each session records the directory its transcript names, so a chat resumes in the project it belongs to rather than the one you imported from. A transcript that records no project is skipped, because there is nowhere to resume it, and one whose directory no longer exists opens in that missing directory — the same refusal Makima already gives a session from another folder.
+
+Every import records the transcript's own project when the format has one: Claude Code, oh-my-pi, Copilot, Continue and Cline all do, Gemini uses its `.project_root` file, and Cline keeps it inside the request text. Codex rollouts name it in their session metadata.
+
+`/inherit import-mcp` is the narrower version for MCP only.
+
+The agent can use the `inherit` tool the same way: `scan` lists what is available, `import` copies one kind, `import` with `kind = "all"` is the bulk path for this project, and `kind = "conversations-everywhere"` is the bulk path for every project.
+
+Every import is a no-op when there is nothing new. A rule block is replaced in place, an existing skill or memory is skipped, an MCP server already in `mcp.toml` is left alone, and an already-imported conversation maps to the same session file and is skipped, so re-running `/inherit all` is safe.
 
 ```text
-inherits: rules 1, skills 10, mcp 4, memories 3, conversations 593
+inherits: rules 1, skills 10, mcp 4, memories 3, conversations 117
 ```
 
 ## Limits
 
 - A conversation is converted to Makima's own message shape. The text, thinking, tool calls and tool results come across; tool output that a source stored separately is dropped.
 - Very large transcripts (over 24 MB) are skipped rather than read into memory.
-- Imported sessions record the model that was current when you imported them, not the model the other agent used.
-- Imports never overwrite: a rule block is replaced in place, a skill or memory is skipped when the name exists, and an MCP server already in `mcp.toml` is left alone.
+- Imported sessions record the model that was current when you imported them, not the model the other agent used. A session whose stored model no longer resolves still opens, on the current model.

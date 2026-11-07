@@ -646,6 +646,56 @@ function M.memories(cwd)
   return out
 end
 
+-- Claude encodes a project path as every non-alphanumeric byte replaced with
+-- `-` (`C:\Users\x` -> `C--Users-x`). The same encoding names both Claude's
+-- and oh-my-pi's project session directories, so it is how a listing is tied
+-- back to a project without reading transcript bodies.
+function M.encode_project(path)
+  return (path:gsub("[^%w]", "-"))
+end
+
+local function normalize_project(path)
+  local value = path:gsub("\\", "/"):gsub("/+$", "")
+  return value:lower()
+end
+
+-- VS Code and Continue store a workspace as a percent-encoded URI
+-- (`file:///w%3A/projects/x`); transcripts store a plain path. A plain path is
+-- returned unchanged. Remote workspaces yield nil, and a multi-root
+-- `.code-workspace` file decodes to a path that matches no project directory.
+function M.dir_from_uri(value)
+  if type(value) ~= "string" or value == "" then
+    return nil
+  end
+  if not value:match("^%a[%w+.-]*://") then
+    return value
+  end
+  local decoded = value:gsub("%%(%x%x)", function(hex)
+    return string.char(tonumber(hex, 16))
+  end)
+  return decoded:match("^file:///(.+)$")
+end
+
+-- Whether a listed conversation belongs to `cwd`. Sources that encode the
+-- directory in a folder name (Claude, oh-my-pi) are compared by that encoding,
+-- the rest by the directory they recorded. A source whose project cannot be
+-- known without reading a large transcript body (Cline, Codex) reports none,
+-- and is left out of bulk imports rather than pulling in every chat on the
+-- machine; it stays available one at a time from the picker.
+function M.same_project(entry, cwd)
+  if entry.encoded then
+    -- Windows paths are case-insensitive, and each session records the cwd as
+    -- it was typed, so the encoded directory names can differ only in case.
+    local got = entry.encoded:gsub("^%-+", ""):gsub("%-+$", ""):lower()
+    local want = M.encode_project(cwd):gsub("^%-+", ""):gsub("%-+$", ""):lower()
+    return got == want
+  end
+  if entry.cwd then
+    return normalize_project(entry.cwd) == normalize_project(cwd)
+  end
+  return false
+end
+
 -- Conversation files: enough to list them without reading bodies.
 M.conversations = {}
 
@@ -668,6 +718,7 @@ function M.conversations.claude(cwd)
           id = name:gsub("%.jsonl$", ""),
           path = path,
           cwd = project_dir:gsub("%-", "/"),
+          encoded = project_dir,
           mtime = meta and meta.mtime or 0,
           size = meta and meta.size or 0,
         }
@@ -724,6 +775,7 @@ function M.conversations.omp(cwd)
           source = "omp",
           id = name:gsub("%.jsonl$", ""),
           path = path,
+          encoded = project_dir,
           mtime = meta and meta.mtime or 0,
           size = meta and meta.size or 0,
         }
@@ -756,7 +808,7 @@ function M.conversations.gemini(cwd)
           source = "gemini",
           id = name:gsub("%.json$", ""),
           path = path,
-          cwd = project,
+          cwd = project and project ~= "" and project or nil,
           mtime = meta and meta.mtime or 0,
           size = meta and meta.size or 0,
         }
@@ -812,7 +864,7 @@ function M.conversations.copilot(cwd)
             source = "copilot",
             id = name:gsub("%.jsonl$", ""):gsub("%.json$", ""),
             path = path,
-            cwd = folder and folder.folder,
+            cwd = folder and M.dir_from_uri(folder.folder or folder.workspace),
             mtime = meta and meta.mtime or 0,
             size = meta and meta.size or 0,
           }
@@ -835,10 +887,12 @@ function M.conversations.continue(cwd)
     if name:match("%.json$") and name ~= "sessions.json" then
       local path = join(root, name)
       local meta = maki.fs.metadata(path)
+      local doc = read_json(path)
       out[#out + 1] = {
         source = "continue",
         id = name:gsub("%.json$", ""),
         path = path,
+        cwd = doc and M.dir_from_uri(doc.workspaceDirectory),
         mtime = meta and meta.mtime or 0,
         size = meta and meta.size or 0,
       }
@@ -857,13 +911,19 @@ M.CONVERSATION_SOURCES = {
   { name = "continue", scan = M.conversations.continue },
 }
 
--- Every listed conversation, newest first, optionally filtered to `source`.
-function M.list_conversations(cwd, source)
+-- Every listed conversation, newest first, filtered to `source`, and to the
+-- conversations recorded for `cwd` when `only_project` is set. The project
+-- filter is what keeps a bulk import from pulling in every chat the machine
+-- ever wrote; a conversation whose project cannot be read without the body is
+-- excluded, and remains available through the unfiltered picker.
+function M.list_conversations(cwd, source, only_project)
   local out = {}
   for _, entry in ipairs(M.CONVERSATION_SOURCES) do
     if not source or source == entry.name then
       for _, conversation in ipairs(entry.scan(cwd)) do
-        out[#out + 1] = conversation
+        if not only_project or M.same_project(conversation, cwd) then
+          out[#out + 1] = conversation
+        end
       end
     end
   end

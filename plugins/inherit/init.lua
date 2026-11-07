@@ -79,32 +79,38 @@ local function base58_encode(bytes)
   return table.concat(out)
 end
 
--- A private xorshift32, seeded from the host's nanosecond clock and bumped per
--- call: no deterministic `math.random` state is touched, and two imports in the
--- same second still land on different ids.
-local id_counter = 0
-
-local function random_bytes(count)
-  local now = maki.time.now()
-  id_counter = id_counter + 1
-  local state = (now.secs * 1000003 + math.floor(now.nanosecs / 1000) + id_counter * 7919) % 4294967296
-  if state == 0 then
-    state = 0x9e3779b9
-  end
-  local out = {}
-  for i = 1, count do
-    state = bit32.bxor(state, bit32.lshift(state, 13))
-    state = bit32.bxor(state, bit32.rshift(state, 17))
-    state = bit32.bxor(state, bit32.lshift(state, 5))
-    out[i] = state % 256
-  end
-  return out
+-- The id is a hash of the source transcript path, so importing the same
+-- conversation twice maps to the same file and the second pass skips it
+-- instead of filling the session list with duplicates.
+local function avalanche(state)
+  state = bit32.bxor(state, bit32.lshift(state, 13))
+  state = bit32.bxor(state, bit32.rshift(state, 17))
+  state = bit32.bxor(state, bit32.lshift(state, 5))
+  return state
 end
 
-local function new_session_id()
+local function session_id_for(key)
+  -- Two 32-bit lanes over the path. The multiplier keeps `state * 1000003`
+  -- below 2^53 so doubles stay exact; the lanes together give 64 bits, which
+  -- makes a collision between two different transcripts implausible.
+  local bytes = {}
+  local n = 0
+  for _, seed in ipairs({ 2166136261, 374761393 }) do
+    local state = seed
+    for i = 1, string.len(key) do
+      state = (state * 1000003 + key:byte(i)) % 4294967296
+    end
+    if state == 0 then
+      state = 0x9e3779b9
+    end
+    for _ = 1, 8 do
+      state = avalanche(state)
+      n = n + 1
+      bytes[n] = state % 256
+    end
+  end
   -- Byte 0 is forced to 1..255 so the encoding always decodes to 16 bytes with
   -- no leading-zero ambiguity (base58 pads a leading zero with a literal "1").
-  local bytes = random_bytes(16)
   bytes[1] = bytes[1] % 255 + 1
   return base58_encode(bytes)
 end
@@ -210,8 +216,11 @@ local function sessions_dir()
   return state and maki.fs.joinpath(state, "sessions")
 end
 
--- Writes one converted transcript as a fresh session and returns its id.
-local function import_conversation(conversation, cwd, model)
+-- Writes one converted transcript as a fresh session and returns its id. The
+-- transcript's own project wins when it records one, so a chat resumes in the
+-- directory it belongs to; otherwise it falls back to the project the command
+-- ran in, unless `require_project` is set and it is skipped instead.
+local function import_conversation(conversation, cwd, model, require_project)
   local convert = T.CONVERTERS[conversation.source]
   if not convert then
     return nil, "no converter for " .. conversation.source
@@ -219,27 +228,32 @@ local function import_conversation(conversation, cwd, model)
   if conversation.size > H.MAX_TRANSCRIPT_BYTES then
     return nil, "transcript is larger than " .. (H.MAX_TRANSCRIPT_BYTES / 1048576) .. " MB"
   end
-  local text, err = maki.fs.read(conversation.path)
-  if not text then
-    return nil, "read error: " .. tostring(err)
-  end
   local dir = sessions_dir()
   if not dir then
     return nil, "cannot resolve makima state dir"
   end
-  maki.fs.mkdir(dir, { parents = true })
-  local id
-  for _ = 1, 4 do
-    id = new_session_id()
-    if not maki.fs.metadata(maki.fs.joinpath(dir, id .. ".jsonl")) then
-      break
-    end
+  local id = session_id_for(conversation.path)
+  local target = maki.fs.joinpath(dir, id .. ".jsonl")
+  if maki.fs.metadata(target) then
+    return nil, "already imported"
   end
-  local jsonl, title = T.session_jsonl(convert(text), id, cwd, model, os.time())
+  local text, err = maki.fs.read(conversation.path)
+  if not text then
+    return nil, "read error: " .. tostring(err)
+  end
+  maki.fs.mkdir(dir, { parents = true })
+  local converted = convert(text) or {}
+  -- Gemini keeps the project beside the transcript rather than inside it, so a
+  -- scan that found one hands it over.
+  local project = H.dir_from_uri(converted.cwd or conversation.cwd)
+  if not project and require_project then
+    return nil, "transcript records no project directory"
+  end
+  local jsonl, title = T.session_jsonl(converted, id, project or cwd, model, os.time())
   if not jsonl then
     return nil, title
   end
-  local ok, werr = maki.fs.atomic_write(maki.fs.joinpath(dir, id .. ".jsonl"), jsonl)
+  local ok, werr = maki.fs.atomic_write(target, jsonl)
   if not ok then
     return nil, "write error: " .. tostring(werr)
   end
@@ -304,6 +318,89 @@ local function import_mcp(servers)
   return added
 end
 
+local function tally_line(kind, items, apply)
+  local done, skipped = 0, 0
+  for _, item in ipairs(items) do
+    local ok = apply(item)
+    if ok then
+      done = done + 1
+    else
+      skipped = skipped + 1
+    end
+  end
+  return string.format("%s: %d imported, %d skipped", kind, done, skipped)
+end
+
+-- Imports this project's conversations. Each session records the directory its
+-- transcript names, so a chat resumes where it belongs.
+local function import_project_conversations(cwd, model)
+  local conversations = H.list_conversations(cwd, nil, true)
+  return tally_line("conversations", conversations, function(conversation)
+    return import_conversation(conversation, cwd, model) ~= nil
+  end)
+end
+
+-- Imports every conversation on the machine, each into the project it recorded.
+-- A transcript that names no project is skipped: there is nowhere to resume it,
+-- and guessing this project would mix unrelated chats into it. Rows that name a
+-- directory that no longer exists are skipped for the same reason.
+local function import_every_conversation(model)
+  local conversations = H.list_conversations(nil, nil, false)
+  local done, skipped_dup, skipped = 0, 0, 0
+  local reasons = {}
+  for _, conversation in ipairs(conversations) do
+    -- The second return is the title on success and an error on failure, so
+    -- only the id (and a successful call) says which happened.
+    local id, reason = import_conversation(conversation, nil, model, true)
+    if id then
+      done = done + 1
+    elseif reason == "already imported" then
+      skipped_dup = skipped_dup + 1
+    else
+      -- A chat with no project, an unreadable one and an oversized one are
+      -- different outcomes, so each is reported rather than summed.
+      skipped = skipped + 1
+      reasons[tostring(reason)] = (reasons[tostring(reason)] or 0) + 1
+    end
+  end
+  local summary = string.format("conversations: %d imported, %d already imported, %d skipped", done, skipped_dup, skipped)
+  local details = {}
+  for reason, count in pairs(reasons) do
+    details[#details + 1] = string.format("%s (%d)", reason, count)
+  end
+  if #details > 0 then
+    table.sort(details)
+    summary = summary .. ": " .. table.concat(details, ", ")
+  end
+  return summary
+end
+
+-- Runs every importer once. Rules, skills and memories skip anything already
+-- present, and MCP only appends servers the config does not have, so a second
+-- run is a no-op rather than a duplicate. Conversations are limited to this
+-- project; every chat on the machine is its own subcommand. Returns a per-kind
+-- tally so the caller can report what happened.
+local function inherit_all(cwd, model)
+  local plan = build_plan(cwd)
+  local tally = {
+    tally_line("rules", plan.rules, import_rule),
+    tally_line("skills", plan.skills, function(skill)
+      return import_skill(skill, cwd)
+    end),
+    tally_line("memories", plan.memories, import_memory),
+  }
+
+  if #plan.mcp > 0 then
+    local added, err = import_mcp(plan.mcp)
+    tally[#tally + 1] = added and ("mcp: " .. #added .. " added") or ("mcp: " .. tostring(err))
+  else
+    tally[#tally + 1] = "mcp: nothing new"
+  end
+
+  tally[#tally + 1] = import_project_conversations(cwd, model)
+  return tally
+end
+
 local function pick_and_apply(cwd, items, apply, describe)
   if #items == 0 then
     maki.ui.flash("Nothing to inherit here")
@@ -331,6 +428,32 @@ local function pick_and_apply(cwd, items, apply, describe)
     flash("Import failed: " .. tostring(err))
   end
 end
+
+-- One table of subcommands, so an unknown argument is answered rather than
+-- silently opening the picker: a typo used to look like `/inherit` ignoring it.
+local SUBCOMMANDS = {
+  ["import-mcp"] = function(cwd)
+    local added, err = import_mcp(build_plan(cwd).mcp)
+    if added then
+      flash("Added " .. table.concat(added, ", ") .. " to mcp.toml; restart makima")
+    else
+      flash("MCP import: " .. tostring(err))
+    end
+  end,
+  all = function(cwd, model)
+    local summary = table.concat(inherit_all(cwd, model), "; ")
+    if summary:find("mcp: %d+ added") then
+      summary = summary .. ". Restart makima to connect the new MCP servers"
+    end
+    maki.log.info("inherit all: " .. summary)
+    flash(summary)
+  end,
+  conversations = function(_, model)
+    local summary = import_every_conversation(model)
+    maki.log.info("inherit conversations: " .. summary)
+    flash(summary)
+  end,
+}
 
 local function run_picker(cwd, model)
   local plan = build_plan(cwd)
@@ -387,13 +510,13 @@ maki.api.register_command({
     local cwd = cwd_of(ctx)
     local model = selection_spec(ctx)
     local sub = (opts.args or ""):match("^%s*(%S+)")
-    if sub == "import-mcp" then
-      local added, err = import_mcp(build_plan(cwd).mcp)
-      if added then
-        flash("Added " .. table.concat(added, ", ") .. " to mcp.toml; restart makima")
-      else
-        flash("MCP import: " .. tostring(err))
+    if sub then
+      local run = SUBCOMMANDS[sub]
+      if not run then
+        flash("Unknown /inherit argument " .. sub .. "; try all, conversations or import-mcp")
+        return
       end
+      run(cwd, model)
       return
     end
     run_picker(cwd, model)
@@ -407,7 +530,9 @@ maki.api.register_tool({
   kind = "read",
   description = "Discover and import configuration and history left on this machine by other coding agents (Claude Code, Cursor, Windsurf, Gemini CLI, Codex, Cline, Copilot Chat, oh-my-pi, Continue).\n\n"
     .. "- `scan` lists what is available per source.\n"
-    .. "- `import` copies one kind into makima: rules into ~/.config/makima/AGENTS.md, skills into .claude/skills/<name>/SKILL.md, MCP servers into ~/.config/makima/mcp.toml, memories into the project's memory store, conversations into new resumable sessions.\n\n"
+    .. "- `import` copies one kind into makima: rules into ~/.config/makima/AGENTS.md, skills into .claude/skills/<name>/SKILL.md, MCP servers into ~/.config/makima/mcp.toml, memories into the project's memory store, conversations into new resumable sessions.\n"
+    .. "- `import` with `kind = \"all\"` does every kind at once; conversations are then limited to this project's own.\n"
+    .. "- `import` with `kind = \"conversations-everywhere\"` imports every conversation on the machine, each session in the project its transcript recorded.\n\n"
     .. "Ask before importing, then report what changed. MCP changes need a restart.",
   schema = {
     type = "object",
@@ -419,8 +544,8 @@ maki.api.register_tool({
       },
       kind = {
         type = "string",
-        enum = { "rules", "skills", "mcp", "memories", "conversations" },
-        description = "What to import. Required for import; optional for scan.",
+        enum = { "all", "conversations-everywhere", "rules", "skills", "mcp", "memories", "conversations" },
+        description = "What to import. Required for import; optional for scan. `all` imports every kind at once (conversations are limited to this project's); `conversations-everywhere` imports every chat on the machine into the project its transcript recorded.",
       },
       source = {
         type = "string",
@@ -476,6 +601,14 @@ maki.api.register_tool({
       return { llm_output = table.concat(parts, "\n\n") }
     end
 
+    if kind == "all" then
+      return { llm_output = table.concat(inherit_all(cwd, selection_spec(ctx)), "\n") }
+    end
+
+    if kind == "conversations-everywhere" then
+      return { llm_output = import_every_conversation(selection_spec(ctx)) }
+    end
+
     if kind == "mcp" then
       local added, err = import_mcp(plan.mcp)
       if not added then
@@ -506,7 +639,10 @@ maki.api.register_tool({
         return import_conversation(conversation, cwd, selection_spec(ctx))
       end
     else
-      return { llm_output = "error: kind must be one of rules, skills, mcp, memories, conversations", is_error = true }
+      return {
+        llm_output = "error: kind must be one of all, conversations-everywhere, rules, skills, mcp, memories, conversations",
+        is_error = true,
+      }
     end
 
     local done, failed = {}, {}

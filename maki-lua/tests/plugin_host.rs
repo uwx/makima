@@ -3967,6 +3967,27 @@ fn nested_run_command_rejects_unknown_command() {
         .expect("nested run_command did not flash its result");
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "nil|unknown command"));
 }
+
+/// A mistyped `/inherit` argument answers instead of opening the picker: it
+/// used to fall through silently, so a missing subcommand looked like a no-op.
+#[test]
+fn inherit_rejects_an_unknown_argument_without_opening_the_picker() {
+    let (_reg, host) = builtins_host();
+    let rx = host.ui_action_rx();
+    let _completion = run_command(&host.command_registry(), "/inherit bogus", 0, None);
+
+    // A picker action would sit on the same channel and never complete.
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("/inherit bogus produced no feedback");
+    let maki_lua::UiAction::Flash(msg) = action else {
+        panic!("an unknown argument must flash, not open a picker");
+    };
+    assert!(
+        msg.contains("Unknown /inherit argument bogus"),
+        "unexpected flash: {msg}"
+    );
+}
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
     "non-empty" ; "empty_name"

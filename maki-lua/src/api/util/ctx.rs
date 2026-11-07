@@ -380,7 +380,7 @@ impl UserData for LuaCtx {
             if let Err(error) = this.validate_origin(lua) {
                 return Ok((None, Some(error)));
             }
-            let Some(agent) = this.agent() else {
+            let Some(agent) = this.model_context() else {
                 return Ok(this.cap_err_pair("model"));
             };
             let selection =

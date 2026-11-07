@@ -77,7 +77,13 @@ end
 function M.claude(text)
   local messages = {}
   local title
+  local cwd
   for _, record in ipairs(decode_jsonl(text)) do
+    -- The first record that names the directory wins. Messages carry it too,
+    -- so this is read before the type dispatch rather than as a branch of it.
+    if not cwd and type(record.cwd) == "string" then
+      cwd = record.cwd
+    end
     if record.type == "custom-title" then
       title = record.customTitle
     elseif record.type == "ai-title" and not title then
@@ -129,7 +135,7 @@ function M.claude(text)
       push_message(messages, record.type, blocks)
     end
   end
-  return { messages = messages, title = title }
+  return { messages = messages, title = title, cwd = cwd }
 end
 
 -- Codex rollouts interleave `response_item` and `event_msg` records. The
@@ -138,10 +144,12 @@ end
 function M.codex(text)
   local messages = {}
   local title
+  local cwd
   for _, record in ipairs(decode_jsonl(text)) do
     local payload = record.payload
     if record.type == "session_meta" and type(payload) == "table" then
       title = title or payload.title
+      cwd = cwd or payload.cwd
     elseif record.type == "response_item" and type(payload) == "table" then
       if payload.type == "message" then
         local parts = {}
@@ -175,7 +183,7 @@ function M.codex(text)
       push_message(messages, "user", { text_block(payload.message) })
     end
   end
-  return { messages = messages, title = title }
+  return { messages = messages, title = title, cwd = cwd }
 end
 
 -- oh-my-pi rollouts already use the canonical block shape under `message`.
@@ -185,9 +193,11 @@ end
 function M.omp(text)
   local messages = {}
   local title
+  local cwd
   for _, record in ipairs(decode_jsonl(text)) do
     if record.type == "session" then
       title = record.title
+      cwd = record.cwd
     elseif record.type == "title" and not title then
       title = record.title
     elseif record.type == "message" and type(record.message) == "table" then
@@ -216,7 +226,7 @@ function M.omp(text)
       push_message(messages, role == "assistant" and "assistant" or "user", blocks)
     end
   end
-  return { messages = messages, title = title }
+  return { messages = messages, title = title, cwd = cwd }
 end
 
 -- Gemini CLI chat snapshots: a flat `messages` array, role in `type`.
@@ -273,7 +283,7 @@ function M.continue(text)
       push_message(messages, message.role == "assistant" and "assistant" or "user", blocks)
     end
   end
-  return { messages = messages, title = data.title }
+  return { messages = messages, title = data.title, cwd = data.workspaceDirectory }
 end
 
 -- Cline keeps a UI event log; user turns and assistant text are enough for a
@@ -285,6 +295,7 @@ function M.cline(text)
   end
   local messages = {}
   local title
+  local cwd
   for _, event in ipairs(data) do
     if type(event) == "table" and type(event.text) == "string" then
       if event.type == "say" and event.say == "task" then
@@ -294,10 +305,13 @@ function M.cline(text)
         push_message(messages, "assistant", { text_block(event.text) })
       elseif event.type == "say" and event.say == "user_feedback" then
         push_message(messages, "user", { text_block(event.text) })
+      elseif event.type == "say" and event.say == "api_req_started" and not cwd then
+        -- The environment block is embedded in the request text, not a field.
+        cwd = event.text:match("Current Working Directory %(([^%)]+)%)")
       end
     end
   end
-  return { messages = messages, title = title }
+  return { messages = messages, title = title, cwd = cwd }
 end
 
 -- Copilot Chat sessions are an operation log: kind 0 is the base state, kind 1

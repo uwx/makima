@@ -2030,6 +2030,69 @@ fn trusted_spawn_inherits_configuration_committed_in_same_invocation() {
 }
 
 #[test]
+fn command_handler_reads_the_pinned_agents_model() {
+    smol::block_on(async {
+        let fixture = Fixture::start("pr5_model_read", "");
+        assert_eq!(
+            bounded(
+                fixture.completed.recv_async(),
+                "integration channel receive"
+            )
+            .await
+            .unwrap(),
+            Ok(())
+        );
+        let (template, _events, _cancel) = common::ctx_with_canned_provider();
+        let expected = template.model.spec();
+        let services = Arc::new(RegisteredOrchestrationTargets::new(vec![TrustedTarget {
+            target: fixture.manager.root().unwrap(),
+            template,
+        }]));
+        fixture
+            ._host
+            .event_handle()
+            .install_orchestration_services(services);
+        fixture
+            ._host
+            .load_source(
+                "pr5_model_read",
+                r#"
+                maki.api.register_command({
+                    name = "/pr5_model_read", tui_only = false,
+                    handler = function(_, ctx)
+                        -- Command handlers run as a trusted target, not a tool
+                        -- handler; reading the model must work in both.
+                        local selection = assert(ctx:model())
+                        maki.ui.flash(selection.spec)
+                    end,
+                })
+            "#,
+            )
+            .unwrap();
+        let actions = fixture._host.ui_action_rx();
+        assert_eq!(
+            run_command(
+                &fixture._host.command_registry(),
+                "/pr5_model_read",
+                0,
+                None
+            )
+            .recv_timeout(TEST_TIMEOUT)
+            .unwrap(),
+            Ok(())
+        );
+        let action = actions
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("command handler did not flash the model");
+        match action {
+            maki_lua::UiAction::Flash(msg) => assert_eq!(msg, expected),
+            _ => panic!("command handler flashed another action"),
+        }
+        shutdown_manager(&fixture.manager).await;
+    });
+}
+
+#[test]
 fn trusted_context_controls_another_registered_graph_with_fresh_authority() {
     smol::block_on(async {
         let first = Fixture::start("pr5_registered_first", "");

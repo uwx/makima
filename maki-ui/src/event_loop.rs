@@ -1310,7 +1310,13 @@ impl SpawnCtx {
         {
             return Ok(None);
         }
-        let model = Model::from_spec(model_spec).map_err(|error| error.to_string())?;
+        // A stored spec that no longer resolves (a hand-edited session, or one
+        // imported from another tool) resumes on the current model instead of
+        // refusing to open. Startup already behaves this way for the same
+        // reason: a session's model is a detail, not a precondition.
+        let Ok(model) = Model::from_spec(model_spec) else {
+            return Ok(None);
+        };
         let prepared =
             (self.prepare_provider)(model, self.timeouts).map_err(|error| error.to_string())?;
         Ok(Some(PreparedProvider {
@@ -6746,6 +6752,28 @@ mod tests {
         release_runtime(runtime);
     }
 
+    #[test]
+    fn unresolvable_stored_model_resumes_on_the_current_one() {
+        let harness = RuntimeHarness::new();
+        let current = harness.ctx().model_slot.load().model.spec();
+        let mut session = harness.session();
+        // What an imported session writes when no model could be read.
+        session.model = "unknown".into();
+        session.push_message(Message::user("imported history".into()));
+
+        let provider = harness
+            .ctx()
+            .prepare_replacement_provider(&session)
+            .expect("an unknown stored model must not block resuming");
+        assert!(provider.is_none(), "the current model needs no replacement");
+        let runtime = harness
+            .ctx()
+            .spawn_runtime_with_provider(session, provider)
+            .expect("session with an unknown model must still open");
+        assert_eq!(runtime.model_slot.load().model.spec(), current);
+        release_runtime(runtime);
+    }
+
     #[test_case(false ; "absent_plan_path")]
     #[test_case(true ; "missing_plan_file")]
     fn restored_plan_uses_one_path_for_app_and_actor(missing_file: bool) {
@@ -7027,16 +7055,18 @@ mod tests {
 
     #[test]
     fn failed_replacement_provider_preparation_preserves_current_runtime() {
-        const INVALID_MODEL: &str = "unsupported-provider/test-model";
+        const STORED_MODEL: &str = "openai/gpt-5";
 
-        let harness = RuntimeHarness::new();
+        let mut harness = RuntimeHarness::new();
+        harness.ctx.as_mut().unwrap().prepare_provider =
+            Arc::new(|_, _| Err(Arc::from("provider unavailable")));
         let mut runtime = harness.runtime(harness.session());
         let current_id = runtime.id();
         let current_target = runtime.app.command_target.id();
         let (current_manager, current_root) = runtime.handles.manager_and_root();
         let current_provider = harness.ctx().model_slot.load().provider.identity();
         let mut session = harness.session();
-        session.model = INVALID_MODEL.into();
+        session.model = STORED_MODEL.into();
 
         runtime.app.checkpoint_now();
         assert!(

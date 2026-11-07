@@ -267,6 +267,6 @@ Discover and import configuration and history left on this machine by other codi
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `action` | string | no | What to do. Defaults to scan. |
-| `kind` | string | no | What to import. Required for import; optional for scan. |
+| `kind` | string | no | What to import. Required for import; optional for scan. `all` imports every kind at once (conversations are limited to this project's); `conversations-everywhere` imports every chat on the machine into the project its transcript recorded. |
 | `name` | string | no | Import only the entry with this name (rule label, skill name, memory name or conversation id). |
 | `source` | string | no | Only consider this harness (claude, codex, omp, gemini, cline, copilot, continue). |

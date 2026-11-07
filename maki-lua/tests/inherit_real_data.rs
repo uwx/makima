@@ -43,7 +43,11 @@ local found = H.list_conversations([==[{cwd}]==], [==[{source}]==])
 for i = 1, math.min(#found, 20) do
   local text = maki.fs.read(found[i].path)
   if text and #text <= H.MAX_TRANSCRIPT_BYTES then
-    local jsonl = T.session_jsonl(T.{source}(text), [==[{id}]==], [==[{cwd}]==], "test/model", 1700000000)
+    -- Mirror the importer: the transcript's own project wins over the
+    -- directory the import ran in.
+    local converted = T.{source}(text)
+    local project = H.dir_from_uri(converted.cwd or found[i].cwd) or [==[{cwd}]==]
+    local jsonl = T.session_jsonl(converted, [==[{id}]==], project, "test/model", 1700000000)
     if jsonl then
       maki.fs.write([==[{out}]==], jsonl)
       return
@@ -76,15 +80,11 @@ fn real_transcript_from_another_harness_reloads() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(format!("{ID}.jsonl")), &jsonl).unwrap();
         let id: MakiId = ID.parse().unwrap();
-        AppSession::load_from(id, dir.path())
+        let session = AppSession::load_from(id, dir.path())
             .unwrap_or_else(|e| panic!("{source}: imported session did not reload: {e}"));
         // The session scanner counts messages by the literal prefix; a file it
         // cannot count is one `makima sessions` shows with zero messages.
-        let listed_cwd = std::env::current_dir()
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
-        let summaries = AppSession::list_in(&listed_cwd, dir.path()).unwrap();
+        let summaries = AppSession::list_in(&session.cwd, dir.path()).unwrap();
         let summary = summaries.iter().find(|s| s.id == id).unwrap();
         assert!(
             summary.message_count > 0,

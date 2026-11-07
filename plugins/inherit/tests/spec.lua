@@ -44,6 +44,30 @@ case("claude_keeps_anthropic_blocks", function()
   eq(block.content, "data")
 end)
 
+case("converters_report_the_project_they_recorded", function()
+  -- Claude puts cwd on every turn and must still keep the turns.
+  local claude = T.claude(table.concat({
+    '{"type":"user","cwd":"W:\\\\projects\\\\a","message":{"role":"user","content":"q"}}',
+    '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a"}]}}',
+  }, "\n"))
+  eq(claude.cwd, "W:\\projects\\a")
+  eq(#claude.messages, 2)
+
+  local omp = T.omp(table.concat({
+    '{"type":"session","cwd":"W:\\\\projects\\\\b","title":"t"}',
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"q"}]}}',
+  }, "\n"))
+  eq(omp.cwd, "W:\\projects\\b")
+
+  -- Cline embeds the directory in the request text rather than a field.
+  local cline = T.cline('[{"type":"say","say":"api_req_started","text":"{\\"request\\":\\"Current Working Directory (w:/projects/c) Files\\"}"}]')
+  eq(cline.cwd, "w:/projects/c")
+
+  -- Continue stores a workspace URI; decoding happens at the importer.
+  local continue = T.continue('{"history":[{"message":{"role":"user","content":"q"}}],"workspaceDirectory":"file:///w%3A/projects%2Fd"}')
+  eq(continue.cwd, "file:///w%3A/projects%2Fd")
+end)
+
 case("claude_skips_sidechains_and_meta", function()
   local jsonl = table.concat({
     '{"type":"user","isSidechain":true,"message":{"content":"subagent"}}',
@@ -158,6 +182,24 @@ case("toml_string_escapes_backslashes", function()
   eq(H.toml_string("C:\\Program Files\\x"), '"C:\\\\Program Files\\\\x"')
   eq(H.toml_string('a"b'), '"a\\"b"')
   eq(H.toml_string("line\nbreak"), '"line\\nbreak"')
+end)
+
+case("dir_from_uri_decodes_local_workspaces", function()
+  eq(H.dir_from_uri("file:///w%3A/projects%2Dmakima"), "w:/projects-makima")
+  eq(H.dir_from_uri("file:///home/x/My%20Project"), "home/x/My Project")
+  -- Remote and multi-root workspaces are not a local directory.
+  eq(H.dir_from_uri("vscode-remote://wsl%2Bubuntu/home/x"), nil)
+  eq(H.dir_from_uri("file:///c%3A/x.code-workspace"), "c:/x.code-workspace")
+  eq(H.dir_from_uri(nil), nil)
+end)
+
+case("same_project_matches_only_this_project", function()
+  eq(H.same_project({ encoded = "W--projects-makima" }, "w:/projects/makima"), true)
+  eq(H.same_project({ encoded = "W--projects-other" }, "W:/projects/makima"), false)
+  eq(H.same_project({ cwd = "W:\\projects\\makima\\" }, "w:/projects/makima"), true)
+  eq(H.same_project({ cwd = "C:/elsewhere" }, "W:/projects/makima"), false)
+  -- No recorded project: readable one at a time, never in bulk.
+  eq(H.same_project({}, "W:/projects/makima"), false)
 end)
 
 case("merge_mcp_toml_appends_only_new", function()
