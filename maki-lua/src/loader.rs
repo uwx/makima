@@ -185,6 +185,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "list",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
     },
+    BundledPlugin {
+        name: "inherit",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/inherit"),
+    },
     // Bundled splashes: the default starfield plus the named picker entries.
     BundledPlugin {
         name: "splashes_default",

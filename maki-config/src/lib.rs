@@ -108,6 +108,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "glob",
     "grep",
     "index",
+    "inherit",
     "list",
     "memory",
     "mode_plan_override",

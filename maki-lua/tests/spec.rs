@@ -7,6 +7,8 @@ use test_case::test_case;
 #[test_case("edit", include_str!("../../plugins/edit/tests/spec.lua") ; "edit_plugin_spec")]
 #[test_case("bash", include_str!("../../plugins/bash/tests/spec.lua") ; "bash_plugin_spec")]
 #[test_case("index", include_str!("../../plugins/index/tests/spec.lua") ; "index_plugin_spec")]
+#[test_case("inherit", include_str!("../../plugins/inherit/init.lua") ; "inherit_plugin_loads")]
+#[test_case("inherit_spec", include_str!("../../plugins/inherit/tests/spec.lua") ; "inherit_plugin_spec")]
 #[test_case("lib", include_str!("../../plugins/lib/tests/spec.lua") ; "lib_spec")]
 #[test_case("list", include_str!("../../plugins/list/tests/spec.lua") ; "list_plugin_spec")]
 #[test_case("memory", include_str!("../../plugins/memory/tests/spec.lua") ; "memory_plugin_spec")]
@@ -29,6 +31,8 @@ fn plugin_spec(name: &str, spec: &str) {
     let source = match name {
         "sessions" => Some(include_str!("../../plugins/sessions/init.lua")),
         "thinking" => Some(include_str!("../../plugins/thinking/init.lua")),
+        "inherit" => Some(include_str!("../../plugins/inherit/init.lua")),
+        "inherit_spec" => Some(include_str!("../../plugins/inherit/init.lua")),
         _ => None,
     };
     let spec = source.map_or_else(

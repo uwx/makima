@@ -44,6 +44,7 @@ Bundled Lua plugins register these commands at startup. Plugin commands have hig
 |---------|-------------|------|-----------|-----------|
 | `/automode` | Toggle bash auto mode (classifier gates every bash command) | none |  | all |
 | `/build` | Switch to build mode (full tool access) | none |  | all |
+| `/inherit` | Import rules, skills, MCP servers, memories and conversations left by other coding harnesses | raw (optional) |  | TUI only |
 | `/memory` | View, edit, and delete memory files | none |  | TUI only |
 | `/options` | Browse and change session options | none |  | TUI only |
 | `/plan` | Switch to plan mode (analyse and write only the plan file) | none |  | all |

@@ -686,6 +686,60 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
         assert!(err.to_string().contains("callback_path"));
     }
 
+    /// The inherit plugin writes `mcp.toml` by hand; a Windows path or a
+    /// command with quotes has to survive TOML basic-string escaping.
+    #[test]
+    fn imported_mcp_toml_parses_like_the_plugin_writes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MCP_CONFIG_FILE);
+        fs::write(
+            &path,
+            concat!(
+                "# imported by makima /inherit\n",
+                r#"[mcp.everything-search]"#,
+                "\n",
+                r#"command = ["node", "W:\\projects\\everything-mcp\\dist\\index.js"]"#,
+                "\n\n# imported by makima /inherit\n",
+                "[mcp.renoise]\n",
+                r#"command = ["uv.exe", "--directory", "W:\\projects\\renoise-mcp", "run"]"#,
+                "\n",
+                r#"environment = { RENOISE_PORT = "6767" }"#,
+                "\n\n",
+                "[mcp.github]\n",
+                r#"url = "https://api.githubcopilot.com/mcp/""#,
+                "\n",
+                r#"headers = { Authorization = "Bearer token" }"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let (config, errors) =
+            load_config_inner(dir.path(), Some(&path), ProjectConfig::discover(dir.path()));
+        assert!(errors.is_empty(), "{errors:?}");
+        let everything = parse_server(
+            "everything-search".into(),
+            config.mcp["everything-search"].clone(),
+        )
+        .unwrap();
+        match everything.transport {
+            Transport::Stdio { program, args, .. } => {
+                assert_eq!(program, "node");
+                assert_eq!(args[0], r"W:\projects\everything-mcp\dist\index.js");
+            }
+            _ => panic!("expected stdio"),
+        }
+        let renoise = parse_server("renoise".into(), config.mcp["renoise"].clone()).unwrap();
+        match renoise.transport {
+            Transport::Stdio { environment, .. } => {
+                assert_eq!(environment["RENOISE_PORT"], "6767");
+            }
+            _ => panic!("expected stdio"),
+        }
+        let github = parse_server("github".into(), config.mcp["github"].clone()).unwrap();
+        assert!(matches!(github.transport, Transport::Http { .. }));
+    }
+
     #[test]
     fn project_config_overrides_global() {
         let dir = tempfile::tempdir().unwrap();

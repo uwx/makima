@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Makima ships with 25 built-in tools in this reference (24 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Makima ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -257,3 +257,16 @@ Search the web for real-time information using Exa AI.
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
+
+## Additional tools
+
+### `inherit` {#inherit}
+
+Discover and import configuration and history left on this machine by other coding agents (Claude Code, Cursor, Windsurf, Gemini CLI, Codex, Cline, Copilot Chat, oh-my-pi, Continue).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `action` | string | no | What to do. Defaults to scan. |
+| `kind` | string | no | What to import. Required for import; optional for scan. |
+| `name` | string | no | Import only the entry with this name (rule label, skill name, memory name or conversation id). |
+| `source` | string | no | Only consider this harness (claude, codex, omp, gemini, cline, copilot, continue). |
