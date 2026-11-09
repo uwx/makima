@@ -5038,9 +5038,11 @@ dependencies = [
  "color-eyre",
  "flume 0.11.1",
  "gpui-kit",
+ "jiff",
  "maki-storage",
  "serde",
  "serde_json",
+ "similar",
  "test-case",
 ]
 

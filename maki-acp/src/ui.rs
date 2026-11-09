@@ -20,6 +20,9 @@ pub const UI_CAPABILITY_KEY: &str = "maki-ui";
 pub(crate) const UI_CAPABILITY_PATH: &str = "/params/clientCapabilities/_meta/maki-ui";
 pub const FLASH_METHOD: &str = "maki/ui/flash";
 pub const PICK_METHOD: &str = "maki/ui/pick";
+/// Server to client: the history was rewound, so drop the transcript before
+/// the replacement history arrives as `session/update` notifications.
+pub const REWOUND_METHOD: &str = "maki/ui/rewind";
 /// Client to server: complete the command argument being typed.
 pub const COMPLETE_METHOD: &str = "maki/complete";
 

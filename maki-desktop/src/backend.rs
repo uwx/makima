@@ -5,7 +5,7 @@ use std::thread;
 use flume::{Receiver, Sender};
 use serde_json::Value;
 
-use crate::acp::{self, Client, Event, PickOutcome, Target, ThemeCatalog};
+use crate::acp::{self, Client, Event, PickOutcome, SessionView, Target, ThemeCatalog};
 
 pub enum Command {
     Prompt(String),
@@ -16,7 +16,7 @@ pub struct Backend {
     client: Arc<Client>,
     arguments: Sender<String>,
     pub themes: ThemeCatalog,
-    pub agent_pid: u32,
+    pub options: SessionView,
     pub model: String,
     pub session: String,
     pub cwd: PathBuf,
@@ -36,7 +36,7 @@ impl Backend {
             client: connection.client,
             arguments,
             themes: connection.themes,
-            agent_pid: connection.agent_pid,
+            options: connection.options,
             model: connection.model,
             session: acp::short_session(&connection.session),
             cwd: target.session_cwd().to_path_buf(),
@@ -89,6 +89,55 @@ impl Backend {
                 let _ = client.emit(Event::Theme(result));
             })
             .map_err(|error| format!("start theme switch: {error}"))?;
+        Ok(())
+    }
+
+    pub fn list_sessions(&self, query: String) -> Result<(), String> {
+        let client = Arc::clone(&self.client);
+        thread::Builder::new()
+            .name("maki-sessions".into())
+            .spawn(move || {
+                let result = client.list_sessions(&query);
+                let _ = client.emit(Event::Sessions(result));
+            })
+            .map_err(|error| format!("start session list: {error}"))?;
+        Ok(())
+    }
+
+    pub fn load_session(&self, id: String) -> Result<(), String> {
+        let client = Arc::clone(&self.client);
+        let cwd = self.cwd.clone();
+        thread::Builder::new()
+            .name("maki-session-load".into())
+            .spawn(move || {
+                let result = client.load_session(&id, &cwd);
+                let _ = client.emit(Event::Loaded(result));
+            })
+            .map_err(|error| format!("start session load: {error}"))?;
+        Ok(())
+    }
+
+    pub fn list_rewind_turns(&self) -> Result<(), String> {
+        let client = Arc::clone(&self.client);
+        thread::Builder::new()
+            .name("maki-rewind-turns".into())
+            .spawn(move || {
+                let result = client.rewind_turns();
+                let _ = client.emit(Event::RewindTurns(result));
+            })
+            .map_err(|error| format!("start rewind list: {error}"))?;
+        Ok(())
+    }
+
+    pub fn rewind(&self, offset: usize) -> Result<(), String> {
+        let client = Arc::clone(&self.client);
+        thread::Builder::new()
+            .name("maki-rewind".into())
+            .spawn(move || {
+                let result = client.rewind(offset);
+                let _ = client.emit(Event::RewindDone(result));
+            })
+            .map_err(|error| format!("start rewind: {error}"))?;
         Ok(())
     }
 }

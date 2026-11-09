@@ -25,7 +25,7 @@ use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::session_coordinator::{
-    ModelPreparer, SessionCoordinatorError, SessionCoordinatorHandle,
+    ModelPreparer, SessionCoordinatorError, SessionCoordinatorHandle, publication_claim,
 };
 use maki_agent::session_defaults;
 use maki_agent::session_options::SessionOptionError;
@@ -46,15 +46,16 @@ use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
 use maki_storage::StateDir;
+use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, SessionMeta, StoredTokenUsage, read_prefs};
-use serde::Serialize;
+use maki_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, StoredTokenUsage, read_prefs};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use smol::io::AsyncBufReadExt;
 use tracing::{debug, info, warn};
 
-use crate::ui::{COMPLETE_METHOD, UI_CAPABILITY_PATH, UiBridge};
+use crate::ui::{COMPLETE_METHOD, REWOUND_METHOD, UI_CAPABILITY_PATH, UiBridge};
 use crate::{AcpParams, THEME_METHOD, ThemeParams, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
@@ -68,6 +69,14 @@ const EVENT_STREAM_ENDED: &str = "session event stream ended";
 const ROOT_CONFIG_UNAVAILABLE: &str = "session root configuration is unavailable";
 const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const COMMAND_PREFIX: char = '/';
+const SESSIONS_METHOD: &str = "maki/sessions";
+/// Client to server: list the user turns a rewind can return to, or rewind to
+/// the one whose `offset` is in the params.
+const REWIND_METHOD: &str = "maki/rewind";
+const REWIND_PREVIEW_CHARS: usize = 80;
+const REWIND_STALE: &str = "that turn is gone; open the rewind picker again";
+
+type StoredSession = Session<Message, TokenUsage, maki_agent::ToolOutput>;
 const INVALID_THEME_CODE: i32 = -32602;
 const AUTH_FAILED_MSG: &str =
     "Authentication failed. Run `maki auth login`, then send the prompt again.";
@@ -310,7 +319,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     });
 
-    let _ui_forward = smol::spawn({
+    let ui_forward = smol::spawn({
         let out_tx = out_tx.clone();
         let events = params.ui.events.clone();
         async move {
@@ -373,6 +382,9 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     }
     close_session(&mut server).await;
     drop(server);
+    // The forwarder holds an out_tx clone, so the writer would wait for a
+    // channel that never closes; stop it so the last writes can drain.
+    ui_forward.cancel().await;
     writer_task.await;
 
     Ok(())
@@ -452,6 +464,27 @@ async fn handle_request(
         },
         "session/set_mode" => handle_set_mode(srv, raw, params).await,
         "session/set_config_option" => handle_set_config(srv, raw).await,
+        SESSIONS_METHOD => {
+            if !srv.ui.enabled() {
+                respond_request(srv, method, id, Err(AcpError::method_not_found()));
+                return;
+            }
+            let result = list_sessions(srv, params);
+            send(
+                &srv.out_tx,
+                Response::new(id, Ok::<Value, AcpError>(result)),
+            );
+            return;
+        }
+        REWIND_METHOD => {
+            if !srv.ui.enabled() {
+                respond_request(srv, method, id, Err(AcpError::method_not_found()));
+                return;
+            }
+            let result = rewind_session(srv, raw).await;
+            send(&srv.out_tx, Response::new(id, result));
+            return;
+        }
         THEME_METHOD => {
             let Some(themes) = params.themes.as_ref() else {
                 respond_request(srv, method, id, Err(AcpError::method_not_found()));
@@ -1167,6 +1200,136 @@ fn session_command_capabilities(ui: bool) -> (TargetCapabilities, TargetCapabili
     }
     let ui_actions = TargetCapabilities::from_capability(TargetCapability::UiActions);
     (executable.union(ui_actions), presented.union(ui_actions))
+}
+
+/// The sessions stored for this session's directory, newest first, so a
+/// client can offer the same picker the TUI has.
+fn list_sessions(srv: &Server, params: &AcpParams) -> Value {
+    let empty = json!({ "sessions": [] });
+    let Some(session) = &srv.session else {
+        return empty;
+    };
+    let Some(cwd) = session
+        .coordinator
+        .as_ref()
+        .and_then(|coordinator| coordinator.read().cwd())
+    else {
+        return empty;
+    };
+    let Ok(listed) = StoredSession::list(&cwd.to_string_lossy(), &params.storage) else {
+        return empty;
+    };
+    let current = session.handle.session_id.to_string();
+    let sessions = listed
+        .iter()
+        .map(|entry| {
+            let id = entry.id.to_string();
+            json!({
+                "id": id,
+                "title": entry.title,
+                "updatedAt": entry.updated_at,
+                "messages": entry.message_count,
+                "openElsewhere": entry.open_elsewhere,
+                "current": id == current,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "sessions": sessions })
+}
+
+#[derive(Deserialize)]
+struct RewindParams {
+    offset: Option<usize>,
+}
+
+/// Lists the turns a rewind can return to, or rewinds to one. A rewind drops
+/// every message from that turn on, so the client is told to clear its
+/// transcript before the remaining history is replayed as updates.
+async fn rewind_session(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
+    let params: RewindParams = parse_params(raw)?;
+    let Some(session) = &srv.session else {
+        return Err(no_session());
+    };
+    let target = session
+        .handle
+        .initialized_root()
+        .await
+        .map_err(rewind_error)?;
+    let actor = target.actor().map_err(rewind_error)?;
+    let boundaries = actor.history_boundary_messages().map_err(rewind_error)?;
+    let Some(offset) = params.offset else {
+        let turns = boundaries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (boundary, message))| {
+                Some(json!({
+                    "offset": boundary.offset,
+                    "turn": index + 1,
+                    "preview": rewind_preview(message.user_text()?),
+                }))
+            })
+            .collect::<Vec<_>>();
+        return Ok(json!({ "turns": turns }));
+    };
+    let (boundary, _) = boundaries
+        .iter()
+        .find(|(boundary, _)| boundary.offset == offset)
+        .ok_or_else(|| AcpError::invalid_params().data(json_str(&REWIND_STALE)))?;
+    let coordinator = session.coordinator.as_ref().ok_or_else(no_session)?;
+    let guard = actor.prepare_idle().map_err(rewind_error)?;
+    let (draft, replacement) = actor.rewind_snapshot(boundary).map_err(rewind_error)?;
+    let operation = guard
+        .reserve_prepared_operation(None)
+        .map_err(rewind_error)?;
+    let publication = CheckpointPublication::default();
+    operation
+        .register_publication(&publication)
+        .map_err(rewind_error)?;
+    let reservation = coordinator
+        .reserve_transaction(publication)
+        .map_err(rewind_error)?;
+    operation.resolve(None).map_err(rewind_error)?;
+    operation.wait_ready().await.map_err(rewind_error)?;
+    let config = operation.ready_config().map_err(rewind_error)?;
+    let transaction = reservation
+        .prepare(config, publication_claim(), true)
+        .map_err(rewind_error)?;
+    let updated = guard
+        .commit_prepared_transaction_held(operation, Some(replacement), transaction)
+        .await
+        .map_err(rewind_error)?
+        .2;
+    let draft = draft.user_text().unwrap_or_default().to_owned();
+    if let Some(change) = updated {
+        let sid = SessionId::from(session.handle.session_id.to_string());
+        let cwd = coordinator.read().cwd();
+        let home = maki_storage::paths::home();
+        send(
+            &srv.out_tx,
+            Notification {
+                method: REWOUND_METHOD.into(),
+                params: Some(json!({})),
+            },
+        );
+        for update in translate::replay_history(&change.messages, cwd.as_deref(), home.as_deref()) {
+            session_update(&srv.out_tx, &sid, update);
+        }
+    }
+    Ok(json!({ "draft": draft }))
+}
+
+fn rewind_preview(text: &str) -> String {
+    let first = text.lines().next().unwrap_or_default();
+    let cut = first.floor_char_boundary(first.len().min(REWIND_PREVIEW_CHARS));
+    let mut preview = first[..cut].to_owned();
+    if cut < first.len() {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn rewind_error(error: impl std::fmt::Display) -> AcpError {
+    AcpError::internal_error().data(json_str(&error))
 }
 
 fn emit_current_commands(srv: &Server) {
@@ -5020,6 +5183,63 @@ mod tests {
             );
             turns.release();
             finishing.await;
+        });
+    }
+
+    #[test]
+    fn rewind_drops_the_turn_and_returns_it_as_the_draft() {
+        smol::block_on(async {
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "first", false),
+                &RequestId::Number(41),
+            )
+            .await
+            .unwrap();
+            assert_eq!(turns.next_text().await, "first");
+            let ticket = turns.latest();
+            turns.release();
+            within(ticket.wait(), "the turn never settled").await;
+
+            let listed = rewind_session(&mut srv, &serde_json::json!({ "params": {} }))
+                .await
+                .unwrap();
+            let turns_json = listed["turns"].as_array().unwrap();
+            assert_eq!(turns_json.len(), 1);
+            assert_eq!(turns_json[0]["turn"], 1);
+            assert_eq!(turns_json[0]["preview"], "first");
+
+            let offset = turns_json[0]["offset"].as_u64().unwrap();
+            let rewound = rewind_session(
+                &mut srv,
+                &serde_json::json!({ "params": { "offset": offset } }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(rewound["draft"], "first");
+            let actor = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .handle
+                .initialized_root()
+                .await
+                .unwrap()
+                .actor()
+                .unwrap();
+            assert!(actor.history_boundary_messages().unwrap().is_empty());
+
+            let methods = std::iter::from_fn(|| out_rx.try_recv().ok())
+                .filter_map(|message| {
+                    message
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>();
+            assert!(methods.iter().any(|method| method == REWOUND_METHOD));
         });
     }
 

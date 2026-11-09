@@ -5,22 +5,24 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
 use agent_client_protocol_schema::{
     CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
-    InitializeRequest, JsonRpcMessage, NewSessionRequest, NewSessionResponse, Notification,
-    PermissionOption, PromptRequest, PromptResponse, ProtocolVersion, Request, RequestId,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
+    InitializeRequest, JsonRpcMessage, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, Notification, PermissionOption, PromptRequest, PromptResponse,
+    ProtocolVersion, Request, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionId, SessionNotification, SessionUpdate, StopReason,
+    TextContent, ToolCallContent,
 };
 use flume::{Receiver, Sender};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use similar::{ChangeTag, TextDiff};
 
 const AGENT_ENV: &str = "MAKI_DESKTOP_AGENT";
 const REMOTE_ENV: &str = "MAKI_DESKTOP_REMOTE";
@@ -40,15 +42,22 @@ const INITIALIZE_METHOD: &str = "initialize";
 const SESSION_UPDATE_METHOD: &str = "session/update";
 const PERMISSION_METHOD: &str = "session/request_permission";
 const UI_CAPABILITY_KEY: &str = "maki-ui";
+const YOLO_OPTION_ID: &str = "yolo";
+const ENABLED_VALUE: &str = "enabled";
 const FLASH_METHOD: &str = "maki/ui/flash";
 const PICK_METHOD: &str = "maki/ui/pick";
 const COMPLETE_METHOD: &str = "maki/complete";
 const THEME_METHOD: &str = "maki/theme";
+const SESSIONS_METHOD: &str = "maki/sessions";
+const SESSION_LOAD_METHOD: &str = "session/load";
+const REWIND_METHOD: &str = "maki/rewind";
+const REWOUND_METHOD: &str = "maki/ui/rewind";
 const SHORT_SESSION_CHARS: usize = 8;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(5);
 const THEME_TIMEOUT: Duration = Duration::from_secs(30);
+const DIFF_CONTEXT_LINES: usize = 3;
 
 /// An inbound event from the agent, already narrowed to what the desktop renders.
 pub enum Event {
@@ -62,8 +71,56 @@ pub enum Event {
         items: Vec<ArgItem>,
     },
     Theme(Result<ThemePalette, String>),
+    Sessions(Result<Vec<SessionEntry>, String>),
+    Loaded(Result<LoadedSession, String>),
+    RewindTurns(Result<Vec<RewindTurn>, String>),
+    /// The agent rewound its history; the replay follows as updates.
+    Rewound,
+    RewindDone(Result<String, String>),
     PromptDone(Result<StopReason, String>),
     Closed(String),
+}
+
+/// A stored session the agent can reopen.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEntry {
+    pub id: String,
+    pub title: String,
+    pub updated_at: u64,
+    pub messages: usize,
+    pub open_elsewhere: bool,
+    pub current: bool,
+}
+
+#[derive(Deserialize)]
+struct SessionsResponse {
+    sessions: Vec<SessionEntry>,
+}
+
+/// One user turn a rewind can return to.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RewindTurn {
+    pub offset: usize,
+    pub turn: usize,
+    pub preview: String,
+}
+
+#[derive(Deserialize)]
+struct RewindTurns {
+    turns: Vec<RewindTurn>,
+}
+
+#[derive(Deserialize)]
+struct RewindResult {
+    draft: String,
+}
+
+/// The session the agent switched to, with the config the status bar shows.
+pub struct LoadedSession {
+    pub session: SessionId,
+    pub model: String,
+    pub options: SessionView,
 }
 
 /// A permission request waiting for a click.
@@ -71,6 +128,7 @@ pub struct PermissionPrompt {
     pub id: Value,
     pub title: String,
     pub options: Vec<PermissionOption>,
+    pub diff: Option<String>,
 }
 
 /// A plugin's list picker waiting for a choice.
@@ -163,6 +221,44 @@ fn themes_from(response: &Value) -> ThemeCatalog {
     }
 }
 
+/// Turns the file diffs an agent attaches to a tool call into `+`/`-`/` `
+/// lines under each path, so the client can show what a tool changed.
+pub fn diff_text(content: &[ToolCallContent]) -> Option<String> {
+    let mut out = String::new();
+    for item in content {
+        let ToolCallContent::Diff(diff) = item else {
+            continue;
+        };
+        let before = diff.old_text.as_deref().unwrap_or_default();
+        let changes = TextDiff::from_lines(before, &diff.new_text);
+        let mut lines = String::new();
+        for group in changes.grouped_ops(DIFF_CONTEXT_LINES) {
+            for op in group {
+                for change in changes.iter_changes(&op) {
+                    lines.push(match change.tag() {
+                        ChangeTag::Delete => '-',
+                        ChangeTag::Insert => '+',
+                        ChangeTag::Equal => ' ',
+                    });
+                    lines.push(' ');
+                    lines.push_str(change.value().trim_end_matches('\n'));
+                    lines.push('\n');
+                }
+            }
+        }
+        if lines.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&diff.path.display().to_string());
+        out.push('\n');
+        out.push_str(&lines);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// Where the ACP agent lives: a local process or an SSH connection.
 pub struct Target {
     label: String,
@@ -252,11 +348,11 @@ impl Target {
 
 pub struct Connection {
     pub client: Arc<Client>,
+    pub options: SessionView,
     pub events: Receiver<Event>,
     pub session: SessionId,
     pub model: String,
     pub themes: ThemeCatalog,
-    pub agent_pid: u32,
 }
 
 pub fn connect(target: &Target) -> Result<Connection, String> {
@@ -269,7 +365,6 @@ pub fn connect(target: &Target) -> Result<Connection, String> {
         .stdout
         .take()
         .ok_or_else(|| "agent has no stdout".to_owned())?;
-    let agent_pid = child.id();
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let (events_tx, events_rx) = flume::unbounded::<Event>();
@@ -282,7 +377,7 @@ pub fn connect(target: &Target) -> Result<Connection, String> {
     });
 
     spawn_writer(stdin, out_rx)?;
-    spawn_reader(stdout, Arc::clone(&client))?;
+    spawn_reader(stdout, Arc::downgrade(&client))?;
     thread::Builder::new()
         .name("acp-wait".into())
         .spawn(move || {
@@ -291,14 +386,14 @@ pub fn connect(target: &Target) -> Result<Connection, String> {
         .map_err(|error| format!("start agent waiter: {error}"))?;
 
     let themes = client.initialize()?;
-    let (session, model) = client.new_session(target.session_cwd())?;
+    let (session, model, options) = client.new_session(target.session_cwd())?;
     Ok(Connection {
         client,
         events: events_rx,
         session,
         model,
+        options,
         themes,
-        agent_pid,
     })
 }
 
@@ -323,9 +418,12 @@ fn spawn_writer(
     Ok(())
 }
 
+/// Holds the client weakly: a strong handle here would keep the write end of
+/// the agent's stdin open after its panel is gone, so neither side could ever
+/// see EOF and the agent would outlive the desktop.
 fn spawn_reader(
     stdout: impl std::io::Read + Send + 'static,
-    client: Arc<Client>,
+    client: Weak<Client>,
 ) -> Result<(), String> {
     thread::Builder::new()
         .name("acp-reader".into())
@@ -338,10 +436,15 @@ fn spawn_reader(
                 let Ok(message) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
+                let Some(client) = client.upgrade() else {
+                    break;
+                };
                 client.dispatch(message);
             }
-            client.abort_pending();
-            let _ = client.emit(Event::Closed("agent closed the connection".to_owned()));
+            if let Some(client) = client.upgrade() {
+                client.abort_pending();
+                let _ = client.emit(Event::Closed("agent closed the connection".to_owned()));
+            }
         })
         .map_err(|error| format!("start agent reader: {error}"))?;
     Ok(())
@@ -384,6 +487,46 @@ impl Client {
         serde_json::from_value(response).map_err(|error| format!("decode theme: {error}"))
     }
 
+    pub fn list_sessions(&self, query: &str) -> Result<Vec<SessionEntry>, String> {
+        let response: SessionsResponse =
+            self.request(SESSIONS_METHOD, json!({}), Some(SESSION_TIMEOUT))?;
+        let needle = query.to_lowercase();
+        Ok(response
+            .sessions
+            .into_iter()
+            .filter(|entry| needle.is_empty() || entry.title.to_lowercase().contains(&needle))
+            .collect())
+    }
+
+    pub fn load_session(&self, id: &str, cwd: &Path) -> Result<LoadedSession, String> {
+        let request = LoadSessionRequest::new(SessionId::new(id), cwd);
+        let response: LoadSessionResponse =
+            self.request(SESSION_LOAD_METHOD, request, Some(SESSION_TIMEOUT))?;
+        let options = session_view(response.config_options.as_deref().unwrap_or_default());
+        let session = SessionId::new(id);
+        *self.session.lock().unwrap() = Some(session.clone());
+        Ok(LoadedSession {
+            model: options.model.clone().unwrap_or_default(),
+            session,
+            options,
+        })
+    }
+
+    pub fn rewind_turns(&self) -> Result<Vec<RewindTurn>, String> {
+        let response: RewindTurns =
+            self.request(REWIND_METHOD, json!({}), Some(SESSION_TIMEOUT))?;
+        Ok(response.turns)
+    }
+
+    pub fn rewind(&self, offset: usize) -> Result<String, String> {
+        let response: RewindResult = self.request(
+            REWIND_METHOD,
+            json!({ "offset": offset }),
+            Some(SESSION_TIMEOUT),
+        )?;
+        Ok(response.draft)
+    }
+
     pub fn complete_arguments(&self, text: &str) -> Result<Vec<ArgItem>, String> {
         let response: CompleteResponse = self.request(
             COMPLETE_METHOD,
@@ -393,19 +536,16 @@ impl Client {
         Ok(response.items)
     }
 
-    pub fn new_session(&self, cwd: &Path) -> Result<(SessionId, String), String> {
+    pub fn new_session(&self, cwd: &Path) -> Result<(SessionId, String, SessionView), String> {
         let response: NewSessionResponse = self.request(
             SESSION_NEW_METHOD,
             NewSessionRequest::new(cwd),
             Some(SESSION_TIMEOUT),
         )?;
-        let model = response
-            .config_options
-            .as_deref()
-            .and_then(model_from)
-            .unwrap_or_default();
+        let options = session_view(response.config_options.as_deref().unwrap_or_default());
+        let model = options.model.clone().unwrap_or_default();
         *self.session.lock().unwrap() = Some(response.session_id.clone());
-        Ok((response.session_id, model))
+        Ok((response.session_id, model, options))
     }
 
     pub fn prompt(&self, text: &str) -> Result<StopReason, String> {
@@ -520,6 +660,9 @@ impl Client {
                     let _ = self.emit(Event::Flash(text.to_owned()));
                 }
             }
+            REWOUND_METHOD => {
+                let _ = self.emit(Event::Rewound);
+            }
             _ => {}
         }
     }
@@ -555,6 +698,12 @@ impl Client {
             id,
             title: request.tool_call.fields.title.unwrap_or_default(),
             options: request.options,
+            diff: request
+                .tool_call
+                .fields
+                .content
+                .as_deref()
+                .and_then(diff_text),
         };
         let _ = self.emit(Event::Permission(prompt));
     }
@@ -601,15 +750,30 @@ impl Client {
     }
 }
 
-pub fn model_from(options: &[SessionConfigOption]) -> Option<String> {
-    options
-        .iter()
-        .find(|option| matches!(option.category, Some(SessionConfigOptionCategory::Model)))
-        .and_then(|option| match &option.kind {
-            SessionConfigKind::Select(select) => Some(select.current_value.0.to_string()),
-            _ => None,
-        })
-        .filter(|model| !model.is_empty())
+/// The parts of the session config the status bar shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionView {
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub yolo: bool,
+}
+
+pub fn session_view(options: &[SessionConfigOption]) -> SessionView {
+    let mut view = SessionView::default();
+    for option in options {
+        let SessionConfigKind::Select(select) = &option.kind else {
+            continue;
+        };
+        let value = select.current_value.0.to_string();
+        if matches!(option.category, Some(SessionConfigOptionCategory::Model)) {
+            view.model = Some(value);
+        } else if option.category == Some(SessionConfigOptionCategory::ThoughtLevel) {
+            view.thinking = Some(value);
+        } else if option.id.0.as_ref() == YOLO_OPTION_ID {
+            view.yolo = value == ENABLED_VALUE;
+        }
+    }
+    view
 }
 
 fn push_model(args: &mut Vec<String>, model: Option<&str>) {
@@ -631,8 +795,52 @@ pub fn short_session(session: &SessionId) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{ACP_SUBCOMMAND, MODEL_FLAG, SSH_PROGRAM, Target, ThemePalette, themes_from};
+    use agent_client_protocol_schema::{Diff, ToolCallContent};
+
+    use super::{
+        ACP_SUBCOMMAND, MODEL_FLAG, SSH_PROGRAM, Target, ThemePalette, diff_text, themes_from,
+    };
     use test_case::test_case;
+
+    #[test]
+    fn diff_text_renders_changes_under_the_path() {
+        let content = vec![ToolCallContent::Diff(
+            Diff::new(
+                "/p/a.rs",
+                "keep
+new
+",
+            )
+            .old_text(
+                "keep
+old
+",
+            ),
+        )];
+        let text = diff_text(&content).unwrap();
+        assert!(text.starts_with(
+            "/p/a.rs
+"
+        ));
+        assert!(text.contains("- old"));
+        assert!(text.contains("+ new"));
+        assert!(text.contains("  keep"));
+    }
+
+    #[test]
+    fn diff_text_ignores_content_without_changes() {
+        let content = vec![ToolCallContent::Diff(
+            Diff::new(
+                "/p/a.rs", "same
+",
+            )
+            .old_text(
+                "same
+",
+            ),
+        )];
+        assert_eq!(diff_text(&content), None);
+    }
 
     const HOST: &str = "buildbox";
     const REMOTE_PATH: &str = "/srv/app";
@@ -657,6 +865,49 @@ mod tests {
     #[test_case("#zzzzzz", None ; "not hex")]
     fn rgb_reads_hex_role(hex: &str, expected: Option<[u8; 3]>) {
         assert_eq!(palette(&[("background", hex)]).rgb("background"), expected);
+    }
+
+    #[test]
+    fn session_view_reads_model_thinking_and_yolo() {
+        use agent_client_protocol_schema::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        };
+
+        fn option(
+            id: &str,
+            category: SessionConfigOptionCategory,
+            current: &str,
+        ) -> SessionConfigOption {
+            SessionConfigOption::select(
+                id.to_owned(),
+                id.to_owned(),
+                current.to_owned(),
+                vec![SessionConfigSelectOption::new(
+                    current.to_owned(),
+                    current.to_owned(),
+                )],
+            )
+            .category(category)
+        }
+        let options = [
+            option("model", SessionConfigOptionCategory::Model, "openai/gpt-5"),
+            option(
+                "thinking",
+                SessionConfigOptionCategory::ThoughtLevel,
+                "high",
+            ),
+            option(
+                "yolo",
+                SessionConfigOptionCategory::Other("other".into()),
+                "enabled",
+            ),
+        ];
+
+        let view = super::session_view(&options);
+
+        assert_eq!(view.model.as_deref(), Some("openai/gpt-5"));
+        assert_eq!(view.thinking.as_deref(), Some("high"));
+        assert!(view.yolo);
     }
 
     #[test]

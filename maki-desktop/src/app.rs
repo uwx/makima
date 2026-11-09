@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol_schema::{
     AvailableCommand, ContentBlock, PermissionOption, SessionUpdate, ToolCallContent,
@@ -20,11 +20,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use maki_storage::StateDir;
-use maki_storage::instances::{self, Instance, InstanceGuard, InstanceKind};
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use serde_json::Value;
 
-use crate::acp::{self, ArgItem, Event, PickItem, PickOutcome, Target};
+use crate::acp::{self, ArgItem, Event, PickItem, PickOutcome, RewindTurn, SessionEntry, Target};
 use crate::backend::{Backend, Command, Started};
 
 const SEND_LABEL: &str = "Send";
@@ -35,7 +35,6 @@ const TRANSCRIPT_MAX_WIDTH: f32 = 860.;
 const PICK_WIDTH: f32 = 560.;
 const PICK_MAX_HEIGHT: f32 = 480.;
 const MAX_SLASH_ROWS: usize = 8;
-const INSTANCES_REFRESH: Duration = Duration::from_secs(2);
 const LIGHT_ACCENT: f32 = 0.6;
 const ON_LIGHT_ACCENT: [u8; 3] = [0x1a, 0x1a, 0x1a];
 const ON_DARK_ACCENT: [u8; 3] = [0xf5, 0xf5, 0xf5];
@@ -44,16 +43,55 @@ const THEME_COMMAND: &str = "theme";
 const THEME_DESCRIPTION: &str = "Switch the color theme";
 const THEME_PICKER_TITLE: &str = "Theme";
 const THEMES_UNAVAILABLE: &str = "This agent does not provide themes";
+const SESSIONS_COMMAND: &str = "sessions";
+const SESSIONS_DESCRIPTION: &str = "Browse and switch sessions";
+const SESSION_PICKER_TITLE: &str = "Sessions";
+const SESSIONS_EMPTY: &str = "No stored sessions in this folder";
+const SESSION_SHORT_CHARS: usize = 8;
+const SESSION_CLOCK_FORMAT: &str = "%b %d %H:%M";
+const OPEN_ELSEWHERE: &str = " · open elsewhere";
+const SESSION_PICK_HINT_ACTION: &str = "open";
+const REWIND_TITLE: &str = "Rewind";
+const REWIND_EMPTY: &str = "No user turns to rewind to";
+const REWIND_PICK_HINT_ACTION: &str = "rewind";
+const ESC_REWIND_HINT: &str = "Press Esc again to rewind...";
+const ESC_CANCEL_HINT: &str = "Press Esc again to stop...";
+const ESCAPE_KEY: &str = "escape";
+const DOUBLE_TAP: Duration = Duration::from_millis(1500);
 const PICK_HINT: &str = "Enter";
+const YOLO_BADGE: &str = "[yolo]";
+const NORMAL_BADGE: &str = "[normal]";
+const THINKING_LABEL: &str = "thinking";
+const CLOCK_FORMAT: &str = "%H:%M";
+const THOUSAND: f64 = 1_000.0;
+const MILLION: f64 = 1_000_000.0;
 const PICK_HINT_ACTION: &str = "apply";
 const ARGUMENT_MAX_HEIGHT: f32 = 320.;
 const SLASH_PREFIX: char = '/';
 const DISCONNECTED: &str = "Agent is not connected";
+const NEW_TAB_KEY: &str = "t";
+const CLOSE_TAB_KEY: &str = "w";
+const NEW_TAB_LABEL: &str = "New session";
+const SESSIONS_GROUP: &str = "Sessions";
+const CONNECTING_LABEL: &str = "Connecting...";
+const SESSION_ENDED_LABEL: &str = "Session ended";
+const START_FAILED_LABEL: &str = "Start failed";
+const MAX_DIFF_LINES: usize = 400;
+const DIFF_TRUNCATED: &str = "... diff truncated";
 
 enum ChatView {
-    User(SharedString),
-    Assistant(Entity<TextViewState>),
-    Thinking(String),
+    User {
+        text: SharedString,
+        at: SharedString,
+    },
+    Assistant {
+        state: Entity<TextViewState>,
+        at: SharedString,
+    },
+    Thinking {
+        text: String,
+        at: SharedString,
+    },
     Tool(ToolCard),
     Notice(SharedString),
 }
@@ -63,6 +101,7 @@ struct ToolCard {
     name: SharedString,
     summary: SharedString,
     output: SharedString,
+    diff: SharedString,
     done: bool,
     failed: bool,
 }
@@ -73,12 +112,15 @@ struct Status {
     context: Option<u64>,
     context_window: u64,
     cost: Option<String>,
+    thinking: Option<SharedString>,
+    yolo: bool,
 }
 
 struct PendingPermission {
     request: Value,
     title: String,
     options: Vec<PermissionOption>,
+    diff: Option<String>,
 }
 
 struct SlashMenu {
@@ -103,6 +145,8 @@ struct PendingPick {
 enum PickTarget {
     Agent(Value),
     Themes,
+    Sessions(Vec<String>),
+    Rewind(Vec<usize>),
 }
 
 #[derive(Clone, Copy)]
@@ -152,8 +196,11 @@ impl ArgumentMenu {
     }
 }
 
-pub struct ChatApp {
+/// One agent session: its connection, transcript, composer, and overlays.
+pub struct SessionPanel {
     backend: Option<Backend>,
+    closed: bool,
+    failed: bool,
     input: Entity<TextareaState>,
     views: Vec<ChatView>,
     scroll: ScrollHandle,
@@ -162,158 +209,133 @@ pub struct ChatApp {
     pick: Option<PendingPick>,
     status: Status,
     commands: Vec<AvailableCommand>,
-    instances: Vec<Instance>,
-    agent_pid: Option<u32>,
-    _instance: Option<InstanceGuard>,
-    _instances: Task<()>,
     themes: Vec<String>,
     theme: Option<String>,
     slash: Option<SlashMenu>,
     slash_dismissed: bool,
     arguments: Option<ArgumentMenu>,
     arguments_dismissed: bool,
+    last_escape: Option<Instant>,
     _subscriptions: Vec<Subscription>,
-    _events: Task<()>,
+    _events: Option<Task<()>>,
 }
 
-impl ChatApp {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut views = Vec::new();
-        let started = Target::from_env().and_then(Backend::start);
-        let (backend, events) = match started {
-            Ok(Started { backend, events }) => (Some(backend), Some(events)),
-            Err(error) => {
-                views.push(ChatView::Notice(
-                    format!("Could not start a session: {error}").into(),
-                ));
-                (None, None)
-            }
-        };
+/// The desktop shell: a sidebar of live sessions and the active one.
+pub struct ChatApp {
+    panels: Vec<Entity<SessionPanel>>,
+    active: usize,
+    _subscriptions: Vec<Subscription>,
+}
 
-        let agent_pid = backend.as_ref().map(|backend| backend.agent_pid);
-        let storage = StateDir::resolve().ok();
-        let cwd = backend
-            .as_ref()
-            .map(|backend| backend.cwd.clone())
-            .unwrap_or_default();
-        let _instance = storage.as_ref().and_then(|storage| {
-            InstanceGuard::register(storage, InstanceKind::Desktop, &cwd, None).ok()
-        });
-        let themes = backend
-            .as_ref()
-            .map(|backend| backend.themes.names.clone())
-            .unwrap_or_default();
-        let theme = backend
-            .as_ref()
-            .and_then(|backend| backend.themes.current.as_ref())
-            .map(|theme| theme.name.clone());
-        let status = Status {
-            model: backend
-                .as_ref()
-                .map(|backend| SharedString::from(backend.model.clone()))
-                .unwrap_or_default(),
-            ..Status::default()
-        };
-
-        if let Some(theme) = backend
-            .as_ref()
-            .and_then(|backend| backend.themes.current.clone())
-        {
-            apply_palette(&theme, cx);
-        }
-
+impl SessionPanel {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder(COMPOSER_PLACEHOLDER)
                 .submit_on_enter(true)
                 .auto_grow(1, 8)
         });
-
-        let this = cx.entity().downgrade();
-        let subscriptions = vec![
-            cx.subscribe_in(
-                &input,
-                window,
-                |this: &mut Self, _, event: &InputEvent, window, cx| match event {
-                    InputEvent::Change => {
-                        this.slash_dismissed = false;
-                        this.arguments_dismissed = false;
-                        this.refresh_slash(cx);
-                        this.refresh_arguments(cx);
-                        cx.notify();
-                    }
-                    InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
-                    _ => {}
-                },
-            ),
-            cx.intercept_keystrokes({
-                let this = this.clone();
-                move |event, window, cx| {
-                    _ = this.update(cx, |this, cx| {
-                        if this.on_key(&event.keystroke, window, cx) {
-                            cx.stop_propagation();
-                        }
-                    });
+        let subscriptions = vec![cx.subscribe_in(
+            &input,
+            window,
+            |this: &mut Self, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    this.slash_dismissed = false;
+                    this.arguments_dismissed = false;
+                    this.refresh_slash(cx);
+                    this.refresh_arguments(cx);
+                    cx.notify();
                 }
-            }),
-        ];
-
-        let instances_task = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(INSTANCES_REFRESH).await;
-                let Some(storage) = storage.clone() else {
-                    return;
-                };
-                let listed = cx
-                    .background_executor()
-                    .spawn(async move { instances::list(&storage) })
-                    .await;
-                if this
-                    .update(cx, |app, cx| {
-                        app.instances = listed;
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        });
-
-        let events_task = cx.spawn(async move |this, cx| {
-            let Some(events) = events else {
-                return;
-            };
-            while let Ok(event) = events.recv_async().await {
-                if this.update(cx, |app, cx| app.on_event(event, cx)).is_err() {
-                    break;
-                }
-            }
-        });
-
+                InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
+                _ => {}
+            },
+        )];
         Self {
-            backend,
+            backend: None,
+            closed: false,
+            failed: false,
             input,
-            views,
+            views: Vec::new(),
             scroll: ScrollHandle::new(),
             busy: false,
             pending: None,
             pick: None,
-            status,
+            status: Status::default(),
             commands: Vec::new(),
-            instances: Vec::new(),
-            agent_pid,
-            _instance,
-            _instances: instances_task,
-            themes,
-            theme,
+            themes: Vec::new(),
+            theme: None,
             slash: None,
             slash_dismissed: false,
             arguments: None,
             arguments_dismissed: false,
+            last_escape: None,
             _subscriptions: subscriptions,
-            _events: events_task,
+            _events: None,
         }
+    }
+
+    /// A panel starts empty and gets its agent once the connection is up, so
+    /// opening a tab never blocks the window.
+    fn attach(
+        &mut self,
+        started: Result<Started, String>,
+        apply_theme: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match started {
+            Ok(Started { backend, events }) => {
+                self.status = session_status(&backend);
+                self.themes = backend.themes.names.clone();
+                self.theme = backend
+                    .themes
+                    .current
+                    .as_ref()
+                    .map(|theme| theme.name.clone());
+                if apply_theme && let Some(theme) = backend.themes.current.clone() {
+                    apply_palette(&theme, cx);
+                }
+                self.backend = Some(backend);
+                self._events = Some(cx.spawn(async move |this, cx| {
+                    while let Ok(event) = events.recv_async().await {
+                        if this
+                            .update(cx, |panel, cx| panel.on_event(event, cx))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }));
+            }
+            Err(error) => {
+                self.failed = true;
+                self.notice(format!("Could not start a session: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.input.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    fn title(&self) -> String {
+        match &self.backend {
+            Some(backend) => format!("Session {}", backend.session),
+            None if self.failed => START_FAILED_LABEL.to_owned(),
+            None if self.closed => SESSION_ENDED_LABEL.to_owned(),
+            None => CONNECTING_LABEL.to_owned(),
+        }
+    }
+
+    fn location(&self) -> String {
+        self.backend
+            .as_ref()
+            .map(|backend| format!("{} · {}", backend.target, backend.cwd.display()))
+            .unwrap_or_default()
+    }
+
+    fn theme_name(&self) -> Option<String> {
+        self.theme.clone()
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -344,21 +366,25 @@ impl ChatApp {
 
         self.input.update(cx, |state, cx| state.clean(window, cx));
         self.slash = None;
-        self.views.push(ChatView::User(text.into()));
-        self.views.push(ChatView::Assistant(
-            cx.new(|cx| TextViewState::markdown("", cx)),
-        ));
+        self.views.push(ChatView::User {
+            text: text.into(),
+            at: clock(),
+        });
+        self.views.push(ChatView::Assistant {
+            state: cx.new(|cx| TextViewState::markdown("", cx)),
+            at: clock(),
+        });
         self.busy = true;
         self.pending = None;
         self.scroll.scroll_to_bottom();
         cx.notify();
     }
 
-    /// Commands the desktop answers itself; the agent advertises no `/theme`.
     fn run_local_command(&mut self, text: &str) -> bool {
         match local_command(text) {
             Some(LocalCommand::ThemePicker) => self.open_theme_picker(),
             Some(LocalCommand::Theme(name)) => self.switch_theme(name),
+            Some(LocalCommand::Sessions(query)) => self.open_sessions(query),
             None => return false,
         }
         true
@@ -397,6 +423,7 @@ impl ChatApp {
                     request: prompt.id,
                     title: prompt.title,
                     options: prompt.options,
+                    diff: prompt.diff,
                 });
             }
             Event::Flash(text) => self.notice(text),
@@ -413,6 +440,48 @@ impl ChatApp {
                 }
                 Err(error) => self.notice(format!("Theme failed: {error}")),
             },
+            Event::Sessions(result) => match result {
+                Ok(entries) => self.open_session_picker(entries),
+                Err(error) => self.notice(format!("Sessions unavailable: {error}")),
+            },
+            Event::Loaded(result) => {
+                self.busy = false;
+                match result {
+                    Ok(loaded) => {
+                        self.status.model = loaded.model.into();
+                        self.status.thinking = loaded.options.thinking.map(SharedString::from);
+                        self.status.yolo = loaded.options.yolo;
+                        if let Some(backend) = &mut self.backend {
+                            backend.session = acp::short_session(&loaded.session);
+                        }
+                        self.notice(format!(
+                            "Loaded session {}",
+                            acp::short_session(&loaded.session)
+                        ));
+                    }
+                    Err(error) => self.notice(format!("Session not opened: {error}")),
+                }
+            }
+            Event::RewindTurns(result) => match result {
+                Ok(turns) => self.open_rewind_picker(turns),
+                Err(error) => self.notice(format!("Rewind unavailable: {error}")),
+            },
+            Event::Rewound => {
+                self.views.clear();
+                self.pending = None;
+                self.arguments = None;
+                self.slash = None;
+                self.busy = false;
+                self.status.context = None;
+                self.scroll.scroll_to_bottom();
+            }
+            Event::RewindDone(result) => {
+                self.busy = false;
+                match result {
+                    Ok(draft) => self.restore_draft(draft, cx),
+                    Err(error) => self.notice(format!("Rewind failed: {error}")),
+                }
+            }
             Event::PromptDone(result) => {
                 self.busy = false;
                 self.pending = None;
@@ -422,6 +491,7 @@ impl ChatApp {
             }
             Event::Closed(reason) => {
                 self.backend = None;
+                self.closed = true;
                 self.busy = false;
                 self.pending = None;
                 self.pick = None;
@@ -484,6 +554,16 @@ impl ChatApp {
                     self.switch_theme(name.clone());
                 }
             }
+            PickTarget::Sessions(ids) => {
+                if let (PickEnd::Choose, Some(id)) = (end, ids.get(pick.active)) {
+                    self.resume_session(id.clone());
+                }
+            }
+            PickTarget::Rewind(offsets) => {
+                if let (PickEnd::Choose, Some(offset)) = (end, offsets.get(pick.active)) {
+                    self.rewind(*offset);
+                }
+            }
         }
         cx.notify();
     }
@@ -526,8 +606,125 @@ impl ChatApp {
         }
     }
 
+    fn open_sessions(&mut self, query: String) {
+        let Some(backend) = &self.backend else {
+            self.notice(DISCONNECTED.to_owned());
+            return;
+        };
+        if let Err(error) = backend.list_sessions(query) {
+            self.notice(error);
+        }
+    }
+
+    fn open_session_picker(&mut self, entries: Vec<SessionEntry>) {
+        let entries = entries
+            .into_iter()
+            .filter(|entry| !entry.current)
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            self.notice(SESSIONS_EMPTY.to_owned());
+            return;
+        }
+        let items = entries
+            .iter()
+            .map(|entry| PickItem {
+                label: entry.title.clone(),
+                detail: Some(session_detail(entry)),
+                section: None,
+            })
+            .collect();
+        let ids = entries.into_iter().map(|entry| entry.id).collect();
+        self.pick = Some(PendingPick {
+            target: PickTarget::Sessions(ids),
+            title: SESSION_PICKER_TITLE.to_owned(),
+            footer: vec![(PICK_HINT.to_owned(), SESSION_PICK_HINT_ACTION.to_owned())],
+            items,
+            active: 0,
+        });
+    }
+
+    /// The agent replays the stored transcript as session updates, so the
+    /// transcript is emptied first and the replay fills it back.
+    fn resume_session(&mut self, id: String) {
+        let Some(backend) = &self.backend else {
+            self.notice(DISCONNECTED.to_owned());
+            return;
+        };
+        if let Err(error) = backend.load_session(id) {
+            self.notice(error);
+            return;
+        }
+        self.views.clear();
+        self.pending = None;
+        self.arguments = None;
+        self.slash = None;
+        self.busy = true;
+        self.scroll.scroll_to_bottom();
+    }
+
+    fn open_rewind(&mut self) {
+        let Some(backend) = &self.backend else {
+            self.notice(DISCONNECTED.to_owned());
+            return;
+        };
+        if let Err(error) = backend.list_rewind_turns() {
+            self.notice(error);
+        }
+    }
+
+    fn open_rewind_picker(&mut self, turns: Vec<RewindTurn>) {
+        if turns.is_empty() {
+            self.notice(REWIND_EMPTY.to_owned());
+            return;
+        }
+        let (items, offsets) = rewind_rows(turns);
+        self.pick = Some(PendingPick {
+            target: PickTarget::Rewind(offsets),
+            title: REWIND_TITLE.to_owned(),
+            footer: vec![(PICK_HINT.to_owned(), REWIND_PICK_HINT_ACTION.to_owned())],
+            items,
+            active: 0,
+        });
+    }
+
+    fn rewind(&mut self, offset: usize) {
+        let Some(backend) = &self.backend else {
+            self.notice(DISCONNECTED.to_owned());
+            return;
+        };
+        if let Err(error) = backend.rewind(offset) {
+            self.notice(error);
+            return;
+        }
+        self.busy = true;
+    }
+
+    fn restore_draft(&mut self, draft: String, cx: &mut Context<Self>) {
+        if draft.is_empty() {
+            return;
+        }
+        let Some(window) = cx.active_window() else {
+            return;
+        };
+        _ = cx.update_window(window, |_, window, cx| {
+            self.input
+                .update(cx, |state, cx| state.set_value(draft, window, cx));
+            self.input.read(cx).focus_handle(cx).focus(window, cx);
+        });
+    }
+
     fn on_update(&mut self, update: SessionUpdate, cx: &mut Context<Self>) {
         match update {
+            // Only replayed history carries user chunks; a live prompt is
+            // already on screen by the time the agent answers.
+            SessionUpdate::UserMessageChunk(chunk) => {
+                if let ContentBlock::Text(block) = chunk.content {
+                    self.views.push(ChatView::User {
+                        text: block.text.into(),
+                        at: clock(),
+                    });
+                }
+            }
             SessionUpdate::AgentMessageChunk(chunk) => {
                 if let ContentBlock::Text(block) = chunk.content {
                     self.push_text(&block.text, cx);
@@ -555,9 +752,13 @@ impl ChatApp {
                         other => other.to_string(),
                     })
                     .or_else(|| fields.content.as_deref().and_then(tool_text));
+                let diff = fields.content.as_deref().and_then(acp::diff_text);
                 self.upsert_tool(&id, "", &summary);
                 if let Some(output) = output {
                     self.set_tool_output(&id, output);
+                }
+                if let Some(diff) = diff {
+                    self.set_tool_diff(&id, diff);
                 }
                 if let Some(status) = fields.status {
                     self.apply_tool_status(&id, status);
@@ -565,13 +766,13 @@ impl ChatApp {
             }
             SessionUpdate::AvailableCommandsUpdate(update) => {
                 self.commands = update.available_commands;
-                if !self
-                    .commands
-                    .iter()
-                    .any(|command| command.name == THEME_COMMAND)
-                {
-                    self.commands
-                        .push(AvailableCommand::new(THEME_COMMAND, THEME_DESCRIPTION));
+                for (name, description) in [
+                    (THEME_COMMAND, THEME_DESCRIPTION),
+                    (SESSIONS_COMMAND, SESSIONS_DESCRIPTION),
+                ] {
+                    if !self.commands.iter().any(|command| command.name == name) {
+                        self.commands.push(AvailableCommand::new(name, description));
+                    }
                 }
                 self.refresh_slash(cx);
             }
@@ -583,9 +784,12 @@ impl ChatApp {
                     .map(|cost| format!("{:.4} {}", cost.amount, cost.currency));
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
-                if let Some(model) = acp::model_from(&update.config_options) {
+                let view = acp::session_view(&update.config_options);
+                if let Some(model) = view.model {
                     self.status.model = model.into();
                 }
+                self.status.thinking = view.thinking.map(SharedString::from);
+                self.status.yolo = view.yolo;
             }
             _ => {}
         }
@@ -596,23 +800,26 @@ impl ChatApp {
             .views
             .len()
             .checked_sub(1)
-            .filter(|index| matches!(&self.views[*index], ChatView::Assistant(_)));
+            .filter(|index| matches!(&self.views[*index], ChatView::Assistant { .. }));
         if let Some(index) = trailing {
-            if let ChatView::Assistant(state) = &self.views[index] {
+            if let ChatView::Assistant { state, .. } = &self.views[index] {
                 state.update(cx, |state, cx| state.push_str(text, cx));
             }
             return;
         }
         let state = cx.new(|cx| TextViewState::markdown(text, cx));
-        self.views.push(ChatView::Assistant(state));
+        self.views.push(ChatView::Assistant { state, at: clock() });
     }
 
     fn push_thinking(&mut self, text: &str) {
-        if let Some(ChatView::Thinking(buffer)) = self.views.last_mut() {
+        if let Some(ChatView::Thinking { text: buffer, .. }) = self.views.last_mut() {
             buffer.push_str(text);
             return;
         }
-        self.views.push(ChatView::Thinking(text.into()));
+        self.views.push(ChatView::Thinking {
+            text: text.to_owned(),
+            at: clock(),
+        });
     }
 
     fn tool_mut(&mut self, id: &str) -> Option<&mut ToolCard> {
@@ -637,6 +844,7 @@ impl ChatApp {
             name: name.into(),
             summary: summary.into(),
             output: SharedString::default(),
+            diff: SharedString::default(),
             done: false,
             failed: false,
         }));
@@ -645,6 +853,12 @@ impl ChatApp {
     fn set_tool_output(&mut self, id: &str, output: String) {
         if let Some(card) = self.tool_mut(id) {
             card.output = output.into();
+        }
+    }
+
+    fn set_tool_diff(&mut self, id: &str, diff: String) {
+        if let Some(card) = self.tool_mut(id) {
+            card.diff = diff.into();
         }
     }
 
@@ -785,13 +999,54 @@ impl ChatApp {
     }
 
     fn on_key(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if key.key != ESCAPE_KEY {
+            self.last_escape = None;
+        }
         if self.pick.is_some() {
             return self.on_pick_key(key, cx);
         }
         if self.on_slash_key(key, window, cx) {
             return true;
         }
-        self.on_argument_key(key, window, cx)
+        if self.on_argument_key(key, window, cx) {
+            return true;
+        }
+        if key.key == ESCAPE_KEY
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+        {
+            return self.on_escape(cx);
+        }
+        false
+    }
+
+    /// Double Esc cancels a running turn or opens the rewind picker, like the
+    /// TUI; one Esc only arms the second press and says what it would do.
+    fn on_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        let repeated = self
+            .last_escape
+            .take()
+            .is_some_and(|at| at.elapsed() < DOUBLE_TAP);
+        if !repeated {
+            self.last_escape = Some(Instant::now());
+            self.notice(
+                if self.busy {
+                    ESC_CANCEL_HINT
+                } else {
+                    ESC_REWIND_HINT
+                }
+                .to_owned(),
+            );
+            cx.notify();
+            return true;
+        }
+        if self.busy {
+            self.cancel(cx);
+        } else {
+            self.open_rewind();
+        }
+        true
     }
 
     fn on_pick_key(&mut self, key: &Keystroke, cx: &mut Context<Self>) -> bool {
@@ -860,105 +1115,6 @@ impl ChatApp {
             _ => return false,
         }
         true
-    }
-
-    /// Other live makima processes: our pid and the agent we spawned are ours.
-    fn instance_rows(&self) -> Vec<(String, String, u32)> {
-        self.instances
-            .iter()
-            .filter(|instance| !instance.is_self() && Some(instance.pid) != self.agent_pid)
-            .map(|instance| {
-                (
-                    instance.kind.label().to_owned(),
-                    Path::new(&instance.cwd).file_name().map_or_else(
-                        || instance.cwd.clone(),
-                        |name| name.to_string_lossy().into_owned(),
-                    ),
-                    instance.pid,
-                )
-            })
-            .collect()
-    }
-
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let session_label = self
-            .backend
-            .as_ref()
-            .map(|backend| format!("Session {}", backend.session))
-            .unwrap_or_else(|| "No session".to_owned());
-        let instances = self.instance_rows();
-        let location = self
-            .backend
-            .as_ref()
-            .map(|backend| format!("{} · {}", backend.target, backend.cwd.display()))
-            .unwrap_or_default();
-        let theme = self.theme.clone();
-
-        Sidebar::new("sidebar")
-            .w(px(240.))
-            .collapsible(SidebarCollapsible::None)
-            .header(
-                SidebarHeader::new().child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .size_8()
-                                .flex_shrink_0()
-                                .rounded(cx.theme().radius)
-                                .bg(cx.theme().sidebar_primary)
-                                .text_color(cx.theme().sidebar_primary_foreground)
-                                .child(Icon::new(IconName::Bot)),
-                        )
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .overflow_hidden()
-                                .child("Makima")
-                                .child(div().text_xs().child("desktop")),
-                        ),
-                ),
-            )
-            .child(
-                SidebarGroup::new("Chat").child(
-                    SidebarMenu::new().children([SidebarMenuItem::new(session_label)
-                        .icon(IconName::Inbox)
-                        .active(true)]),
-                ),
-            )
-            .when(!instances.is_empty(), |this| {
-                this.child(
-                    SidebarGroup::new("Instances").child(SidebarMenu::new().children(
-                        instances.into_iter().map(|(kind, folder, pid)| {
-                            SidebarMenuItem::new(format!("{kind} · {folder} · {pid}"))
-                        }),
-                    )),
-                )
-            })
-            .footer(
-                SidebarFooter::new().child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(IconName::Folder)
-                                .child(div().text_xs().overflow_hidden().child(location)),
-                        )
-                        .when_some(theme, |this, theme| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("Theme · {theme}")),
-                            )
-                        }),
-                ),
-            )
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1034,9 +1190,16 @@ impl ChatApp {
 
     fn render_view(&self, view: &ChatView, cx: &mut Context<Self>) -> AnyElement {
         match view {
-            ChatView::User(text) => h_flex()
+            ChatView::User { text, at } => v_flex()
                 .w_full()
-                .justify_end()
+                .items_end()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(at.clone()),
+                )
                 .child(
                     div()
                         .max_w(px(680.))
@@ -1047,7 +1210,7 @@ impl ChatApp {
                         .child(text.clone()),
                 )
                 .into_any_element(),
-            ChatView::Assistant(state) => v_flex()
+            ChatView::Assistant { state, at } => v_flex()
                 .w_full()
                 .gap_1()
                 .child(
@@ -1057,11 +1220,13 @@ impl ChatApp {
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(Icon::new(IconName::Bot))
-                        .child("Assistant"),
+                        .child("Assistant")
+                        .child(div().flex_1())
+                        .child(at.clone()),
                 )
                 .child(TextView::new(state).selectable(true))
                 .into_any_element(),
-            ChatView::Thinking(text) => v_flex()
+            ChatView::Thinking { text, at } => v_flex()
                 .w_full()
                 .gap_1()
                 .child(
@@ -1071,7 +1236,9 @@ impl ChatApp {
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(Icon::new(IconName::Cpu))
-                        .child("Thinking"),
+                        .child("Thinking")
+                        .child(div().flex_1())
+                        .child(at.clone()),
                 )
                 .child(
                     div()
@@ -1133,6 +1300,9 @@ impl ChatApp {
                         .child(card.output.clone()),
                 )
             })
+            .when(!card.diff.is_empty(), |this| {
+                this.child(diff_block(&card.diff, cx))
+            })
             .into_any_element()
     }
 
@@ -1183,6 +1353,9 @@ impl ChatApp {
                     .child(Icon::new(IconName::TriangleAlert))
                     .child(div().text_sm().child(title)),
             )
+            .when_some(pending.diff.as_deref(), |this, diff| {
+                this.child(diff_block(diff, cx))
+            })
             .child(h_flex().gap_2().justify_end().children(actions))
     }
 
@@ -1459,9 +1632,21 @@ impl ChatApp {
     fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let context = match self.status.context {
             Some(used) if self.status.context_window > 0 => {
-                format!("{used} / {} ctx", self.status.context_window)
+                let percent = used.saturating_mul(100) / self.status.context_window;
+                let window = compact_tokens(self.status.context_window);
+                format!("{}/{window} ({percent}%)", compact_tokens(used))
             }
             _ => String::new(),
+        };
+        let thinking = self
+            .status
+            .thinking
+            .as_ref()
+            .map(|thinking| format!("{THINKING_LABEL}: {thinking}"));
+        let permission = if self.status.yolo {
+            YOLO_BADGE
+        } else {
+            NORMAL_BADGE
         };
 
         h_flex()
@@ -1475,17 +1660,223 @@ impl ChatApp {
             .border_color(cx.theme().border)
             .text_color(cx.theme().muted_foreground)
             .child(self.status.model.clone())
+            .child(div().flex_1())
+            .children(thinking)
             .when(!context.is_empty(), |this| this.child(context))
             .children(self.status.cost.clone())
+            .child(permission)
     }
 }
 
-impl ChatApp {
+impl SessionPanel {
     fn cwd_label(&self) -> String {
         self.backend
             .as_ref()
             .map(|backend| backend.cwd.display().to_string())
             .unwrap_or_else(|| PathBuf::from(".").display().to_string())
+    }
+}
+
+impl ChatApp {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let panel = cx.new(|cx| {
+            let mut panel = SessionPanel::new(window, cx);
+            panel.attach(Target::from_env().and_then(Backend::start), true, cx);
+            panel
+        });
+        let this = cx.entity().downgrade();
+        let subscriptions = vec![
+            cx.observe(&panel, |_, _, cx| cx.notify()),
+            cx.intercept_keystrokes(move |event, window, cx| {
+                _ = this.update(cx, |this, cx| {
+                    if this.on_key(&event.keystroke, window, cx) {
+                        cx.stop_propagation();
+                    }
+                });
+            }),
+        ];
+        panel.update(cx, |panel, cx| panel.focus(window, cx));
+        Self {
+            panels: vec![panel],
+            active: 0,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// Ctrl+T opens a tab with its own agent, Ctrl+W closes the active one.
+    fn on_key(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform {
+            match key.key.as_str() {
+                NEW_TAB_KEY => return self.open_tab(window, cx),
+                CLOSE_TAB_KEY => return self.close_tab(window, cx),
+                _ => {}
+            }
+        }
+        let Some(panel) = self.panels.get(self.active).cloned() else {
+            return false;
+        };
+        panel.update(cx, |panel, cx| panel.on_key(key, window, cx))
+    }
+
+    fn open_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let panel = cx.new(|cx| SessionPanel::new(window, cx));
+        let target_panel = panel.clone();
+        let theme = self
+            .panels
+            .get(self.active)
+            .and_then(|panel| panel.read(cx).theme_name());
+        self._subscriptions
+            .push(cx.observe(&panel, |_, _, cx| cx.notify()));
+        self.panels.push(panel);
+        self.active = self.panels.len() - 1;
+        self.focus_active(window, cx);
+        cx.spawn(async move |this, cx| {
+            let started = cx
+                .background_executor()
+                .spawn(async { Target::from_env().and_then(Backend::start) })
+                .await;
+            _ = this.update(cx, |app, cx| {
+                if app.panels.contains(&target_panel) {
+                    target_panel.update(cx, |panel, cx| {
+                        panel.attach(started, false, cx);
+                        if theme.is_some() {
+                            panel.theme = theme;
+                        }
+                    });
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+        true
+    }
+
+    fn close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.panels.len() < 2 {
+            return true;
+        }
+        self.panels.remove(self.active);
+        self.active = self.active.min(self.panels.len() - 1);
+        self.focus_active(window, cx);
+        cx.notify();
+        true
+    }
+
+    fn switch_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index == self.active || index >= self.panels.len() {
+            return;
+        }
+        self.active = index;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(panel) = self.panels.get(self.active) {
+            panel.update(cx, |panel, cx| panel.focus(window, cx));
+        }
+    }
+
+    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self
+            .panels
+            .iter()
+            .enumerate()
+            .map(|(index, panel)| {
+                let this = cx.entity();
+                SidebarMenuItem::new(panel.read(cx).title())
+                    .icon(IconName::Inbox)
+                    .active(index == self.active)
+                    .on_click(move |_, window, cx| {
+                        this.update(cx, |app, cx| app.switch_tab(index, window, cx));
+                    })
+            })
+            .collect::<Vec<_>>();
+        let new_row = {
+            let this = cx.entity();
+            SidebarMenuItem::new(NEW_TAB_LABEL)
+                .icon(IconName::Plus)
+                .on_click(move |_, window, cx| {
+                    this.update(cx, |app, cx| {
+                        app.open_tab(window, cx);
+                    });
+                })
+        };
+        let (location, theme) = self.panels.get(self.active).map_or_else(
+            || (String::new(), None),
+            |panel| {
+                let panel = panel.read(cx);
+                (panel.location(), panel.theme_name())
+            },
+        );
+
+        Sidebar::new("sidebar")
+            .w(px(240.))
+            .collapsible(SidebarCollapsible::None)
+            .header(
+                SidebarHeader::new().child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size_8()
+                                .flex_shrink_0()
+                                .rounded(cx.theme().radius)
+                                .bg(cx.theme().sidebar_primary)
+                                .text_color(cx.theme().sidebar_primary_foreground)
+                                .child(Icon::new(IconName::Bot)),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .overflow_hidden()
+                                .child("Makima")
+                                .child(div().text_xs().child("desktop")),
+                        ),
+                ),
+            )
+            .child(
+                SidebarGroup::new(SESSIONS_GROUP)
+                    .child(SidebarMenu::new().children(rows).child(new_row)),
+            )
+            .footer(
+                SidebarFooter::new().child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_2()
+                                .child(IconName::Folder)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .truncate()
+                                        .child(location),
+                                ),
+                        )
+                        .when_some(theme, |this, theme| {
+                            this.child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .truncate()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("Theme · {theme}")),
+                            )
+                        }),
+                ),
+            )
     }
 }
 
@@ -1500,16 +1891,20 @@ fn slash_query(value: &str) -> Option<String> {
 enum LocalCommand {
     ThemePicker,
     Theme(String),
+    Sessions(String),
 }
 
 fn local_command(text: &str) -> Option<LocalCommand> {
-    let rest = text
-        .strip_prefix(SLASH_PREFIX)?
-        .strip_prefix(THEME_COMMAND)?;
-    Some(match rest.trim() {
-        "" => LocalCommand::ThemePicker,
-        name => LocalCommand::Theme(name.to_owned()),
-    })
+    let rest = text.strip_prefix(SLASH_PREFIX)?;
+    if let Some(name) = rest.strip_prefix(THEME_COMMAND) {
+        return Some(match name.trim() {
+            "" => LocalCommand::ThemePicker,
+            name => LocalCommand::Theme(name.to_owned()),
+        });
+    }
+    Some(LocalCommand::Sessions(
+        rest.strip_prefix(SESSIONS_COMMAND)?.trim().to_owned(),
+    ))
 }
 
 /// The token being typed after the command name, where it starts, and whether
@@ -1613,8 +2008,101 @@ fn apply_palette(palette: &acp::ThemePalette, cx: &mut App) {
     paint("warning", &mut colors.yellow);
 }
 
+/// `500000` reads as `500.0k`, matching the CLI status bar.
+fn compact_tokens(tokens: u64) -> String {
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", tokens as f64 / THOUSAND),
+        _ => format!("{:.1}m", tokens as f64 / MILLION),
+    }
+}
+
+/// The local time a message was created, e.g. `14:05`.
+fn clock() -> SharedString {
+    Timestamp::now()
+        .to_zoned(TimeZone::system())
+        .strftime(CLOCK_FORMAT)
+        .to_string()
+        .into()
+}
+
+/// The status bar state a freshly connected session starts with.
+fn session_status(backend: &Backend) -> Status {
+    Status {
+        model: SharedString::from(backend.model.clone()),
+        thinking: backend.options.thinking.clone().map(SharedString::from),
+        yolo: backend.options.yolo,
+        ..Status::default()
+    }
+}
+
+/// One picker row's second line: id, when it was last saved, and size.
+fn session_detail(entry: &SessionEntry) -> String {
+    let short = entry.id.get(..SESSION_SHORT_CHARS).unwrap_or(&entry.id);
+    let when = Timestamp::from_second(i64::try_from(entry.updated_at).unwrap_or_default())
+        .map(|stamp| {
+            stamp
+                .to_zoned(TimeZone::system())
+                .strftime(SESSION_CLOCK_FORMAT)
+                .to_string()
+        })
+        .unwrap_or_default();
+    let mut detail = format!("{short} · {when} · {} messages", entry.messages);
+    if entry.open_elsewhere {
+        detail.push_str(OPEN_ELSEWHERE);
+    }
+    detail
+}
+
+/// Newest turn first, like the TUI picker, with the offsets kept in the same
+/// order as the rows they label.
+fn rewind_rows(turns: Vec<RewindTurn>) -> (Vec<PickItem>, Vec<usize>) {
+    let mut items = Vec::with_capacity(turns.len());
+    let mut offsets = Vec::with_capacity(turns.len());
+    for turn in turns.into_iter().rev() {
+        items.push(PickItem {
+            label: format!("{}: {}", turn.turn, turn.preview),
+            detail: None,
+            section: None,
+        });
+        offsets.push(turn.offset);
+    }
+    (items, offsets)
+}
+
 /// Label and description colors for a row, readable on its own background:
 /// the accent fill needs its own foreground, a plain row keeps the theme's.
+/// A unified diff in the theme's mono font, added lines in the success color
+/// and removed ones in the danger color.
+fn diff_block(text: &str, cx: &App) -> AnyElement {
+    let mut lines = text.lines().take(MAX_DIFF_LINES + 1).collect::<Vec<_>>();
+    let truncated = lines.len() > MAX_DIFF_LINES;
+    lines.truncate(MAX_DIFF_LINES);
+    v_flex()
+        .w_full()
+        .px_3()
+        .py_2()
+        .gap_0()
+        .text_xs()
+        .font_family(cx.theme().mono_font_family.clone())
+        .children(lines.into_iter().map(|line| {
+            let color = match line.chars().next() {
+                Some('+') => cx.theme().success,
+                Some('-') => cx.theme().danger,
+                _ => cx.theme().muted_foreground,
+            };
+            div().text_color(color).child(line.to_owned())
+        }))
+        .when(truncated, |this| {
+            this.child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(DIFF_TRUNCATED),
+            )
+        })
+        .into_any_element()
+}
+
 fn row_colors(active: bool, cx: &App) -> (Hsla, Hsla) {
     if !active {
         return (cx.theme().foreground, cx.theme().muted_foreground);
@@ -1665,7 +2153,6 @@ fn tool_text(content: &[ToolCallContent]) -> Option<String> {
                 ContentBlock::Text(block) => block.text.clone(),
                 _ => continue,
             },
-            ToolCallContent::Diff(diff) => diff.path.display().to_string(),
             _ => continue,
         };
         if !text.is_empty() {
@@ -1676,34 +2163,43 @@ fn tool_text(content: &[ToolCallContent]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-impl Render for ChatApp {
+impl Render for SessionPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .relative()
             .size_full()
             .child(
-                h_flex()
+                v_flex()
                     .size_full()
-                    .bg(cx.theme().background)
-                    .text_color(cx.theme().foreground)
-                    .child(self.sidebar(cx))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .h_full()
-                            .min_w_0()
-                            .child(self.header(cx))
-                            .child(self.transcript(cx))
-                            .children(
-                                self.pending
-                                    .as_ref()
-                                    .map(|pending| self.permission_card(pending, cx)),
-                            )
-                            .child(self.composer(cx))
-                            .child(self.status_bar(cx)),
-                    ),
+                    .min_w_0()
+                    .child(self.header(cx))
+                    .child(self.transcript(cx))
+                    .children(
+                        self.pending
+                            .as_ref()
+                            .map(|pending| self.permission_card(pending, cx)),
+                    )
+                    .child(self.composer(cx))
+                    .child(self.status_bar(cx)),
             )
             .children(self.pick.as_ref().map(|pick| self.pick_modal(pick, cx)))
+    }
+}
+
+impl Render for ChatApp {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(self.sidebar(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .children(self.panels.get(self.active).cloned()),
+            )
     }
 }
 
@@ -1711,15 +2207,35 @@ impl Render for ChatApp {
 mod tests {
     use super::{
         ArgumentMenu, FIELD_CLOSE, LocalCommand, SLASH_PREFIX, accent_text, argument_insertion,
-        argument_slot, local_command, quote_argument, slash_query,
+        argument_slot, compact_tokens, local_command, quote_argument, rewind_rows, slash_query,
     };
-    use crate::acp::ArgItem;
+    use crate::acp::{ArgItem, RewindTurn};
     use gpui_kit::{Hsla, rgb};
     use test_case::test_case;
 
     #[test]
     fn slash_query_accepts_the_bare_prefix() {
         assert_eq!(slash_query(&SLASH_PREFIX.to_string()), Some(String::new()));
+    }
+
+    #[test]
+    fn rewind_rows_newest_first_keeps_offsets_aligned() {
+        let turns = vec![
+            RewindTurn {
+                offset: 0,
+                turn: 1,
+                preview: "first".into(),
+            },
+            RewindTurn {
+                offset: 12,
+                turn: 2,
+                preview: "second".into(),
+            },
+        ];
+        let (items, offsets) = rewind_rows(turns);
+        assert_eq!(items[0].label, "2: second");
+        assert_eq!(items[1].label, "1: first");
+        assert_eq!(offsets, vec![12, 0]);
     }
 
     #[test_case("/inherit", None ; "command without arguments")]
@@ -1741,8 +2257,10 @@ mod tests {
     #[test_case("/theme  dracula ", Some(LocalCommand::Theme("dracula".to_owned())) ; "trimmed")]
     #[test_case("/themeology", Some(LocalCommand::Theme("ology".to_owned())) ; "prefix match keeps the word")]
     #[test_case("/theming", None ; "other command")]
+    #[test_case("/sessions", Some(LocalCommand::Sessions(String::new())) ; "bare sessions opens the picker")]
+    #[test_case("/sessions auth", Some(LocalCommand::Sessions("auth".to_owned())) ; "session query")]
     #[test_case("hello", None ; "plain text")]
-    fn local_command_recognizes_theme(text: &str, expected: Option<LocalCommand>) {
+    fn local_command_recognizes_local_commands(text: &str, expected: Option<LocalCommand>) {
         assert_eq!(local_command(text), expected);
     }
 
@@ -1768,6 +2286,14 @@ mod tests {
     #[test_case("thinking=high", true, "thinking=high," ; "field list opens the next field")]
     fn argument_insertion_closes_or_keeps_the_token(insertion: &str, braced: bool, expected: &str) {
         assert_eq!(argument_insertion(insertion, braced), expected);
+    }
+
+    #[test_case(0, "0" ; "zero")]
+    #[test_case(999, "999" ; "below a thousand")]
+    #[test_case(500_000, "500.0k" ; "thousands")]
+    #[test_case(1_200_000, "1.2m" ; "millions")]
+    fn compact_tokens_matches_the_cli(tokens: u64, expected: &str) {
+        assert_eq!(compact_tokens(tokens), expected);
     }
 
     #[test_case(0xe8dcc8, true ; "beige fill takes dark text")]
