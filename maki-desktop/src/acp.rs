@@ -40,7 +40,9 @@ const PERMISSION_METHOD: &str = "session/request_permission";
 const UI_CAPABILITY_KEY: &str = "maki-ui";
 const FLASH_METHOD: &str = "maki/ui/flash";
 const PICK_METHOD: &str = "maki/ui/pick";
+const COMPLETE_METHOD: &str = "maki/complete";
 const SHORT_SESSION_CHARS: usize = 8;
+const COMPLETE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// An inbound event from the agent, already narrowed to what the desktop renders.
 pub enum Event {
@@ -48,6 +50,11 @@ pub enum Event {
     Permission(PermissionPrompt),
     Flash(String),
     Pick(PickPrompt),
+    /// Argument candidates for `text`, the composer content that asked.
+    Completion {
+        text: String,
+        items: Vec<ArgItem>,
+    },
     PromptDone(Result<StopReason, String>),
     Closed(String),
 }
@@ -81,6 +88,19 @@ pub enum PickOutcome {
     Choice(usize),
     Delete(usize),
     Close,
+}
+
+/// One argument candidate for the command being typed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArgItem {
+    pub label: String,
+    pub insertion: String,
+    pub description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CompleteResponse {
+    items: Vec<ArgItem>,
 }
 
 #[derive(Deserialize)]
@@ -298,6 +318,15 @@ impl Client {
         );
         self.request::<_, Value>(INITIALIZE_METHOD, request, Some(INITIALIZE_TIMEOUT))?;
         Ok(())
+    }
+
+    pub fn complete_arguments(&self, text: &str) -> Result<Vec<ArgItem>, String> {
+        let response: CompleteResponse = self.request(
+            COMPLETE_METHOD,
+            json!({ "text": text }),
+            Some(COMPLETE_TIMEOUT),
+        )?;
+        Ok(response.items)
     }
 
     pub fn new_session(&self, cwd: &Path) -> Result<(SessionId, String), String> {

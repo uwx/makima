@@ -33,7 +33,8 @@ use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
 use maki_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
-    InputDispatch, PresentedCommand, TargetCapabilities, TargetCapability, TargetHandle,
+    CompletionResult, InputDispatch, PresentedCommand, TargetCapabilities, TargetCapability,
+    TargetHandle,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{
@@ -48,11 +49,11 @@ use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
 use maki_storage::sessions::{SESSIONS_DIR, SessionMeta, StoredTokenUsage, read_prefs};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use smol::io::AsyncBufReadExt;
 use tracing::{debug, info, warn};
 
-use crate::ui::{UI_CAPABILITY_PATH, UiBridge};
+use crate::ui::{COMPLETE_METHOD, UI_CAPABILITY_PATH, UiBridge};
 use crate::{AcpParams, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
@@ -65,6 +66,7 @@ const SESSION_ENDED_MESSAGE: &str = "session ended";
 const EVENT_STREAM_ENDED: &str = "session event stream ended";
 const ROOT_CONFIG_UNAVAILABLE: &str = "session root configuration is unavailable";
 const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const COMMAND_PREFIX: char = '/';
 const AUTH_FAILED_MSG: &str =
     "Authentication failed. Run `maki auth login`, then send the prompt again.";
 
@@ -448,6 +450,18 @@ async fn handle_request(
         },
         "session/set_mode" => handle_set_mode(srv, raw, params).await,
         "session/set_config_option" => handle_set_config(srv, raw).await,
+        COMPLETE_METHOD => {
+            if !srv.ui.enabled() {
+                respond_request(srv, method, id, Err(AcpError::method_not_found()));
+                return;
+            }
+            let result = complete_arguments(srv, raw).await;
+            send(
+                &srv.out_tx,
+                Response::new(id, Ok::<Value, AcpError>(result)),
+            );
+            return;
+        }
         _ => Err(AcpError::method_not_found()),
     };
     respond_request(srv, method, id, result);
@@ -1149,6 +1163,98 @@ fn emit_current_commands(srv: &Server) {
         &SessionId::from(session.handle.session_id.to_string()),
         &commands,
     );
+}
+
+#[derive(serde::Deserialize)]
+struct CompleteParams {
+    text: String,
+}
+
+/// The command argument under the end of `text`, split the way a submitted
+/// line is split.
+struct ArgumentAtEnd<'a> {
+    command: &'a str,
+    arguments: &'a str,
+    argument: &'a str,
+    index: usize,
+}
+
+fn argument_at_end(text: &str) -> Option<ArgumentAtEnd<'_>> {
+    let command_end = text.find(char::is_whitespace)?;
+    let command = &text[..command_end];
+    if !command.starts_with(COMMAND_PREFIX) {
+        return None;
+    }
+    let arguments = text[command_end..].trim();
+    let ends_open = text.ends_with(char::is_whitespace);
+    let mut tokens = arguments.split_whitespace();
+    if ends_open {
+        let index = tokens.count();
+        return Some(ArgumentAtEnd {
+            command,
+            arguments,
+            argument: "",
+            index,
+        });
+    }
+    let index = tokens.clone().count().checked_sub(1)?;
+    Some(ArgumentAtEnd {
+        command,
+        arguments,
+        argument: tokens.next_back()?,
+        index,
+    })
+}
+
+/// Completes the argument `text` ends with. Providers return every candidate
+/// for the argument, so the client filters by the typed prefix.
+async fn complete_arguments(srv: &Server, raw: &Value) -> Value {
+    let empty = || json!({ "items": [] });
+    let Ok(params) = parse_params::<CompleteParams>(raw) else {
+        return empty();
+    };
+    let Some(session) = &srv.session else {
+        return empty();
+    };
+    let Some(target) = argument_at_end(&params.text) else {
+        return empty();
+    };
+    let Ok(command) = session
+        .command_registry
+        .resolve_for(&session.command_target, target.command)
+    else {
+        return empty();
+    };
+    let Ok(completion) = session
+        .command_registry
+        .open_completion(command, session.command_target.id())
+    else {
+        return empty();
+    };
+    let mode = Arc::from("");
+    let result = completion
+        .complete(
+            Arc::from(target.arguments),
+            Arc::from(target.argument),
+            target.index,
+            mode,
+        )
+        .await;
+    let CompletionResult::Items(candidates) = result else {
+        return empty();
+    };
+    let items = candidates
+        .iter()
+        .map(|candidate| {
+            let item = candidate.item();
+            json!({
+                "label": item.label,
+                "insertion": item.insertion,
+                "description": item.description,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "items": items })
 }
 
 fn available_commands(commands: &[PresentedCommand]) -> Vec<AvailableCommand> {
@@ -2537,6 +2643,16 @@ mod tests {
         let (executable, presented) = session_command_capabilities(ui);
         assert_eq!(executable.contains(TargetCapability::UiActions), expected);
         assert_eq!(presented.contains(TargetCapability::UiActions), expected);
+    }
+
+    #[test_case("/inherit", None; "command without arguments")]
+    #[test_case("hello there", None; "plain text")]
+    #[test_case("/inherit ", Some(("/inherit", "", 0)); "empty first argument")]
+    #[test_case("/inherit a", Some(("/inherit", "a", 0)); "first argument typed")]
+    #[test_case("/inherit all c", Some(("/inherit", "c", 1)); "later argument typed")]
+    fn argument_at_end_splits_the_typed_token(text: &str, expected: Option<(&str, &str, usize)>) {
+        let parsed = argument_at_end(text).map(|at| (at.command, at.argument, at.index));
+        assert_eq!(parsed, expected);
     }
 
     fn test_observer() -> HeadlessObserver {

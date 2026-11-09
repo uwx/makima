@@ -21,7 +21,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
-use crate::acp::{self, Event, PickItem, PickOutcome, Target};
+use crate::acp::{self, ArgItem, Event, PickItem, PickOutcome, Target};
 use crate::backend::{Backend, Command, Started};
 
 const SEND_LABEL: &str = "Send";
@@ -32,6 +32,7 @@ const TRANSCRIPT_MAX_WIDTH: f32 = 860.;
 const PICK_WIDTH: f32 = 560.;
 const PICK_MAX_HEIGHT: f32 = 480.;
 const MAX_SLASH_ROWS: usize = 8;
+const ARGUMENT_MAX_HEIGHT: f32 = 320.;
 const SLASH_PREFIX: char = '/';
 const DISCONNECTED: &str = "Agent is not connected";
 
@@ -71,6 +72,12 @@ struct SlashMenu {
     active: usize,
 }
 
+struct ArgumentMenu {
+    items: Vec<ArgItem>,
+    matches: Vec<usize>,
+    active: usize,
+}
+
 struct PendingPick {
     request: Value,
     title: String,
@@ -92,6 +99,40 @@ impl SlashMenu {
     }
 }
 
+impl ArgumentMenu {
+    fn new(items: Vec<ArgItem>, query: &str) -> Self {
+        let mut menu = Self {
+            items,
+            matches: Vec::new(),
+            active: 0,
+        };
+        menu.filter(query);
+        menu
+    }
+
+    fn filter(&mut self, query: &str) {
+        self.matches = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.label.to_lowercase().starts_with(query))
+            .map(|(index, _)| index)
+            .take(MAX_SLASH_ROWS)
+            .collect();
+        self.active = 0;
+    }
+
+    fn is_open(&self) -> bool {
+        !self.matches.is_empty()
+    }
+
+    fn selected(&self) -> Option<&ArgItem> {
+        self.matches
+            .get(self.active)
+            .and_then(|index| self.items.get(*index))
+    }
+}
+
 pub struct ChatApp {
     backend: Option<Backend>,
     input: Entity<TextareaState>,
@@ -104,6 +145,8 @@ pub struct ChatApp {
     commands: Vec<AvailableCommand>,
     slash: Option<SlashMenu>,
     slash_dismissed: bool,
+    arguments: Option<ArgumentMenu>,
+    arguments_dismissed: bool,
     _subscriptions: Vec<Subscription>,
     _events: Task<()>,
 }
@@ -145,7 +188,9 @@ impl ChatApp {
                 |this: &mut Self, _, event: &InputEvent, window, cx| match event {
                     InputEvent::Change => {
                         this.slash_dismissed = false;
+                        this.arguments_dismissed = false;
                         this.refresh_slash(cx);
+                        this.refresh_arguments(cx);
                         cx.notify();
                     }
                     InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
@@ -187,6 +232,8 @@ impl ChatApp {
             commands: Vec::new(),
             slash: None,
             slash_dismissed: false,
+            arguments: None,
+            arguments_dismissed: false,
             _subscriptions: subscriptions,
             _events: events_task,
         }
@@ -260,6 +307,10 @@ impl ChatApp {
             }
             Event::Flash(text) => self.notice(text),
             Event::Pick(prompt) => self.open_pick(prompt),
+            Event::Completion { text, items } => {
+                self.apply_arguments(text, items, cx);
+                return;
+            }
             Event::PromptDone(result) => {
                 self.busy = false;
                 self.pending = None;
@@ -473,6 +524,76 @@ impl ChatApp {
         self.slash = (!matches.is_empty()).then_some(SlashMenu { matches, active: 0 });
     }
 
+    fn refresh_arguments(&mut self, cx: &mut Context<Self>) {
+        let value = self.input.read(cx).value().to_string();
+        let Some(slot) = argument_slot(&value) else {
+            self.arguments = None;
+            return;
+        };
+        if self.arguments_dismissed {
+            self.arguments = None;
+            return;
+        }
+        if let Some(backend) = &self.backend {
+            backend.complete_arguments(value);
+        }
+        if let Some(menu) = &mut self.arguments {
+            menu.filter(&slot.query);
+        }
+    }
+
+    fn apply_arguments(&mut self, text: String, items: Vec<ArgItem>, cx: &mut Context<Self>) {
+        let value = self.input.read(cx).value().to_string();
+        if text != value || self.arguments_dismissed {
+            return;
+        }
+        let Some(slot) = argument_slot(&value) else {
+            self.arguments = None;
+            cx.notify();
+            return;
+        };
+        self.arguments = (!items.is_empty()).then(|| ArgumentMenu::new(items, &slot.query));
+        cx.notify();
+    }
+
+    fn move_arguments(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(menu) = &mut self.arguments else {
+            return;
+        };
+        let len = menu.matches.len() as isize;
+        if len > 0 {
+            menu.active = (menu.active as isize + delta).rem_euclid(len) as usize;
+        }
+        cx.notify();
+    }
+
+    fn accept_arguments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self
+            .arguments
+            .take()
+            .and_then(|menu| menu.selected().cloned())
+        else {
+            return;
+        };
+        let value = self.input.read(cx).value().to_string();
+        let Some(slot) = argument_slot(&value) else {
+            return;
+        };
+        let head = value[..slot.start].to_owned();
+        let insertion = quote_argument(&item.insertion);
+        self.input.update(cx, |state, cx| {
+            state.set_value(head, window, cx);
+            state.insert(format!("{insertion} "), window, cx);
+        });
+        cx.notify();
+    }
+
+    fn dismiss_arguments(&mut self, cx: &mut Context<Self>) {
+        self.arguments = None;
+        self.arguments_dismissed = true;
+        cx.notify();
+    }
+
     fn move_slash(&mut self, delta: isize, cx: &mut Context<Self>) {
         let Some(menu) = &mut self.slash else {
             return;
@@ -510,7 +631,10 @@ impl ChatApp {
         if self.pick.is_some() {
             return self.on_pick_key(key, cx);
         }
-        self.on_slash_key(key, window, cx)
+        if self.on_slash_key(key, window, cx) {
+            return true;
+        }
+        self.on_argument_key(key, window, cx)
     }
 
     fn on_pick_key(&mut self, key: &Keystroke, cx: &mut Context<Self>) -> bool {
@@ -552,6 +676,30 @@ impl ChatApp {
                 self.slash_dismissed = true;
                 cx.notify();
             }
+            _ => return false,
+        }
+        true
+    }
+
+    fn on_argument_key(
+        &mut self,
+        key: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.arguments.as_ref().is_some_and(ArgumentMenu::is_open)
+            || !self.input.read(cx).focus_handle(cx).is_focused(window)
+        {
+            return false;
+        }
+        if key.modifiers.control || key.modifiers.alt || key.modifiers.platform {
+            return false;
+        }
+        match key.key.as_str() {
+            "down" => self.move_arguments(1, cx),
+            "up" => self.move_arguments(-1, cx),
+            "enter" | "tab" => self.accept_arguments(window, cx),
+            "escape" => self.dismiss_arguments(cx),
             _ => return false,
         }
         true
@@ -974,6 +1122,57 @@ impl ChatApp {
             .children(rows)
     }
 
+    fn argument_menu(&self, menu: &ArgumentMenu, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = menu
+            .matches
+            .iter()
+            .enumerate()
+            .map(|(row, index)| {
+                let item = &menu.items[*index];
+                let active = row == menu.active;
+                h_flex()
+                    .id(("argument", row))
+                    .w_full()
+                    .gap_3()
+                    .items_center()
+                    .px_3()
+                    .py_1()
+                    .rounded(cx.theme().radius)
+                    .when(active, |this| this.bg(cx.theme().accent))
+                    .child(div().text_sm().child(item.label.clone()))
+                    .when_some(item.description.clone(), |this, description| {
+                        this.child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .overflow_hidden()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(description),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(menu) = &mut this.arguments {
+                            menu.active = row;
+                        }
+                        this.accept_arguments(window, cx);
+                    }))
+            })
+            .collect::<Vec<_>>();
+        div()
+            .w_full()
+            .max_h(px(ARGUMENT_MAX_HEIGHT))
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .overflow_y_scrollbar()
+            .children(rows)
+    }
+
     fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .w_full()
@@ -1009,7 +1208,18 @@ impl ChatApp {
                                     .right_0()
                                     .pb_2()
                                     .child(self.slash_menu(menu, cx))
-                            })),
+                            }))
+                            .children(self.arguments.as_ref().filter(|menu| menu.is_open()).map(
+                                |menu| {
+                                    div()
+                                        .absolute()
+                                        .bottom(relative(1.))
+                                        .left_0()
+                                        .right_0()
+                                        .pb_2()
+                                        .child(self.argument_menu(menu, cx))
+                                },
+                            )),
                     )
                     .child(
                         h_flex()
@@ -1089,6 +1299,41 @@ fn slash_query(value: &str) -> Option<String> {
         .then(|| rest.to_lowercase())
 }
 
+/// The token being typed after the command name, and where it starts.
+struct ArgumentSlot {
+    start: usize,
+    query: String,
+}
+
+fn argument_slot(value: &str) -> Option<ArgumentSlot> {
+    let command_end = value.find(char::is_whitespace)?;
+    if !value.starts_with(SLASH_PREFIX) {
+        return None;
+    }
+    if value.ends_with(char::is_whitespace) {
+        return Some(ArgumentSlot {
+            start: value.len(),
+            query: String::new(),
+        });
+    }
+    let token = value[command_end..]
+        .trim_start()
+        .rsplit(char::is_whitespace)
+        .next()?;
+    Some(ArgumentSlot {
+        start: value.len() - token.len(),
+        query: token.to_lowercase(),
+    })
+}
+
+fn quote_argument(insertion: &str) -> String {
+    if insertion.contains(char::is_whitespace) {
+        format!("\"{insertion}\"")
+    } else {
+        insertion.to_owned()
+    }
+}
+
 fn tool_text(content: &[ToolCallContent]) -> Option<String> {
     let mut text = String::new();
     for item in content {
@@ -1141,13 +1386,55 @@ impl Render for ChatApp {
 
 #[cfg(test)]
 mod tests {
-    use super::SLASH_PREFIX;
-    use super::slash_query;
+    use super::{ArgumentMenu, SLASH_PREFIX, argument_slot, quote_argument, slash_query};
+    use crate::acp::ArgItem;
     use test_case::test_case;
 
     #[test]
     fn slash_query_accepts_the_bare_prefix() {
         assert_eq!(slash_query(&SLASH_PREFIX.to_string()), Some(String::new()));
+    }
+
+    #[test_case("/inherit", None ; "command without arguments")]
+    #[test_case("hello there", None ; "plain text")]
+    #[test_case("/inherit ", Some((9, "")) ; "empty first argument")]
+    #[test_case("/inherit a", Some((9, "a")) ; "first argument typed")]
+    #[test_case("/inherit all c", Some((13, "c")) ; "later argument typed")]
+    #[test_case("/inherit ALL ", Some((13, "")) ; "empty later argument")]
+    fn argument_slot_finds_the_typed_token(value: &str, expected: Option<(usize, &str)>) {
+        let slot = argument_slot(value).map(|slot| (slot.start, slot.query));
+        assert_eq!(
+            slot,
+            expected.map(|(start, query)| (start, query.to_owned()))
+        );
+    }
+
+    #[test_case("all", "all" ; "single word")]
+    #[test_case("import mcp", "\"import mcp\"" ; "quoted when it has a space")]
+    fn quote_argument_wraps_only_spaced_values(insertion: &str, expected: &str) {
+        assert_eq!(quote_argument(insertion), expected);
+    }
+
+    #[test]
+    fn argument_menu_filters_by_label_prefix() {
+        let items = ["all", "conversations", "import-mcp"]
+            .into_iter()
+            .map(|label| ArgItem {
+                label: label.to_owned(),
+                insertion: label.to_owned(),
+                description: None,
+            })
+            .collect();
+        let mut menu = ArgumentMenu::new(items, "c");
+        assert_eq!(menu.matches.len(), 1);
+        assert_eq!(
+            menu.selected().map(|item| item.label.as_str()),
+            Some("conversations")
+        );
+        menu.filter("");
+        assert!(menu.is_open());
+        menu.filter("zzz");
+        assert!(!menu.is_open());
     }
 
     #[test_case("/mod", Some("mod".to_owned()) ; "partial name")]

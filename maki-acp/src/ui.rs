@@ -1,8 +1,8 @@
 //! Renders Lua plugin UI actions on an ACP client and routes its answers back.
 //!
 //! A client that advertises [`UI_CAPABILITY_KEY`] receives `maki/ui/*`
-//! traffic; any other client keeps those commands hidden, so it never sees a
-//! command it cannot render.
+//! traffic and may call [`COMPLETE_METHOD`]; any other client keeps those
+//! commands hidden, so it never sees a command it cannot render.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +20,8 @@ pub const UI_CAPABILITY_KEY: &str = "maki-ui";
 pub(crate) const UI_CAPABILITY_PATH: &str = "/params/clientCapabilities/_meta/maki-ui";
 pub const FLASH_METHOD: &str = "maki/ui/flash";
 pub const PICK_METHOD: &str = "maki/ui/pick";
+/// Client to server: complete the command argument being typed.
+pub const COMPLETE_METHOD: &str = "maki/complete";
 
 const CHOICE_FIELD: &str = "choice";
 const DELETE_FIELD: &str = "delete";

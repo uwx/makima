@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-use flume::Receiver;
+use flume::{Receiver, Sender};
 use serde_json::Value;
 
 use crate::acp::{self, Client, Event, PickOutcome, Target};
@@ -14,6 +14,7 @@ pub enum Command {
 
 pub struct Backend {
     client: Arc<Client>,
+    arguments: Sender<String>,
     pub model: String,
     pub session: String,
     pub cwd: PathBuf,
@@ -28,12 +29,14 @@ pub struct Started {
 impl Backend {
     pub fn start(target: Target) -> Result<Started, String> {
         let connection = acp::connect(&target)?;
+        let arguments = spawn_argument_worker(Arc::clone(&connection.client))?;
         let backend = Backend {
+            client: connection.client,
+            arguments,
             model: connection.model,
             session: acp::short_session(&connection.session),
             cwd: target.session_cwd().to_path_buf(),
             target: target.label().to_owned(),
-            client: connection.client,
         };
         Ok(Started {
             backend,
@@ -68,4 +71,30 @@ impl Backend {
     pub fn answer_pick(&self, request: &Value, outcome: PickOutcome) {
         self.client.answer_pick(request.clone(), outcome);
     }
+
+    pub fn complete_arguments(&self, text: String) {
+        _ = self.arguments.send(text);
+    }
+}
+
+/// Completion is requested on every composer change, so the worker drops
+/// superseded requests and answers only the newest text.
+fn spawn_argument_worker(client: Arc<Client>) -> Result<Sender<String>, String> {
+    let (tx, rx) = flume::unbounded::<String>();
+    thread::Builder::new()
+        .name("maki-complete".into())
+        .spawn(move || {
+            while let Ok(first) = rx.recv() {
+                let mut text = first;
+                while let Ok(newer) = rx.try_recv() {
+                    text = newer;
+                }
+                let items = client.complete_arguments(&text).unwrap_or_default();
+                if client.emit(Event::Completion { text, items }).is_err() {
+                    return;
+                }
+            }
+        })
+        .map_err(|error| format!("start completion worker: {error}"))?;
+    Ok(tx)
 }
