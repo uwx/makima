@@ -94,7 +94,7 @@ local function open_selector(ctx)
       { "left", "less" },
       { "right", "more" },
       { "enter", "set" },
-      { "esc", "cancel" },
+      { "Esc", "cancel" },
     },
   })
 

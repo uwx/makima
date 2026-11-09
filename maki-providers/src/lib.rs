@@ -40,5 +40,5 @@ pub use types::{
     IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource, Message, MessageKind,
     ModelUsageRow, ObservationSource, ProviderEvent, ProviderUsage, RequestOptions, Role,
     StopReason, StreamResponse, THINKING_USAGE, ThinkingConfigExt, UsageLimit, UsageWindow,
-    adapt_images_for_model, dialect,
+    adapt_images_for_model, dialect, non_empty_tool_result,
 };

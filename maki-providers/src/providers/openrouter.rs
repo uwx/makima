@@ -126,8 +126,12 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
     let context_window = m["context_length"]
         .as_u64()
         .and_then(|v| u32::try_from(v).ok());
-    let per_token =
-        |p: &Value| -> Option<f64> { Some(p.as_str()?.parse::<f64>().ok()? * PER_MILLION) };
+    // Routers like `openrouter/auto` report `-1` because the price depends on
+    // the pick, so a negative price counts as unknown instead of free.
+    let per_token = |p: &Value| -> Option<f64> {
+        let price = p.as_str()?.parse::<f64>().ok()?;
+        (price >= 0.0).then_some(price * PER_MILLION)
+    };
     let pricing = m["pricing"]
         .as_object()
         .and_then(|p| {
@@ -291,6 +295,19 @@ mod tests {
             .pricing
             .expect("pricing should be parsed");
         assert_eq!(pricing.cache_write, 3.75);
+    }
+
+    #[test]
+    fn parse_model_treats_negative_prices_as_unknown() {
+        let mut m = kimi_k3_json();
+        m["pricing"] = json!({"prompt": "-1", "completion": "-1"});
+
+        let pricing = parse_model(&m)
+            .expect("model should parse")
+            .pricing
+            .expect("pricing should be present");
+        assert_eq!(pricing.input, 0.0);
+        assert_eq!(pricing.output, 0.0);
     }
 
     #[test]

@@ -151,6 +151,15 @@ pub const IMAGE_EVICTED_NOTE: &str = "[image omitted: too many images in this co
 pub const IMAGE_PLACEHOLDER: &str = "[image]";
 /// See [`Message::empty_marker`].
 pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
+/// Strict backends (Cohere behind OpenRouter) reject a tool result that carries
+/// no output text, so an empty one goes on the wire as the marker instead.
+pub fn non_empty_tool_result(content: &str) -> &str {
+    if content.trim().is_empty() {
+        EMPTY_RESPONSE_MARKER
+    } else {
+        content
+    }
+}
 
 /// The last stop before the wire for every image in a request, whatever put
 /// it there. For models without vision, image blocks become a text note
@@ -655,10 +664,11 @@ pub mod dialect {
         adaptive: None,
         off: None,
     };
-    /// `output_config.effort` on Anthropic adaptive-thinking models. The API
-    /// has native adaptive mode, so Adaptive sends no effort.
+    /// `output_config.effort` on Anthropic adaptive-thinking models, all of
+    /// which take `xhigh` and `max`. The API has native adaptive mode, so
+    /// Adaptive sends no effort.
     pub const ANTHROPIC_ADAPTIVE: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
+        supported: &[Low, Medium, High, XHigh, Max],
         adaptive: None,
         off: None,
     };
@@ -1273,13 +1283,13 @@ mod tests {
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-6", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_opus_4_6")]
     #[test_case(ThinkingConfig::Off, "claude-opus-4-7", json!({}) ; "off_adaptive_model")]
     #[test_case(ThinkingConfig::Adaptive, "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}}) ; "adaptive_adaptive_model")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_7")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "max"}}) ; "budget_adaptive_opus_4_7")]
     #[test_case(ThinkingConfig::Effort(Low), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "low"}}) ; "effort_low_passthrough")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-8-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_8_long_context")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-5-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_5_unparsable_minor")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4.7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_copilot_dotted_id")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_sonnet_5")]
-    #[test_case(ThinkingConfig::Budget(10000), "anthropic/claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_gateway_prefixed_id")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-8-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "max"}}) ; "budget_adaptive_opus_4_8_long_context")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-5-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "max"}}) ; "budget_adaptive_opus_5_unparsable_minor")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4.7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "max"}}) ; "budget_adaptive_copilot_dotted_id")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "max"}}) ; "budget_adaptive_sonnet_5")]
+    #[test_case(ThinkingConfig::Budget(10000), "anthropic/claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "max"}}) ; "budget_adaptive_gateway_prefixed_id")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-3-5-sonnet-20241022", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_dated_id")]
     fn thinking_apply_to_body(config: ThinkingConfig, model_id: &str, expected: Value) {
         let mut body = json!({});
@@ -1301,7 +1311,9 @@ mod tests {
     #[test_case(&dialect::DEEPSEEK, ThinkingConfig::Adaptive,        None        ; "deepseek_adaptive_uses_api_default")]
     #[test_case(&dialect::DEEPSEEK, ThinkingConfig::Effort(Minimal), Some("max") ; "deepseek_minimal")]
     #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Adaptive,      None         ; "anthropic_adaptive_is_native")]
-    #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Effort(XHigh), Some("high") ; "anthropic_xhigh_snaps_down")]
+    #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Effort(XHigh), Some("xhigh") ; "anthropic_xhigh_passthrough")]
+    #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Effort(Minimal), Some("low") ; "anthropic_minimal_snaps_up")]
+    #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Effort(Max),   Some("max")   ; "anthropic_max_passthrough")]
     #[test_case(&dialect::TENSORX, ThinkingConfig::Off,             Some("none") ; "tensorx_off_explicit_none")]
     fn thinking_apply_reasoning_effort(
         dialect: &EffortDialect,

@@ -161,12 +161,12 @@ impl OpenAiCompatProvider {
     /// wins, then the construction-time env / `providers.toml` override, then
     /// the static compat default.
     pub(crate) fn base_url(&self, auth: &ResolvedAuth) -> String {
-        if let Some(explicit) = auth.base_url.as_deref() {
-            return explicit.to_string();
-        }
-        self.resolved_base_url
-            .clone()
-            .unwrap_or_else(|| self.config.base_url.to_string())
+        auth.base_url
+            .as_deref()
+            .or(self.resolved_base_url.as_deref())
+            .unwrap_or(self.config.base_url)
+            .trim_end_matches('/')
+            .to_owned()
     }
 
     fn build_request(
@@ -323,7 +323,7 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                             tool_results.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_use_id,
-                                "content": content,
+                                "content": crate::types::non_empty_tool_result(content),
                             }));
                         }
                         ContentBlock::ToolUse { .. }
@@ -761,6 +761,41 @@ mod tests {
     use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    static TEST_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+        slug: "",
+        api_key_env: "",
+        base_url: "https://default.example/v1/",
+        max_tokens_field: "max_tokens",
+        include_stream_usage: false,
+        provider_name: "Test",
+    };
+
+    #[test_case(None, None, "https://default.example/v1" ; "default_url")]
+    #[test_case(Some("https://configured.example/v1/"), None, "https://configured.example/v1" ; "configured_url")]
+    #[test_case(
+        Some("https://configured.example/v1"),
+        Some("https://auth.example/v1/"),
+        "https://auth.example/v1" ; "auth_url_wins"
+    )]
+    fn base_url_trims_trailing_slashes(
+        resolved: Option<&str>,
+        auth_url: Option<&str>,
+        expected: &str,
+    ) {
+        let provider = OpenAiCompatProvider {
+            client: crate::providers::http_client(crate::providers::Timeouts::default()),
+            config: &TEST_CONFIG,
+            stream_timeout: TEST_STREAM_TIMEOUT,
+            resolved_base_url: resolved.map(str::to_owned),
+        };
+        let auth = ResolvedAuth {
+            base_url: auth_url.map(str::to_owned),
+            headers: Vec::new(),
+            config_headers: Vec::new(),
+        };
+
+        assert_eq!(provider.base_url(&auth), expected);
+    }
     #[allow(dead_code)]
     const COUNTS_SURVIVE_A_BAD_COST: &str =
         "a price we cannot read must not take the token counts down with it";
@@ -792,6 +827,24 @@ data: [DONE]\n";
             function["parameters"],
             json!({"type": "object", "properties": {}})
         );
+    }
+
+    #[test_case("" ; "empty")]
+    #[test_case("  \n " ; "whitespace_only")]
+    fn convert_messages_blank_tool_result_gets_marker(blank: &str) {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: blank.into(),
+                is_error: false,
+            }],
+            ..Default::default()
+        }];
+
+        let result = convert_messages(&msgs, "system");
+        assert_eq!(result[1]["role"], "tool");
+        assert_eq!(result[1]["content"], crate::types::EMPTY_RESPONSE_MARKER);
     }
 
     #[test]

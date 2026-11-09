@@ -2,10 +2,10 @@ use std::borrow::Cow;
 use std::env;
 use std::path::Path;
 
-use jiff::Timestamp;
+use jiff::Zoned;
 
 pub fn env_vars_for(cwd: &Path) -> Vars {
-    let date = Timestamp::now().strftime("%Y-%m-%d").to_string();
+    let date = Zoned::now().strftime("%Y-%m-%d").to_string();
     Vars::new()
         .set("{cwd}", cwd.to_string_lossy().into_owned())
         .set("{platform}", env::consts::OS)
@@ -51,6 +51,7 @@ impl Vars {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::Timestamp;
     use test_case::test_case;
 
     fn format_date(ts: Timestamp) -> String {

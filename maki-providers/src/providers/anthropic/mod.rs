@@ -793,7 +793,6 @@ data: {{\"type\":\"message_stop\"}}\n"
                     output: 10,
                     cache_creation: 5,
                     cache_read: 8,
-                    cost: None,
                 }
             );
         })

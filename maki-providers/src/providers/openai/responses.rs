@@ -107,7 +107,7 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                             input.push(json!({
                                 "type": "function_call_output",
                                 "call_id": tool_use_id,
-                                "output": content,
+                                "output": crate::types::non_empty_tool_result(content),
                             }));
                         }
                         ContentBlock::ToolUse { .. }

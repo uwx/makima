@@ -20,7 +20,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+O` | Open plan in editor |
 | `Ctrl+T` | Toggle plan panel |
 | `Ctrl+X` | Open tasks |
-| `Ctrl+M` | Model picker |
+| `Ctrl+L` | Model picker |
 | `Alt+M` | Defer an input prompt, press again to restore |
 
 ## Editing
@@ -65,7 +65,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Enter` | Select option |
 | `Space` | Toggle parallel implementation |
 | `Ctrl+O` | Edit plan |
-| `Ctrl+M` | Choose implementation model |
+| `Ctrl+L` | Choose implementation model |
 | `Esc` | Close |
 
 ## Pickers

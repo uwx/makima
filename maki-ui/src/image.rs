@@ -116,10 +116,21 @@ mod tests {
     #[test_case("/home/user/photo.png",              "/home/user/photo.png",  ImageMediaType::Png  ; "absolute_path")]
     #[test_case("  /home/user/photo.jpg\n",          "/home/user/photo.jpg",  ImageMediaType::Jpeg ; "trimmed_whitespace")]
     #[test_case("'/home/user/photo.png'",            "/home/user/photo.png",  ImageMediaType::Png  ; "single_quoted")]
+    fn try_parse_image_path_valid(
+        input: &str,
+        expected_path: &str,
+        expected_media: ImageMediaType,
+    ) {
+        let (path, media) = try_parse_image_path(input).expect("should parse");
+        assert_eq!(path.to_str().unwrap(), expected_path);
+        assert_eq!(media, expected_media);
+    }
+
+    #[cfg(not(windows))]
     #[test_case("/home/user/my\\ photo.png",         "/home/user/my photo.png", ImageMediaType::Png ; "escaped_space")]
     #[test_case("/home/user/image\\ \\(14\\).png",   "/home/user/image (14).png", ImageMediaType::Png ; "escaped_parens")]
     #[test_case("/home/user/a\\&b\\'c.png",          "/home/user/a&b'c.png",  ImageMediaType::Png  ; "escaped_metachars")]
-    fn try_parse_image_path_valid(
+    fn try_parse_image_path_unescapes_shell_metachars(
         input: &str,
         expected_path: &str,
         expected_media: ImageMediaType,
