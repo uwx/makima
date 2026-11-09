@@ -1,0 +1,25 @@
+[package]
+name = "maki-desktop"
+description = "Desktop chat UI for makima, built with gpui-kit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "maki-desktop"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = { workspace = true }
+agent-client-protocol-schema = { workspace = true }
+maki-storage = { workspace = true }
+color-eyre = { workspace = true }
+flume = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }

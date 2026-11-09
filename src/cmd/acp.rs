@@ -8,7 +8,7 @@ use maki_agent::{command, tools::ToolRegistry};
 use maki_config::project::{self, TrustMode};
 use maki_config::{load_env_files, load_permissions};
 use maki_lua::PluginHost;
-use maki_lua::ui_sink::{HeadlessUi, HostUi};
+use maki_lua::ui_sink::HostUi;
 use maki_storage::StateDir;
 
 use crate::setup;
@@ -38,11 +38,12 @@ pub fn run(
         command::StandardCompletions::default(),
     )
     .context("register standard commands")?;
+    let ui = maki_acp::ui::UiChannel::new();
     let mut plugin_host = PluginHost::with_command_registry(
         Arc::clone(ToolRegistry::global_arc()),
         command_registry.clone(),
         !no_jit,
-        HostUi::Sink(Box::new(HeadlessUi)),
+        HostUi::Sink(Box::new(ui.sink.clone())),
     )
     .context("initialize lua plugin host")?;
 
@@ -104,6 +105,7 @@ pub fn run(
         command_registry,
         trust_mode,
         trust_policy: Arc::new(config.trust),
+        ui,
     });
     drop(standard_commands);
     result

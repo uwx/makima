@@ -58,6 +58,7 @@ members = [
   "maki-agent",
   "maki-config",
   "maki-commands",
+  "maki-desktop",
   "maki-docgen",
   "maki-highlight",
   "maki-interpreter",
@@ -96,6 +97,7 @@ maki-lua-macro = { path = "maki-lua-macro" }
 maki-highlight = { path = "maki-highlight" }
 maki-markdown = { path = "maki-markdown" }
 maki-match = { path = "maki-match" }
+gpui-kit = "0.9"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 bs58 = "0.5"
@@ -207,6 +209,14 @@ agent-client-protocol-schema = { version = "0.13", features = ["unstable_boolean
 
 wait-timeout = "0.2"
 inventory = "0.3"
+
+# Incremental compilation costs ~600MB per session for a workspace member: rustc
+# keeps 256 CGU object files with full debug info plus the dep graph and query
+# cache, and never prunes sessions from build configurations you no longer use.
+# maki-lua alone had 29 sessions (11GB), the workspace 37GB. A full non-incremental
+# maki-lua rebuild is ~30s against ~5s incremental, which is a fair trade.
+[profile.dev]
+incremental = false
 
 [profile.bench]
 debug = true

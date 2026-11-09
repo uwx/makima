@@ -33,7 +33,7 @@ use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
 use maki_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
-    InputDispatch, PresentedCommand, TargetHandle,
+    InputDispatch, PresentedCommand, TargetCapabilities, TargetCapability, TargetHandle,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{
@@ -52,6 +52,7 @@ use serde_json::Value;
 use smol::io::AsyncBufReadExt;
 use tracing::{debug, info, warn};
 
+use crate::ui::{UI_CAPABILITY_PATH, UiBridge};
 use crate::{AcpParams, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
@@ -71,6 +72,10 @@ const AUTH_FAILED_MSG: &str =
 /// session cannot match a request of the session that replaced it.
 static NEXT_OUTGOING_REQUEST_ID: AtomicI64 = AtomicI64::new(FIRST_OUTGOING_REQUEST_ID);
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn outgoing_request_id() -> i64 {
+    NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperationKind {
@@ -257,6 +262,8 @@ struct Server {
     elicitation: bool,
     supports_boolean: bool,
     lua_event_handle: maki_lua::EventHandle,
+    /// Where plugin UI actions go while the client renders them.
+    ui: UiBridge,
     /// The prompt whose command is still being dispatched. It runs beside the
     /// input loop, so the answers and cancels its handler waits on still
     /// arrive.
@@ -299,6 +306,16 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     });
 
+    let _ui_forward = smol::spawn({
+        let out_tx = out_tx.clone();
+        let events = params.ui.events.clone();
+        async move {
+            while let Ok(message) = events.recv_async().await {
+                let _ = out_tx.send(message);
+            }
+        }
+    });
+
     let mut server = Server {
         out_tx,
         catalog: ModelCatalog::offline(&params.model_policy),
@@ -306,6 +323,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         elicitation: false,
         supports_boolean: false,
         lua_event_handle: params.lua_event_handle.clone(),
+        ui: params.ui.sink.clone(),
         dispatch: None,
     };
 
@@ -415,6 +433,9 @@ async fn handle_request(
                     .as_ref()
                     .is_some_and(|c| c.form.is_some())
             });
+            if supports_ui_actions(raw) {
+                srv.ui.enable();
+            }
             Ok(AgentResponse::InitializeResponse(
                 methods::initialize_response(),
             ))
@@ -1029,6 +1050,7 @@ async fn install_session_with_lock(
         &trusted_root,
         &orchestration,
         headless::default_model_preparer(params.timeouts),
+        srv.ui.enabled(),
     );
     orchestration.bind_commands(
         &trusted_root.target,
@@ -1076,7 +1098,8 @@ async fn install_session_with_lock(
 }
 
 /// The target a session's prompts dispatch on: commands control {handle}'s
-/// session and run on {root}, or on the agent a plugin pinned them to.
+/// session and run on {root}, or on the agent a plugin pinned them to. A
+/// client that renders `maki/ui/*` gets the picker commands too.
 fn session_command_target(
     registry: &CommandRegistry,
     handle: &InteractiveHandle,
@@ -1084,10 +1107,12 @@ fn session_command_target(
     root: &TrustedTarget,
     orchestration: &Arc<AgentOrchestration>,
     prepare_model: ModelPreparer,
+    ui: bool,
 ) -> TargetHandle {
+    let (capabilities, presentation) = session_command_capabilities(ui);
     registry.bind_target_with_presentation(
-        maki_agent::command::session_capabilities(),
-        maki_agent::command::portable_capabilities(),
+        capabilities,
+        presentation,
         Arc::new(maki_lua::orchestration::PinnedCommandHost::new(
             maki_agent::command::SessionCommandHost::new(
                 handle.control_tx.clone(),
@@ -1099,6 +1124,18 @@ fn session_command_target(
             prepare_model,
         )),
     )
+}
+
+/// Executable and presented capability sets. The presented set decides which
+/// commands reach the client, so `UiActions` has to be added to both.
+fn session_command_capabilities(ui: bool) -> (TargetCapabilities, TargetCapabilities) {
+    let executable = maki_agent::command::session_capabilities();
+    let presented = maki_agent::command::portable_capabilities();
+    if !ui {
+        return (executable, presented);
+    }
+    let ui_actions = TargetCapabilities::from_capability(TargetCapability::UiActions);
+    (executable.union(ui_actions), presented.union(ui_actions))
 }
 
 fn emit_current_commands(srv: &Server) {
@@ -1957,8 +1994,13 @@ fn ask_id(id: &Value) -> Option<i64> {
 }
 
 fn handle_incoming_response(srv: &Server, raw: &Value) {
-    let Some(session) = &srv.session else { return };
     let id_num = raw.get("id").and_then(ask_id);
+    if let Some(id) = id_num
+        && srv.ui.answer(id, raw)
+    {
+        return;
+    }
+    let Some(session) = &srv.session else { return };
     let answer = {
         let mut pending = session.pending.lock().unwrap();
         if let Some(id) = id_num
@@ -2425,6 +2467,17 @@ fn supports_boolean_config(raw: &Value) -> bool {
         .is_some_and(Value::is_object)
 }
 
+/// Whether the client renders `maki/ui/*` traffic. Anything but an explicit
+/// opt-in keeps the UI commands hidden.
+fn supports_ui_actions(raw: &Value) -> bool {
+    raw.pointer(UI_CAPABILITY_PATH)
+        .is_some_and(|value| match value {
+            Value::Bool(enabled) => *enabled,
+            Value::Object(_) => true,
+            _ => false,
+        })
+}
+
 fn parse_params<T: serde::de::DeserializeOwned>(raw: &Value) -> Result<T, AcpError> {
     serde_json::from_value(raw.get("params").cloned().unwrap_or(Value::Null))
         .map_err(|e| AcpError::invalid_params().data(json_str(&e)))
@@ -2476,6 +2529,14 @@ mod tests {
         start_prompt(srv, raw, id)?;
         let dispatched = (&mut srv.dispatch.as_mut().expect("prompt dispatch").future).await;
         finish_prompt(srv, dispatched).await
+    }
+
+    #[test_case(false, false; "without the opt-in")]
+    #[test_case(true, true; "with the opt-in")]
+    fn ui_actions_follow_the_client_opt_in(ui: bool, expected: bool) {
+        let (executable, presented) = session_command_capabilities(ui);
+        assert_eq!(executable.contains(TargetCapability::UiActions), expected);
+        assert_eq!(presented.contains(TargetCapability::UiActions), expected);
     }
 
     fn test_observer() -> HeadlessObserver {
@@ -2720,6 +2781,7 @@ mod tests {
                 })
             "#).unwrap();
         }
+        let ui = srv.ui.enabled();
         let session = srv.session.as_mut().unwrap();
         let id = session.handle.session_id.clone();
         session.coordinator.take().unwrap().close().await.unwrap();
@@ -2842,6 +2904,7 @@ mod tests {
             &root,
             &services,
             headless::default_model_preparer(Default::default()),
+            ui,
         );
         session.coordinator = Some(coordinator.clone());
         session.option_projection = Some(Arc::new(OptionProjection {
@@ -3110,6 +3173,7 @@ mod tests {
             command_registry: test_registry(&[]),
             trust_mode: TrustMode::Consult,
             trust_policy: Arc::default(),
+            ui: Default::default(),
         }
     }
 
@@ -3368,6 +3432,7 @@ mod tests {
             elicitation: false,
             supports_boolean: false,
             lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
+            ui: Default::default(),
             dispatch: None,
         };
         (server, answer_rx, out_rx, turns)
@@ -3399,6 +3464,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                ui: Default::default(),
                 dispatch: None,
             };
             let (handle, root_target) = spawn_session(
@@ -3464,6 +3530,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                ui: Default::default(),
                 dispatch: None,
             };
             let session_id = SessionRef::from(MakiId::generate());
@@ -4015,6 +4082,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: host.event_handle(),
+                ui: Default::default(),
                 dispatch: None,
             };
             new_session(
@@ -4088,6 +4156,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                ui: Default::default(),
                 dispatch: None,
             };
             new_session(
@@ -5972,6 +6041,7 @@ mod tests {
                     command_registry: test_registry(&[]),
                     trust_mode: TrustMode::Consult,
                     trust_policy: Arc::default(),
+                    ui: Default::default(),
                 },
                 SpawnSession {
                     model,
@@ -7152,6 +7222,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                ui: Default::default(),
                 dispatch: None,
             };
             let raw = serde_json::json!({
@@ -7194,6 +7265,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                ui: Default::default(),
                 dispatch: None,
             };
             let raw = serde_json::json!({

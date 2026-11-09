@@ -34,6 +34,7 @@ pub enum TargetCapability {
     InteractiveUi,
     ApplicationLifecycle,
     Reload,
+    UiActions,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -52,6 +53,7 @@ impl TargetCapabilities {
         TargetCapability::InteractiveUi,
         TargetCapability::ApplicationLifecycle,
         TargetCapability::Reload,
+        TargetCapability::UiActions,
     ]);
 
     pub const fn from_capability(capability: TargetCapability) -> Self {

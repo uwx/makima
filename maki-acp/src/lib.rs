@@ -3,6 +3,7 @@ pub mod methods;
 pub mod permissions;
 pub mod server;
 pub mod translate;
+pub mod ui;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +15,8 @@ use maki_commands::CommandRegistry;
 use maki_config::{ModelPolicy, SessionDefaults, TrustConfig, project::TrustMode};
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
+
+use crate::ui::UiChannel;
 
 pub struct AcpParams {
     pub model: Model,
@@ -33,6 +36,7 @@ pub struct AcpParams {
     pub command_registry: CommandRegistry,
     pub trust_mode: TrustMode,
     pub trust_policy: Arc<TrustConfig>,
+    pub ui: UiChannel,
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {

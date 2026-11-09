@@ -2603,7 +2603,7 @@ fn command_registrations(
                         argument_hint: entry.argument_hint.clone(),
                     },
                     required_capabilities: if entry.tui_only {
-                        TargetCapabilities::from_capability(TargetCapability::InteractiveUi)
+                        TargetCapabilities::from_capability(TargetCapability::UiActions)
                     } else {
                         TargetCapabilities::NONE
                     },

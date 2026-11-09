@@ -1202,7 +1202,7 @@ fn bundled_commands_project_complete_metadata() {
                 command
                     .spec()
                     .required_capabilities
-                    .contains(maki_commands::TargetCapability::InteractiveUi),
+                    .contains(maki_commands::TargetCapability::UiActions),
             )
         })
         .collect();
@@ -1219,11 +1219,26 @@ fn bundled_commands_project_complete_metadata() {
                 false
             ),
             (
+                "/autosleep".into(),
+                "Sleep the machine once every makima instance finishes working".into(),
+                None,
+                None,
+                true
+            ),
+            (
                 "/build".into(),
                 "Switch to build mode (full tool access)".into(),
                 None,
                 None,
                 false
+            ),
+            (
+                "/inherit".into(),
+                "Import rules, skills, MCP servers, memories and conversations left by other coding harnesses"
+                    .into(),
+                None,
+                Some("[subcommand]".into()),
+                true
             ),
             (
                 "/memory".into(),
@@ -3127,7 +3142,7 @@ fn register_command_happy_path() {
         snapshot.commands()[0]
             .spec()
             .required_capabilities
-            .contains(maki_commands::TargetCapability::InteractiveUi)
+            .contains(maki_commands::TargetCapability::UiActions)
     );
 }
 
