@@ -61,15 +61,19 @@ pub(super) async fn compact_history(
     cancel: &CancelToken,
     config: &AgentConfig,
     instructions: Option<&str>,
+    carry_len: usize,
     session_id: Option<&SessionRef>,
 ) -> Result<TokenUsage, AgentError> {
     let event_tx = event_tx.without_output();
     let compact_start = std::time::Instant::now();
-    let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
+    // Input no turn has answered yet is summarized away before the model ever
+    // reads it, so it is held out and re-appended after the summary.
+    let summarized = history.len().saturating_sub(carry_len);
+    let mut compaction_history: Vec<Message> = history.as_slice()[..summarized].to_vec();
     remove_orphaned_tool_results(&mut compaction_history);
     strip_images(&mut compaction_history);
     strip_thinking(&mut compaction_history);
-    strip_old_tool_results(&mut compaction_history);
+    collapse_tool_results(&mut compaction_history, RECENT_TOOL_RESULT_BUDGET);
     compaction_history.push(Message::user(summary_prompt(config, instructions)));
 
     let empty_tools = serde_json::json!([]);
@@ -93,16 +97,25 @@ pub(super) async fn compact_history(
         {
             Ok(response) => {
                 if attempt > 0 {
-                    info!(
-                        attempt,
-                        "compaction succeeded after truncating oldest rounds"
-                    );
+                    info!(attempt, "compaction succeeded after shrinking the request");
                 }
-                return finish_compact(response, history, &event_tx, compact_start, model);
+                return finish_compact(
+                    response,
+                    history,
+                    summarized,
+                    &event_tx,
+                    compact_start,
+                    model,
+                );
             }
             Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
-                truncate_oldest_round(&mut compaction_history);
+                // Truncation eats from the front, so it can never shrink an
+                // oversized result sitting in the protected tail. Collapse
+                // first, and only drop a round once nothing is left.
+                if !collapse_tool_results(&mut compaction_history, 0) {
+                    truncate_oldest_round(&mut compaction_history);
+                }
             }
             Err(e) => return Err(e.into()),
         }
@@ -114,6 +127,7 @@ pub(super) async fn compact_history(
 fn finish_compact(
     response: StreamResponse,
     history: &mut History,
+    summarized: usize,
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
@@ -133,10 +147,11 @@ fn finish_compact(
         return Err(AgentError::EmptySummary);
     }
 
-    let new_history = vec![
+    let mut new_history = vec![
         Message::user("What did we do so far?".into()),
         response.message,
     ];
+    new_history.extend_from_slice(&history.as_slice()[summarized..]);
     history.replace_compacted(new_history);
     info!(
         model = %model.id,
@@ -166,6 +181,7 @@ pub async fn compact(
         cancel,
         config,
         instructions,
+        0,
         session_id,
     )
     .await?;
@@ -228,26 +244,50 @@ fn strip_thinking(messages: &mut [Message]) {
 }
 
 const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
-const KEEP_LAST_TOOL_RESULTS: usize = 3;
+/// How much of the newest tool output survives a compaction verbatim. A count
+/// used to keep three huge results and throw away many cheap ones, so one
+/// giant dump could blow the window on every retry.
+const RECENT_TOOL_RESULT_BUDGET: usize = 64 * 1024;
 
-fn strip_old_tool_results(messages: &mut [Message]) {
-    let total: usize = messages
+fn tool_result_positions(messages: &[Message]) -> Vec<(usize, usize)> {
+    messages
         .iter()
-        .flat_map(|m| &m.content)
-        .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
-        .count();
+        .enumerate()
+        .flat_map(|(message, msg)| {
+            msg.content
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| matches!(block, ContentBlock::ToolResult { .. }))
+                .map(move |(block, _)| (message, block))
+        })
+        .collect()
+}
 
-    let mut seen = 0;
-    for msg in messages {
-        for block in &mut msg.content {
-            if let ContentBlock::ToolResult { content, .. } = block {
-                if seen < total.saturating_sub(KEEP_LAST_TOOL_RESULTS) {
-                    *content = TOOL_RESULT_PLACEHOLDER.into();
-                }
-                seen += 1;
-            }
+/// Keeps the newest results that fit `budget` and collapses the older ones. A
+/// result too big for what is left is collapsed on its own instead of spending
+/// the budget, so it cannot starve the cheaper results under it.
+fn collapse_tool_results(messages: &mut [Message], budget: usize) -> bool {
+    let positions = tool_result_positions(messages);
+    let mut remaining = budget;
+    let mut collapse = vec![false; positions.len()];
+    for (i, &(message, block)) in positions.iter().enumerate().rev() {
+        let ContentBlock::ToolResult { content, .. } = &messages[message].content[block] else {
+            continue;
+        };
+        match remaining.checked_sub(content.len()) {
+            Some(rest) => remaining = rest,
+            None => collapse[i] = true,
         }
     }
+    let mut collapsed = false;
+    for (&(message, block), _) in positions.iter().zip(&collapse).filter(|(_, c)| **c) {
+        let ContentBlock::ToolResult { content, .. } = &mut messages[message].content[block] else {
+            continue;
+        };
+        collapsed |= content != TOOL_RESULT_PLACEHOLDER;
+        *content = TOOL_RESULT_PLACEHOLDER.into();
+    }
+    collapsed
 }
 
 fn truncate_oldest_round(messages: &mut Vec<Message>) {
@@ -390,6 +430,7 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                0,
                 None,
             )
             .await
@@ -617,6 +658,7 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                0,
                 None,
             )
             .await
@@ -729,62 +771,78 @@ mod tests {
         assert!(matches!(&messages[0].content[0], ContentBlock::Text { text } if text == "hello"));
     }
 
-    #[test]
-    fn strip_old_tool_results_keeps_newest() {
-        let mut messages = vec![Message {
+    const OLD_RESULT: &str = "old";
+    const NEW_RESULT: &str = "new result";
+
+    fn tool_results(contents: &[&str]) -> Vec<Message> {
+        vec![Message {
             role: Role::User,
-            content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "old result 1".into(),
+            content: contents
+                .iter()
+                .enumerate()
+                .map(|(i, content)| ContentBlock::ToolResult {
+                    tool_use_id: format!("t{i}"),
+                    content: (*content).into(),
                     is_error: false,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t2".into(),
-                    content: "old result 2".into(),
-                    is_error: false,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t3".into(),
-                    content: "keep 1".into(),
-                    is_error: false,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t4".into(),
-                    content: "keep 2".into(),
-                    is_error: false,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t5".into(),
-                    content: "keep 3".into(),
-                    is_error: false,
-                },
-                ContentBlock::Text {
-                    text: "keep me".into(),
-                },
-            ],
+                })
+                .collect(),
             ..Default::default()
-        }];
-        strip_old_tool_results(&mut messages);
-        assert_eq!(messages[0].content.len(), 6);
-        assert!(
-            matches!(&messages[0].content[0], ContentBlock::ToolResult { content, tool_use_id, .. } if content == TOOL_RESULT_PLACEHOLDER && tool_use_id == "t1")
-        );
-        assert!(
-            matches!(&messages[0].content[1], ContentBlock::ToolResult { content, tool_use_id, .. } if content == TOOL_RESULT_PLACEHOLDER && tool_use_id == "t2")
-        );
-        assert!(
-            matches!(&messages[0].content[2], ContentBlock::ToolResult { content, tool_use_id, .. } if content == "keep 1" && tool_use_id == "t3")
-        );
-        assert!(
-            matches!(&messages[0].content[3], ContentBlock::ToolResult { content, tool_use_id, .. } if content == "keep 2" && tool_use_id == "t4")
-        );
-        assert!(
-            matches!(&messages[0].content[4], ContentBlock::ToolResult { content, tool_use_id, .. } if content == "keep 3" && tool_use_id == "t5")
-        );
-        assert!(
-            matches!(&messages[0].content[5], ContentBlock::Text { text } if text == "keep me")
-        );
+        }]
+    }
+
+    #[test_case(NEW_RESULT.len(), &[TOOL_RESULT_PLACEHOLDER, NEW_RESULT] ; "only_newest_fits")]
+    #[test_case(OLD_RESULT.len(), &[OLD_RESULT, TOOL_RESULT_PLACEHOLDER] ; "oversized_newest_spares_the_older_ones")]
+    fn collapse_tool_results_budgets_the_tail(budget: usize, expected: &[&str]) {
+        let mut messages = tool_results(&[OLD_RESULT, NEW_RESULT]);
+        assert!(collapse_tool_results(&mut messages, budget));
+        let contents: Vec<&str> = messages[0]
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => content.as_str(),
+                _ => unreachable!("only tool results are built"),
+            })
+            .collect();
+        assert_eq!(contents, expected);
+    }
+
+    #[test]
+    fn compact_carries_unanswered_input_verbatim() {
+        smol::block_on(async {
+            const PENDING: &str = "pending input";
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![
+                Message::user("first".into()),
+                Message::user(PENDING.into()),
+            ]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+                None,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            assert!(
+                requests[0]
+                    .iter()
+                    .all(|message| message.user_text() != Some(PENDING))
+            );
+            let messages = history.as_slice();
+            assert_eq!(messages.len(), 3);
+            assert!(matches!(messages[0].role, Role::User));
+            assert!(matches!(messages[1].role, Role::Assistant));
+            assert_eq!(messages[2].user_text(), Some(PENDING));
+        });
     }
 
     fn tool_use(id: &str) -> Message {
@@ -822,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_history_retries_without_reproduced_orphan() {
+    fn compact_history_retries_by_collapsing_tool_results() {
         smol::block_on(async {
             const TOOL_USE_ID: &str = "call_dMZDTpEfz2JxMvFbqFHua1Zy";
 
@@ -850,6 +908,7 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                0,
                 None,
             )
             .await
@@ -860,7 +919,54 @@ mod tests {
             assert!(requests[0]
                 .iter()
                 .flat_map(|message| &message.content)
-                .any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == TOOL_USE_ID)));
+                .any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == TOOL_USE_ID && content != TOOL_RESULT_PLACEHOLDER)));
+            assert!(requests[1]
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == TOOL_USE_ID && content == TOOL_RESULT_PLACEHOLDER)));
+        });
+    }
+
+    #[test]
+    fn compact_history_truncates_when_nothing_is_left_to_collapse() {
+        smol::block_on(async {
+            const TOOL_USE_ID: &str = "call_already_collapsed";
+
+            let provider = MockProvider::new(vec![
+                Err(AgentError::api(413, "prompt is too long")),
+                Ok(text_response(StopReason::EndTurn)),
+            ]);
+            let mut history = History::new(vec![
+                Message::user("request".into()),
+                tool_use(TOOL_USE_ID),
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: TOOL_USE_ID.into(),
+                        content: TOOL_RESULT_PLACEHOLDER.into(),
+                        is_error: false,
+                    }],
+                    ..Default::default()
+                },
+            ]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+                None,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
             assert!(
                 !requests[1]
                     .iter()
@@ -894,6 +1000,7 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                0,
                 None,
             )
             .await

@@ -220,6 +220,7 @@ pub struct Agent<'h> {
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
     rollback_len: usize,
+    carry_from: usize,
     mcp: Option<McpSession>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
@@ -288,6 +289,7 @@ impl<'h> Agent<'h> {
 
     pub fn new(params: AgentParams, mut run: AgentRunParams<'h>) -> Self {
         crate::prompt::append_model_identity(&mut run.system, &params.model);
+        let carry_from = run.history.len();
         Self {
             agent_id: params.agent_id,
             provider: params.provider,
@@ -316,6 +318,7 @@ impl<'h> Agent<'h> {
             auto_compact: compaction::auto_compact_enabled(),
             loaded_instructions: LoadedInstructions::new(),
             rollback_len: 0,
+            carry_from,
             mcp: None,
             reauth_attempts: 0,
             opts: RequestOptions::default(),
@@ -438,6 +441,7 @@ impl<'h> Agent<'h> {
         self.num_turns = 0;
         self.reauth_attempts = 0;
         self.rollback_len = self.history.len();
+        self.carry_from = self.history.len();
         self.ledger = Arc::new(RunLedger::default());
 
         let AgentInput {
@@ -783,7 +787,13 @@ impl<'h> Agent<'h> {
             }
         }
 
-        if self.try_auto_compact().await? || self.handle_queued_command().await? {
+        // Everything the turn appended is answered, so a compaction from here
+        // on may summarize it. Input arriving after this point may not.
+        self.carry_from = self.history.len();
+        if self.try_auto_compact().await? {
+            return Ok(TurnProgress::Continue);
+        }
+        if self.handle_queued_command().await? {
             return Ok(TurnProgress::Continue);
         }
 
@@ -982,6 +992,7 @@ impl<'h> Agent<'h> {
     }
 
     async fn do_compact(&mut self, instructions: Option<&str>) -> Result<(), AgentError> {
+        let carry_len = self.history.len().saturating_sub(self.carry_from);
         let context_size_before = self.context_size;
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
@@ -997,6 +1008,7 @@ impl<'h> Agent<'h> {
             &self.cancel,
             &self.config,
             instructions,
+            carry_len,
             self.session_id.as_ref(),
         )
         .await?;
@@ -1013,10 +1025,12 @@ impl<'h> Agent<'h> {
             context_size_after,
             context_window: self.model.context_window,
         })?;
-        self.history
-            .push(Message::synthetic(compaction::continue_message(
-                &self.config,
-            )));
+        if carry_len == 0 {
+            self.history
+                .push(Message::synthetic(compaction::continue_message(
+                    &self.config,
+                )));
+        }
         Ok(())
     }
 
@@ -2855,6 +2869,29 @@ mod tests {
                     AgentEvent::AutoCompacting { .. }
                 )),
                 expected,
+            );
+        });
+    }
+
+    #[test]
+    fn do_compact_carries_input_the_run_has_not_answered() {
+        smol::block_on(async {
+            const PENDING: &str = "queued input";
+            let mut history = History::new(vec![
+                Message::user("go".into()),
+                Message::user(PENDING.into()),
+            ]);
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.carry_from = 1;
+            agent.do_compact(None).await.unwrap();
+            drop(agent);
+
+            assert_eq!(
+                history.as_slice().last().unwrap().user_text(),
+                Some(PENDING)
             );
         });
     }
