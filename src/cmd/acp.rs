@@ -32,12 +32,6 @@ pub fn run(
     load_env_files(&trust.project_config);
 
     let command_registry = maki_commands::CommandRegistry::new();
-    let standard_commands = command::StandardCommands::register(
-        &command_registry,
-        &command::discover_commands(&cwd, &trust.project_config),
-        command::StandardCompletions::default(),
-    )
-    .context("register standard commands")?;
     let ui = maki_acp::ui::UiChannel::new();
     let mut plugin_host = PluginHost::with_command_registry(
         Arc::clone(ToolRegistry::global_arc()),
@@ -68,6 +62,17 @@ pub fn run(
     let automode_on = automode || config.always_automode;
     super::seed_automode(&mut config, automode_on);
     config.validate()?;
+
+    let catalog = maki_lua::orchestration::ModelCatalog::offline(&config.provider.model_policy);
+    let standard_commands = command::StandardCommands::register(
+        &command_registry,
+        &command::discover_commands(&cwd, &trust.project_config),
+        command::StandardCompletions {
+            model: Some(Arc::new(command::ModelSpecSource::new(catalog.specs()))),
+            theme: None,
+        },
+    )
+    .context("register standard commands")?;
 
     plugin_host
         .load_builtins(&config.plugins)
@@ -103,6 +108,7 @@ pub fn run(
         plugin_rules: plugin_host.plugin_rules(),
         lua_event_handle,
         command_registry,
+        catalog,
         trust_mode,
         trust_policy: Arc::new(config.trust),
         ui,

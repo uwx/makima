@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+use arc_swap::ArcSwapOption;
 use maki_commands::{
     AgentTurn, ArgumentValue, BUILTIN_COMMANDS, BuiltinOperation, CancellationToken,
     CommandAttachment, CommandBehavior, CommandCompletion, CommandContent, CommandError,
@@ -585,6 +586,38 @@ impl CommandCompletion for EmptyCompletion {
 pub struct StandardCompletions {
     pub model: Option<Arc<dyn CommandCompletion>>,
     pub theme: Option<Arc<dyn CommandCompletion>>,
+}
+
+/// Offers every model spec a catalog knows, as-is: the frontend narrows them
+/// by what the user typed.
+pub struct ModelSpecSource {
+    specs: Arc<ArcSwapOption<Vec<String>>>,
+}
+
+impl ModelSpecSource {
+    pub fn new(specs: Arc<ArcSwapOption<Vec<String>>>) -> Self {
+        Self { specs }
+    }
+}
+
+impl CommandCompletion for ModelSpecSource {
+    fn complete(
+        &self,
+        _context: CompletionContext,
+        _cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        let items = self.specs.load_full().map_or_else(Vec::new, |specs| {
+            specs
+                .iter()
+                .map(|spec| CompletionItem {
+                    label: Arc::from(spec.as_str()),
+                    insertion: Arc::from(spec.as_str()),
+                    description: None,
+                })
+                .collect()
+        });
+        Box::pin(async move { Ok(items) })
+    }
 }
 
 pub struct StandardCommands {

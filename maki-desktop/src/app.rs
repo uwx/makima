@@ -580,10 +580,10 @@ impl ChatApp {
             return;
         };
         let head = value[..slot.start].to_owned();
-        let insertion = quote_argument(&item.insertion);
+        let insertion = argument_insertion(&item.insertion);
         self.input.update(cx, |state, cx| {
             state.set_value(head, window, cx);
-            state.insert(format!("{insertion} "), window, cx);
+            state.insert(insertion, window, cx);
         });
         cx.notify();
     }
@@ -1326,6 +1326,15 @@ fn argument_slot(value: &str) -> Option<ArgumentSlot> {
     })
 }
 
+/// A directory insertion leaves the token open so the next level lists, and
+/// everything else gets the separating space done.
+fn argument_insertion(insertion: &str) -> String {
+    if insertion.ends_with(std::path::is_separator) {
+        return insertion.to_owned();
+    }
+    format!("{} ", quote_argument(insertion))
+}
+
 fn quote_argument(insertion: &str) -> String {
     if insertion.contains(char::is_whitespace) {
         format!("\"{insertion}\"")
@@ -1386,7 +1395,9 @@ impl Render for ChatApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArgumentMenu, SLASH_PREFIX, argument_slot, quote_argument, slash_query};
+    use super::{
+        ArgumentMenu, SLASH_PREFIX, argument_insertion, argument_slot, quote_argument, slash_query,
+    };
     use crate::acp::ArgItem;
     use test_case::test_case;
 
@@ -1413,6 +1424,13 @@ mod tests {
     #[test_case("import mcp", "\"import mcp\"" ; "quoted when it has a space")]
     fn quote_argument_wraps_only_spaced_values(insertion: &str, expected: &str) {
         assert_eq!(quote_argument(insertion), expected);
+    }
+
+    #[test_case("all", "all " ; "command argument closes with a space")]
+    #[test_case("import mcp", "\"import mcp\" " ; "spaced value is quoted")]
+    #[test_case("src/", "src/" ; "directory stays open for the next level")]
+    fn argument_insertion_closes_or_keeps_the_token(insertion: &str, expected: &str) {
+        assert_eq!(argument_insertion(insertion), expected);
     }
 
     #[test]

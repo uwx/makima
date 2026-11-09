@@ -33,8 +33,8 @@ use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
 use maki_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
-    CompletionResult, InputDispatch, PresentedCommand, TargetCapabilities, TargetCapability,
-    TargetHandle,
+    CompletionKind, CompletionProviders, CompletionResult, InputDispatch, PresentedCommand,
+    TargetCapabilities, TargetCapability, TargetHandle,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{
@@ -320,7 +320,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
     let mut server = Server {
         out_tx,
-        catalog: ModelCatalog::offline(&params.model_policy),
+        catalog: params.catalog.clone(),
         session: None,
         elicitation: false,
         supports_boolean: false,
@@ -1225,10 +1225,26 @@ async fn complete_arguments(srv: &Server, raw: &Value) -> Value {
     else {
         return empty();
     };
-    let Ok(completion) = session
-        .command_registry
-        .open_completion(command, session.command_target.id())
-    else {
+    let providers = CompletionProviders::default()
+        .with(
+            CompletionKind::Directory,
+            Arc::new(crate::completion::PathSource::directories()),
+        )
+        .with(
+            CompletionKind::File,
+            Arc::new(crate::completion::PathSource::files()),
+        );
+    let cwd = session
+        .coordinator
+        .as_ref()
+        .and_then(|coordinator| coordinator.read().cwd())
+        .unwrap_or_default();
+    let Ok(completion) = session.command_registry.open_completion_with_defaults(
+        command,
+        session.command_target.id(),
+        providers,
+        Arc::from(cwd.to_string_lossy().as_ref()),
+    ) else {
         return empty();
     };
     let mode = Arc::from("");
@@ -3287,6 +3303,7 @@ mod tests {
             plugin_rules: Arc::default(),
             lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
             command_registry: test_registry(&[]),
+            catalog: ModelCatalog::default(),
             trust_mode: TrustMode::Consult,
             trust_policy: Arc::default(),
             ui: Default::default(),
@@ -6155,6 +6172,7 @@ mod tests {
                     plugin_rules: Arc::default(),
                     lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
                     command_registry: test_registry(&[]),
+                    catalog: ModelCatalog::default(),
                     trust_mode: TrustMode::Consult,
                     trust_policy: Arc::default(),
                     ui: Default::default(),

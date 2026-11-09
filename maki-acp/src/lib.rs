@@ -1,3 +1,4 @@
+pub mod completion;
 pub mod elicitation;
 pub mod methods;
 pub mod permissions;
@@ -13,6 +14,7 @@ use maki_agent::permissions::PluginRuleStore;
 use maki_agent::{AgentConfig, PermissionsConfig};
 use maki_commands::CommandRegistry;
 use maki_config::{ModelPolicy, SessionDefaults, TrustConfig, project::TrustMode};
+use maki_lua::orchestration::ModelCatalog;
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
 
@@ -34,6 +36,8 @@ pub struct AcpParams {
     pub plugin_rules: Arc<PluginRuleStore>,
     pub lua_event_handle: maki_lua::EventHandle,
     pub command_registry: CommandRegistry,
+    /// Shared with the model completion source, so discovery reaches it.
+    pub catalog: ModelCatalog,
     pub trust_mode: TrustMode,
     pub trust_policy: Arc<TrustConfig>,
     pub ui: UiChannel,
