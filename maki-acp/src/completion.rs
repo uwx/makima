@@ -2,14 +2,99 @@
 //! candidates but cannot walk the agent's filesystem, so paths are listed
 //! here.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwapOption;
+use maki_agent::argument_completion::{model_argument_items, plan_model_argument};
 use maki_commands::{
     CancellationToken, CommandCompletion, CommandFuture, CompletionContext, CompletionError,
     CompletionItem, MAX_COMPLETION_CANDIDATES,
 };
+use maki_providers::provider::adjust_model;
+use maki_providers::{Model, ModelCapabilities, Timeouts};
+use tracing::debug;
+
+/// Completes `/model`: the catalog's specs, then the `key=value` fields the
+/// named model accepts. With no model named the host cannot tell which model
+/// is current, so every preset is offered and the command validates on run.
+#[derive(Clone)]
+pub struct ModelArgSource {
+    specs: Arc<ArcSwapOption<Vec<String>>>,
+    capabilities: Arc<Mutex<HashMap<String, ModelCapabilities>>>,
+    timeouts: Timeouts,
+}
+
+impl ModelArgSource {
+    pub fn new(specs: Arc<ArcSwapOption<Vec<String>>>, timeouts: Timeouts) -> Self {
+        Self {
+            specs,
+            capabilities: Arc::default(),
+            timeouts,
+        }
+    }
+}
+
+impl CommandCompletion for ModelArgSource {
+    fn complete(
+        &self,
+        context: CompletionContext,
+        _cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        let plan = plan_model_argument(
+            &context.arguments,
+            &context.argument,
+            context.argument_range.as_ref(),
+            &context.preceding_arguments,
+        );
+        let specs = self.specs.load_full().map_or_else(Vec::new, |specs| {
+            specs
+                .iter()
+                .map(|spec| Arc::from(spec.as_str()))
+                .collect::<Vec<_>>()
+        });
+        let named = plan.named.clone();
+        let cached = named.as_ref().and_then(|spec| {
+            self.capabilities
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(spec.as_ref())
+                .copied()
+        });
+        let cache = Arc::clone(&self.capabilities);
+        let timeouts = self.timeouts;
+        Box::pin(async move {
+            let resolved = match (named, cached) {
+                (Some(_), Some(capabilities)) => Some(capabilities),
+                (Some(spec), None) => {
+                    let argument = Arc::clone(&spec);
+                    let capabilities = smol::unblock(move || resolve(&argument, timeouts)).await;
+                    cache
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(spec.to_string(), capabilities);
+                    Some(capabilities)
+                }
+                (None, _) => None,
+            };
+            Ok(model_argument_items(&specs, &plan, resolved, true))
+        })
+    }
+}
+
+/// Falls back to the static capabilities when the provider cannot be built,
+/// so a broken provider shows what the model table knows.
+fn resolve(spec: &str, timeouts: Timeouts) -> ModelCapabilities {
+    let Ok(mut model) = Model::from_spec(spec) else {
+        return ModelCapabilities::NONE;
+    };
+    if let Err(error) = adjust_model(&mut model, timeouts) {
+        debug!(spec, %error, "model capabilities fall back to static metadata");
+    }
+    ModelCapabilities::from(&model)
+}
 
 /// Lists one directory: its entries that start with the typed leaf.
 pub struct PathSource {
@@ -64,7 +149,7 @@ fn split(cwd: &Path, query: &str) -> (PathBuf, String, String) {
     }
     match query.rfind(std::path::is_separator) {
         Some(index) => (
-            resolve(cwd, &query[..=index]),
+            resolve_query(cwd, &query[..=index]),
             query[..=index].to_owned(),
             query[index + 1..].to_owned(),
         ),
@@ -72,7 +157,7 @@ fn split(cwd: &Path, query: &str) -> (PathBuf, String, String) {
     }
 }
 
-fn resolve(cwd: &Path, value: &str) -> PathBuf {
+fn resolve_query(cwd: &Path, value: &str) -> PathBuf {
     let expanded = match value.strip_prefix("~/") {
         Some(rest) => {
             maki_storage::paths::home().map_or_else(|| PathBuf::from(value), |home| home.join(rest))

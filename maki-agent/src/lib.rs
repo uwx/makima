@@ -41,6 +41,7 @@ pub use manager::{
     CurrentManagedTurn, GraphEvents, GraphLifecycle, ManagedPromptWait, ManagerError,
     PromptWaitError, ShutdownReport, TurnPermitLease,
 };
+pub mod argument_completion;
 pub mod command;
 pub mod config_change;
 pub mod diff;

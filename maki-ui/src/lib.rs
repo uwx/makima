@@ -28,6 +28,22 @@ mod storage_writer;
 mod text_buffer;
 mod theme;
 pub use theme::BUNDLED_THEMES;
+
+/// The active CLI theme's palette, for frontends that render their own colors.
+pub fn theme_palette() -> (String, Vec<(&'static str, [u8; 3])>) {
+    theme::palette()
+}
+
+/// Every theme the CLI knows, for a frontend's theme picker.
+pub fn theme_names() -> Vec<String> {
+    theme::names()
+}
+
+/// Installs and persists `name`, so the next run and the TUI agree with the
+/// frontend that asked.
+pub fn select_theme(name: &str) -> Result<(), String> {
+    theme::select(name)
+}
 pub(crate) mod terminal_image;
 mod trust_card;
 pub use trust_card::ask_trust;

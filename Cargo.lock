@@ -4926,6 +4926,7 @@ name = "maki-acp"
 version = "0.5.5-makima"
 dependencies = [
  "agent-client-protocol-schema",
+ "arc-swap",
  "color-eyre",
  "event-listener",
  "flume 0.11.1",

@@ -365,6 +365,19 @@ pub(crate) fn apply_theme(provider: &dyn ThemesProvider, name: &str) {
     provider.select(name);
 }
 
+/// Every theme name the CLI knows: bundled first-run set plus user overrides.
+pub(crate) fn names() -> Vec<String> {
+    default_provider().names()
+}
+
+/// Installs `name` as the active theme and remembers it for the next run.
+pub(crate) fn select(name: &str) -> Result<(), String> {
+    let provider = default_provider();
+    provider.install(name)?;
+    provider.persist(name);
+    Ok(())
+}
+
 pub fn current() -> Guard<Arc<Theme>> {
     THEME.load()
 }
@@ -380,6 +393,44 @@ pub(crate) fn theme_test_guard() -> std::sync::MutexGuard<'static, ()> {
     THEME_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The active theme's colors, keyed by the role a non-TUI frontend can reuse.
+pub(crate) fn palette() -> (String, Vec<(&'static str, [u8; 3])>) {
+    let theme = current();
+    let roles = [
+        ("background", Some(theme.background)),
+        ("foreground", Some(theme.foreground)),
+        ("accent", theme.accent.fg),
+        ("selection", theme.item_selected.bg),
+        ("border", theme.panel_border.fg),
+        ("input_border", theme.input_border.fg),
+        ("muted", theme.status_dim.fg),
+        ("error", theme.error.fg),
+        ("success", theme.tool_success.fg),
+        ("warning", theme.todo_in_progress.fg),
+        ("user", theme.user.fg),
+        ("user_background", theme.user_bg.bg),
+        ("tool", theme.tool.fg),
+        ("tool_background", theme.tool_bg.bg),
+        ("thinking", theme.thinking.fg),
+        ("heading", theme.heading.fg),
+        ("inline_code", theme.inline_code.fg),
+        ("diff_added", theme.diff_new.bg),
+        ("diff_removed", theme.diff_old.bg),
+    ];
+    let colors = roles
+        .into_iter()
+        .filter_map(|(role, color)| Some((role, rgb(color?)?)))
+        .collect();
+    (default_provider().current_theme_name(), colors)
+}
+
+fn rgb(color: Color) -> Option<[u8; 3]> {
+    match color {
+        Color::Rgb(r, g, b) => Some([r, g, b]),
+        _ => None,
+    }
 }
 
 pub fn style_by_name(name: &str) -> Style {

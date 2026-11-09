@@ -11,18 +11,23 @@ use agent_client_protocol_schema::{
     SessionModeState,
 };
 
+use crate::ThemeSource;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const MODEL_CONFIG_ID: &str = "model";
 
-pub fn initialize_response() -> InitializeResponse {
+pub fn initialize_response(themes: Option<&dyn ThemeSource>) -> InitializeResponse {
+    let capabilities = AgentCapabilities::new()
+        .load_session(true)
+        .prompt_capabilities(PromptCapabilities::new().image(true).embedded_context(true))
+        .mcp_capabilities(McpCapabilities::new().http(true));
+    let capabilities = match themes {
+        Some(themes) => capabilities.meta(themes.current().meta(&themes.names())),
+        None => capabilities,
+    };
     InitializeResponse::new(ProtocolVersion::V1)
-        .agent_capabilities(
-            AgentCapabilities::new()
-                .load_session(true)
-                .prompt_capabilities(PromptCapabilities::new().image(true).embedded_context(true))
-                .mcp_capabilities(McpCapabilities::new().http(true)),
-        )
+        .agent_capabilities(capabilities)
         .auth_methods(vec![])
         .agent_info(Implementation::new("makima", VERSION))
 }
@@ -221,7 +226,7 @@ mod tests {
 
     #[test]
     fn agent_info_names_makima() {
-        let info = initialize_response().agent_info.unwrap();
+        let info = initialize_response(None).agent_info.unwrap();
         assert_eq!(info.name, "makima");
     }
 }

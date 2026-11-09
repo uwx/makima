@@ -1,3 +1,8 @@
+//! GPUI shell for makima's desktop frontend.
+//!
+//! Windows GUI subsystem: without it a console window opens beside the app.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod acp;
 mod app;
 mod backend;

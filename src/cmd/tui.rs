@@ -314,6 +314,19 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
     let mut apply_explicit_model = explicit_model;
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
+    let _instance = (!cli.print)
+        .then(|| {
+            maki_storage::instances::InstanceGuard::register(
+                &storage,
+                maki_storage::instances::InstanceKind::Tui,
+                &cwd,
+                None,
+            )
+        })
+        .transpose();
+    if let Err(error) = &_instance {
+        eprintln!("warning: cannot record this instance: {error}");
+    }
 
     let mode = cli.trust_mode();
     let mut trust = project::resolve(&storage, &cwd, mode);

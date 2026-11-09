@@ -5,7 +5,7 @@ use std::thread;
 use flume::{Receiver, Sender};
 use serde_json::Value;
 
-use crate::acp::{self, Client, Event, PickOutcome, Target};
+use crate::acp::{self, Client, Event, PickOutcome, Target, ThemeCatalog};
 
 pub enum Command {
     Prompt(String),
@@ -15,6 +15,8 @@ pub enum Command {
 pub struct Backend {
     client: Arc<Client>,
     arguments: Sender<String>,
+    pub themes: ThemeCatalog,
+    pub agent_pid: u32,
     pub model: String,
     pub session: String,
     pub cwd: PathBuf,
@@ -33,6 +35,8 @@ impl Backend {
         let backend = Backend {
             client: connection.client,
             arguments,
+            themes: connection.themes,
+            agent_pid: connection.agent_pid,
             model: connection.model,
             session: acp::short_session(&connection.session),
             cwd: target.session_cwd().to_path_buf(),
@@ -74,6 +78,18 @@ impl Backend {
 
     pub fn complete_arguments(&self, text: String) {
         _ = self.arguments.send(text);
+    }
+
+    pub fn set_theme(&self, name: String) -> Result<(), String> {
+        let client = Arc::clone(&self.client);
+        thread::Builder::new()
+            .name("maki-theme".into())
+            .spawn(move || {
+                let result = client.set_theme(&name);
+                let _ = client.emit(Event::Theme(result));
+            })
+            .map_err(|error| format!("start theme switch: {error}"))?;
+        Ok(())
     }
 }
 

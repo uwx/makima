@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -41,8 +43,12 @@ const UI_CAPABILITY_KEY: &str = "maki-ui";
 const FLASH_METHOD: &str = "maki/ui/flash";
 const PICK_METHOD: &str = "maki/ui/pick";
 const COMPLETE_METHOD: &str = "maki/complete";
+const THEME_METHOD: &str = "maki/theme";
 const SHORT_SESSION_CHARS: usize = 8;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(5);
+const THEME_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An inbound event from the agent, already narrowed to what the desktop renders.
 pub enum Event {
@@ -55,6 +61,7 @@ pub enum Event {
         text: String,
         items: Vec<ArgItem>,
     },
+    Theme(Result<ThemePalette, String>),
     PromptDone(Result<StopReason, String>),
     Closed(String),
 }
@@ -90,6 +97,35 @@ pub enum PickOutcome {
     Close,
 }
 
+/// The themes the agent knows, and the one it paints with now.
+#[derive(Debug, Clone, Default)]
+pub struct ThemeCatalog {
+    pub current: Option<ThemePalette>,
+    pub names: Vec<String>,
+}
+
+/// The CLI theme the agent says to paint with, as `#rrggbb` roles.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThemePalette {
+    pub name: String,
+    #[serde(default)]
+    colors: HashMap<String, String>,
+}
+
+impl ThemePalette {
+    pub fn rgb(&self, role: &str) -> Option<[u8; 3]> {
+        let hex = self.colors.get(role)?.strip_prefix('#')?;
+        let channel = |at: usize| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok();
+        Some([channel(0)?, channel(2)?, channel(4)?])
+    }
+
+    pub fn is_light(&self) -> bool {
+        self.rgb("background").is_some_and(|[red, green, blue]| {
+            u32::from(red) + u32::from(green) + u32::from(blue) > 3 * 128
+        })
+    }
+}
+
 /// One argument candidate for the command being typed.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArgItem {
@@ -110,6 +146,21 @@ struct PickParams {
     footer: Option<Vec<(String, String)>>,
     cursor: Option<usize>,
     items: Vec<PickItem>,
+}
+
+fn themes_from(response: &Value) -> ThemeCatalog {
+    let Some(maki) = response.pointer("/agentCapabilities/_meta/maki") else {
+        return ThemeCatalog::default();
+    };
+    ThemeCatalog {
+        current: maki
+            .get("theme")
+            .and_then(|theme| serde_json::from_value(theme.clone()).ok()),
+        names: maki
+            .get("themes")
+            .and_then(|names| serde_json::from_value(names.clone()).ok())
+            .unwrap_or_default(),
+    }
 }
 
 /// Where the ACP agent lives: a local process or an SSH connection.
@@ -191,6 +242,8 @@ impl Target {
         if let Some(cwd) = &self.process_cwd {
             command.current_dir(cwd);
         }
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
         command
             .spawn()
             .map_err(|error| format!("start `{}`: {error}", self.program))
@@ -202,6 +255,8 @@ pub struct Connection {
     pub events: Receiver<Event>,
     pub session: SessionId,
     pub model: String,
+    pub themes: ThemeCatalog,
+    pub agent_pid: u32,
 }
 
 pub fn connect(target: &Target) -> Result<Connection, String> {
@@ -214,6 +269,7 @@ pub fn connect(target: &Target) -> Result<Connection, String> {
         .stdout
         .take()
         .ok_or_else(|| "agent has no stdout".to_owned())?;
+    let agent_pid = child.id();
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let (events_tx, events_rx) = flume::unbounded::<Event>();
@@ -234,13 +290,15 @@ pub fn connect(target: &Target) -> Result<Connection, String> {
         })
         .map_err(|error| format!("start agent waiter: {error}"))?;
 
-    client.initialize()?;
+    let themes = client.initialize()?;
     let (session, model) = client.new_session(target.session_cwd())?;
     Ok(Connection {
         client,
         events: events_rx,
         session,
         model,
+        themes,
+        agent_pid,
     })
 }
 
@@ -308,7 +366,7 @@ impl Client {
         self.events.send(event).map_err(|_| "ui closed".to_owned())
     }
 
-    pub fn initialize(&self) -> Result<(), String> {
+    pub fn initialize(&self) -> Result<ThemeCatalog, String> {
         let mut meta = serde_json::Map::new();
         meta.insert(UI_CAPABILITY_KEY.to_owned(), Value::Bool(true));
         let request = InitializeRequest::new(ProtocolVersion::LATEST).client_capabilities(
@@ -316,8 +374,14 @@ impl Client {
                 .fs(FileSystemCapabilities::new())
                 .meta(meta),
         );
-        self.request::<_, Value>(INITIALIZE_METHOD, request, Some(INITIALIZE_TIMEOUT))?;
-        Ok(())
+        let response: Value = self.request(INITIALIZE_METHOD, request, Some(INITIALIZE_TIMEOUT))?;
+        Ok(themes_from(&response))
+    }
+
+    pub fn set_theme(&self, name: &str) -> Result<ThemePalette, String> {
+        let response: Value =
+            self.request(THEME_METHOD, json!({ "name": name }), Some(THEME_TIMEOUT))?;
+        serde_json::from_value(response).map_err(|error| format!("decode theme: {error}"))
     }
 
     pub fn complete_arguments(&self, text: &str) -> Result<Vec<ArgItem>, String> {
@@ -567,13 +631,68 @@ pub fn short_session(session: &SessionId) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{ACP_SUBCOMMAND, MODEL_FLAG, SSH_PROGRAM, Target};
+    use super::{ACP_SUBCOMMAND, MODEL_FLAG, SSH_PROGRAM, Target, ThemePalette, themes_from};
     use test_case::test_case;
 
     const HOST: &str = "buildbox";
     const REMOTE_PATH: &str = "/srv/app";
     const QUOTED_PATH: &str = "/srv/it's";
     const MODEL: &str = "claude-sonnet-4";
+
+    fn palette(colors: &[(&str, &str)]) -> ThemePalette {
+        let colors = colors
+            .iter()
+            .map(|(role, hex)| ((*role).to_owned(), (*hex).to_owned()))
+            .collect();
+        ThemePalette {
+            name: "makima".to_owned(),
+            colors,
+        }
+    }
+
+    #[test_case("#120c0c", Some([0x12, 0x0c, 0x0c]) ; "hex triplet")]
+    #[test_case("#FFB08A", Some([0xff, 0xb0, 0x8a]) ; "uppercase")]
+    #[test_case("120c0c", None ; "missing hash")]
+    #[test_case("#12c", None ; "short form")]
+    #[test_case("#zzzzzz", None ; "not hex")]
+    fn rgb_reads_hex_role(hex: &str, expected: Option<[u8; 3]>) {
+        assert_eq!(palette(&[("background", hex)]).rgb("background"), expected);
+    }
+
+    #[test]
+    fn initialize_theme_is_read_from_the_agent_meta() {
+        let response = serde_json::json!({
+            "agentCapabilities": {
+                "_meta": {
+                    "maki": {
+                        "theme": { "name": "dracula", "colors": { "background": "#282a36" } }
+                    }
+                }
+            }
+        });
+        let catalog = themes_from(&response);
+        let theme = catalog.current.expect("theme");
+        assert_eq!(theme.name, "dracula");
+        assert_eq!(theme.rgb("background"), Some([0x28, 0x2a, 0x36]));
+        assert!(catalog.names.is_empty());
+    }
+
+    #[test]
+    fn initialize_without_theme_meta_yields_none() {
+        let response = serde_json::json!({ "agentCapabilities": {} });
+        assert!(themes_from(&response).current.is_none());
+    }
+
+    #[test]
+    fn unknown_role_has_no_color() {
+        assert_eq!(palette(&[]).rgb("background"), None);
+    }
+
+    #[test_case("#120c0c", false ; "dark background")]
+    #[test_case("#f5f5f5", true ; "light background")]
+    fn is_light_follows_the_background(hex: &str, light: bool) {
+        assert_eq!(palette(&[("background", hex)]).is_light(), light);
+    }
 
     #[test]
     fn remote_builds_ssh_argv() {

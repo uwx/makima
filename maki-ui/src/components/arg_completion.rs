@@ -13,9 +13,10 @@ use maki_commands::{
     CompletionSessionId, InvocationTargetId, MAX_COMPLETION_CANDIDATES,
 };
 
+use maki_agent::argument_completion::{model_argument_items, plan_model_argument};
 use maki_agent::command::resolve_model;
 use maki_lua::orchestration::TrustedTarget;
-use maki_providers::{ModelCapabilities, ModelOption};
+use maki_providers::ModelCapabilities;
 
 use crate::model_capabilities::ModelCapabilityCache;
 
@@ -219,72 +220,12 @@ impl CommandCompletion for ModelArgSource {
                 .map(|spec| Arc::from(spec.as_str()))
                 .collect()
         });
-        let preceding = context
-            .preceding_arguments
-            .iter()
-            .flat_map(|argument| argument.values.iter())
-            .filter_map(|value| match value {
-                maki_commands::ArgumentValue::String(value) => Some(value.as_ref()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let range = context.argument_range.as_ref();
-        let open_brace = range.and_then(|range| context.arguments[..range.start].rfind('{'));
-        let named_model = match open_brace {
-            Some(open) => {
-                let head = &context.arguments[..open];
-                head.rsplit(char::is_whitespace)
-                    .next()
-                    .map(|token| token.trim_matches('"'))
-            }
-            None => preceding.iter().copied().find(|value| !value.contains('=')),
-        }
-        .filter(|argument| !argument.is_empty())
-        .map(str::to_owned);
-        let mut items: Vec<CompletionItem> =
-            if named_model.is_some() || open_brace.is_some() || context.argument.contains('=') {
-                Vec::new()
-            } else {
-                allowed
-                    .iter()
-                    .map(|spec| CompletionItem {
-                        label: Arc::clone(spec),
-                        insertion: Arc::clone(spec),
-                        description: None,
-                    })
-                    .collect()
-            };
-        let embedded_options = open_brace.map(|open| {
-            let end = context.arguments[open..]
-                .find('}')
-                .map_or(context.arguments.len(), |end| open + end);
-            (open + 1, end)
-        });
-        let candidates: Vec<ModelOption> = ModelOption::ALL
-            .into_iter()
-            .filter(|option| {
-                let prefix = format!("{}=", option.key());
-                let duplicate = embedded_options.map_or_else(
-                    || preceding.iter().any(|value| value.starts_with(&prefix)),
-                    |(start, end)| {
-                        context.arguments[start..end]
-                            .split(',')
-                            .scan(start, |offset, option| {
-                                let option_start = *offset;
-                                *offset += option.len() + 1;
-                                Some((option_start, option))
-                            })
-                            .any(|(start, option)| {
-                                let start = start + option.len() - option.trim_start().len();
-                                range.is_none_or(|range| start != range.start)
-                                    && option.trim_start().starts_with(&prefix)
-                            })
-                    },
-                );
-                !duplicate
-                    && (!context.argument.contains('=') || context.argument.starts_with(&prefix))
-            })
-            .collect();
+        let plan = plan_model_argument(
+            &context.arguments,
+            &context.argument,
+            context.argument_range.as_ref(),
+            &context.preceding_arguments,
+        );
         let current = target
             .as_ref()
             .and_then(|target| target.target.effective_config().ok().flatten())
@@ -292,7 +233,7 @@ impl CommandCompletion for ModelArgSource {
         let unconstrained = self.targets.is_none();
         let cache = Arc::clone(&self.capabilities);
         Box::pin(async move {
-            let capabilities = match named_model {
+            let capabilities = match plan.named.clone() {
                 Some(argument) => match resolve_model(&argument, &allowed) {
                     Ok(spec)
                         if target
@@ -305,24 +246,12 @@ impl CommandCompletion for ModelArgSource {
                 },
                 None => current,
             };
-            for option in candidates {
-                let supported = match capabilities {
-                    Some(capabilities) => capabilities.supports(option),
-                    None => unconstrained,
-                };
-                if !supported {
-                    continue;
-                }
-                items.extend(option.presets().iter().map(|value| {
-                    let insertion: Arc<str> = Arc::from(format!("{}={value}", option.key()));
-                    CompletionItem {
-                        label: Arc::clone(&insertion),
-                        insertion,
-                        description: Some(Arc::from(option.description())),
-                    }
-                }));
-            }
-            Ok(items)
+            Ok(model_argument_items(
+                &allowed,
+                &plan,
+                capabilities,
+                unconstrained,
+            ))
         })
     }
 }

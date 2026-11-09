@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::iter;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,8 +34,8 @@ use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
 use maki_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
-    CompletionKind, CompletionProviders, CompletionResult, InputDispatch, PresentedCommand,
-    TargetCapabilities, TargetCapability, TargetHandle,
+    CompletionInput, CompletionKind, CompletionProviders, CompletionResult, InputDispatch,
+    PresentedCommand, TargetCapabilities, TargetCapability, TargetHandle,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{
@@ -54,7 +55,7 @@ use smol::io::AsyncBufReadExt;
 use tracing::{debug, info, warn};
 
 use crate::ui::{COMPLETE_METHOD, UI_CAPABILITY_PATH, UiBridge};
-use crate::{AcpParams, methods, permissions, translate};
+use crate::{AcpParams, THEME_METHOD, ThemeParams, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 const CANCELLATION_IN_PROGRESS_CODE: i32 = -32001;
@@ -67,6 +68,7 @@ const EVENT_STREAM_ENDED: &str = "session event stream ended";
 const ROOT_CONFIG_UNAVAILABLE: &str = "session root configuration is unavailable";
 const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const COMMAND_PREFIX: char = '/';
+const INVALID_THEME_CODE: i32 = -32602;
 const AUTH_FAILED_MSG: &str =
     "Authentication failed. Run `maki auth login`, then send the prompt again.";
 
@@ -439,7 +441,7 @@ async fn handle_request(
                 srv.ui.enable();
             }
             Ok(AgentResponse::InitializeResponse(
-                methods::initialize_response(),
+                methods::initialize_response(params.themes.as_deref()),
             ))
         }
         "session/new" => new_session(srv, raw, params).await,
@@ -450,6 +452,21 @@ async fn handle_request(
         },
         "session/set_mode" => handle_set_mode(srv, raw, params).await,
         "session/set_config_option" => handle_set_config(srv, raw).await,
+        THEME_METHOD => {
+            let Some(themes) = params.themes.as_ref() else {
+                respond_request(srv, method, id, Err(AcpError::method_not_found()));
+                return;
+            };
+            let result = match parse_params::<ThemeParams>(raw) {
+                Ok(ThemeParams { name }) => themes
+                    .install(&name)
+                    .map(|theme| theme.json())
+                    .map_err(|error| AcpError::new(INVALID_THEME_CODE, error)),
+                Err(error) => Err(error),
+            };
+            send(&srv.out_tx, Response::new(id, result));
+            return;
+        }
         COMPLETE_METHOD => {
             if !srv.ui.enabled() {
                 respond_request(srv, method, id, Err(AcpError::method_not_found()));
@@ -1177,6 +1194,7 @@ struct ArgumentAtEnd<'a> {
     arguments: &'a str,
     argument: &'a str,
     index: usize,
+    range: Range<usize>,
 }
 
 fn argument_at_end(text: &str) -> Option<ArgumentAtEnd<'_>> {
@@ -1190,19 +1208,24 @@ fn argument_at_end(text: &str) -> Option<ArgumentAtEnd<'_>> {
     let mut tokens = arguments.split_whitespace();
     if ends_open {
         let index = tokens.count();
+        let end = arguments.len();
         return Some(ArgumentAtEnd {
             command,
             arguments,
             argument: "",
             index,
+            range: end..end,
         });
     }
     let index = tokens.clone().count().checked_sub(1)?;
+    let argument = tokens.next_back()?;
+    let start = arguments.len() - argument.len();
     Some(ArgumentAtEnd {
         command,
         arguments,
-        argument: tokens.next_back()?,
+        argument,
         index,
+        range: start..arguments.len(),
     })
 }
 
@@ -1247,15 +1270,14 @@ async fn complete_arguments(srv: &Server, raw: &Value) -> Value {
     ) else {
         return empty();
     };
-    let mode = Arc::from("");
-    let result = completion
-        .complete(
-            Arc::from(target.arguments),
-            Arc::from(target.argument),
-            target.index,
-            mode,
-        )
-        .await;
+    let input = CompletionInput {
+        arguments: Arc::from(target.arguments),
+        argument: Arc::from(target.argument),
+        argument_index: target.index,
+        argument_range: Some(target.range),
+        mode: Arc::from(""),
+    };
+    let result = completion.complete_input(input).await;
     let CompletionResult::Items(candidates) = result else {
         return empty();
     };
@@ -2663,11 +2685,14 @@ mod tests {
 
     #[test_case("/inherit", None; "command without arguments")]
     #[test_case("hello there", None; "plain text")]
-    #[test_case("/inherit ", Some(("/inherit", "", 0)); "empty first argument")]
-    #[test_case("/inherit a", Some(("/inherit", "a", 0)); "first argument typed")]
-    #[test_case("/inherit all c", Some(("/inherit", "c", 1)); "later argument typed")]
-    fn argument_at_end_splits_the_typed_token(text: &str, expected: Option<(&str, &str, usize)>) {
-        let parsed = argument_at_end(text).map(|at| (at.command, at.argument, at.index));
+    #[test_case("/inherit ", Some(("/inherit", "", 0, 0..0)); "empty first argument")]
+    #[test_case("/inherit a", Some(("/inherit", "a", 0, 0..1)); "first argument typed")]
+    #[test_case("/inherit all c", Some(("/inherit", "c", 1, 4..5)); "later argument typed")]
+    fn argument_at_end_splits_the_typed_token(
+        text: &str,
+        expected: Option<(&str, &str, usize, Range<usize>)>,
+    ) {
+        let parsed = argument_at_end(text).map(|at| (at.command, at.argument, at.index, at.range));
         assert_eq!(parsed, expected);
     }
 
@@ -3307,6 +3332,7 @@ mod tests {
             trust_mode: TrustMode::Consult,
             trust_policy: Arc::default(),
             ui: Default::default(),
+            themes: None,
         }
     }
 
@@ -6176,6 +6202,7 @@ mod tests {
                     trust_mode: TrustMode::Consult,
                     trust_policy: Arc::default(),
                     ui: Default::default(),
+                    themes: None,
                 },
                 SpawnSession {
                     model,

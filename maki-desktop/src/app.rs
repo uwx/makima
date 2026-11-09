@@ -1,11 +1,12 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use agent_client_protocol_schema::{
     AvailableCommand, ContentBlock, PermissionOption, SessionUpdate, ToolCallContent,
     ToolCallStatus,
 };
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Sizable,
+    ActiveTheme, Icon, IconName, Sizable, Theme, ThemeMode,
     button::Button,
     h_flex,
     input::{InputEvent, Textarea, TextareaState},
@@ -19,6 +20,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use maki_storage::StateDir;
+use maki_storage::instances::{self, Instance, InstanceGuard, InstanceKind};
 use serde_json::Value;
 
 use crate::acp::{self, ArgItem, Event, PickItem, PickOutcome, Target};
@@ -32,6 +35,17 @@ const TRANSCRIPT_MAX_WIDTH: f32 = 860.;
 const PICK_WIDTH: f32 = 560.;
 const PICK_MAX_HEIGHT: f32 = 480.;
 const MAX_SLASH_ROWS: usize = 8;
+const INSTANCES_REFRESH: Duration = Duration::from_secs(2);
+const LIGHT_ACCENT: f32 = 0.6;
+const ON_LIGHT_ACCENT: [u8; 3] = [0x1a, 0x1a, 0x1a];
+const ON_DARK_ACCENT: [u8; 3] = [0xf5, 0xf5, 0xf5];
+const ACTIVE_DESCRIPTION_ALPHA: f32 = 0.75;
+const THEME_COMMAND: &str = "theme";
+const THEME_DESCRIPTION: &str = "Switch the color theme";
+const THEME_PICKER_TITLE: &str = "Theme";
+const THEMES_UNAVAILABLE: &str = "This agent does not provide themes";
+const PICK_HINT: &str = "Enter";
+const PICK_HINT_ACTION: &str = "apply";
 const ARGUMENT_MAX_HEIGHT: f32 = 320.;
 const SLASH_PREFIX: char = '/';
 const DISCONNECTED: &str = "Agent is not connected";
@@ -79,11 +93,16 @@ struct ArgumentMenu {
 }
 
 struct PendingPick {
-    request: Value,
+    target: PickTarget,
     title: String,
     footer: Vec<(String, String)>,
     items: Vec<PickItem>,
     active: usize,
+}
+
+enum PickTarget {
+    Agent(Value),
+    Themes,
 }
 
 #[derive(Clone, Copy)]
@@ -143,6 +162,12 @@ pub struct ChatApp {
     pick: Option<PendingPick>,
     status: Status,
     commands: Vec<AvailableCommand>,
+    instances: Vec<Instance>,
+    agent_pid: Option<u32>,
+    _instance: Option<InstanceGuard>,
+    _instances: Task<()>,
+    themes: Vec<String>,
+    theme: Option<String>,
     slash: Option<SlashMenu>,
     slash_dismissed: bool,
     arguments: Option<ArgumentMenu>,
@@ -165,6 +190,23 @@ impl ChatApp {
             }
         };
 
+        let agent_pid = backend.as_ref().map(|backend| backend.agent_pid);
+        let storage = StateDir::resolve().ok();
+        let cwd = backend
+            .as_ref()
+            .map(|backend| backend.cwd.clone())
+            .unwrap_or_default();
+        let _instance = storage.as_ref().and_then(|storage| {
+            InstanceGuard::register(storage, InstanceKind::Desktop, &cwd, None).ok()
+        });
+        let themes = backend
+            .as_ref()
+            .map(|backend| backend.themes.names.clone())
+            .unwrap_or_default();
+        let theme = backend
+            .as_ref()
+            .and_then(|backend| backend.themes.current.as_ref())
+            .map(|theme| theme.name.clone());
         let status = Status {
             model: backend
                 .as_ref()
@@ -172,6 +214,13 @@ impl ChatApp {
                 .unwrap_or_default(),
             ..Status::default()
         };
+
+        if let Some(theme) = backend
+            .as_ref()
+            .and_then(|backend| backend.themes.current.clone())
+        {
+            apply_palette(&theme, cx);
+        }
 
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -209,6 +258,28 @@ impl ChatApp {
             }),
         ];
 
+        let instances_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(INSTANCES_REFRESH).await;
+                let Some(storage) = storage.clone() else {
+                    return;
+                };
+                let listed = cx
+                    .background_executor()
+                    .spawn(async move { instances::list(&storage) })
+                    .await;
+                if this
+                    .update(cx, |app, cx| {
+                        app.instances = listed;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
         let events_task = cx.spawn(async move |this, cx| {
             let Some(events) = events else {
                 return;
@@ -230,6 +301,12 @@ impl ChatApp {
             pick: None,
             status,
             commands: Vec::new(),
+            instances: Vec::new(),
+            agent_pid,
+            _instance,
+            _instances: instances_task,
+            themes,
+            theme,
             slash: None,
             slash_dismissed: false,
             arguments: None,
@@ -240,11 +317,18 @@ impl ChatApp {
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
         let text = self.input.read(cx).value().trim().to_owned();
         if text.is_empty() {
+            return;
+        }
+        if self.run_local_command(&text) {
+            self.input.update(cx, |state, cx| state.clean(window, cx));
+            self.slash = None;
+            self.arguments = None;
+            cx.notify();
+            return;
+        }
+        if self.busy {
             return;
         }
         let Some(backend) = &self.backend else {
@@ -268,6 +352,16 @@ impl ChatApp {
         self.pending = None;
         self.scroll.scroll_to_bottom();
         cx.notify();
+    }
+
+    /// Commands the desktop answers itself; the agent advertises no `/theme`.
+    fn run_local_command(&mut self, text: &str) -> bool {
+        match local_command(text) {
+            Some(LocalCommand::ThemePicker) => self.open_theme_picker(),
+            Some(LocalCommand::Theme(name)) => self.switch_theme(name),
+            None => return false,
+        }
+        true
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
@@ -311,6 +405,14 @@ impl ChatApp {
                 self.apply_arguments(text, items, cx);
                 return;
             }
+            Event::Theme(result) => match result {
+                Ok(palette) => {
+                    apply_palette(&palette, cx);
+                    self.theme = Some(palette.name.clone());
+                    self.notice(format!("Theme: {}", palette.name));
+                }
+                Err(error) => self.notice(format!("Theme failed: {error}")),
+            },
             Event::PromptDone(result) => {
                 self.busy = false;
                 self.pending = None;
@@ -343,7 +445,7 @@ impl ChatApp {
             return;
         };
         self.pick = Some(PendingPick {
-            request: prompt.id,
+            target: PickTarget::Agent(prompt.id),
             title: prompt.title,
             footer: prompt.footer,
             items: prompt.items,
@@ -366,15 +468,62 @@ impl ChatApp {
         let Some(pick) = self.pick.take() else {
             return;
         };
-        let outcome = match end {
-            PickEnd::Choose => PickOutcome::Choice(pick.active),
-            PickEnd::Delete => PickOutcome::Delete(pick.active),
-            PickEnd::Close => PickOutcome::Close,
-        };
-        if let Some(backend) = &self.backend {
-            backend.answer_pick(&pick.request, outcome);
+        match &pick.target {
+            PickTarget::Agent(request) => {
+                let outcome = match end {
+                    PickEnd::Choose => PickOutcome::Choice(pick.active),
+                    PickEnd::Delete => PickOutcome::Delete(pick.active),
+                    PickEnd::Close => PickOutcome::Close,
+                };
+                if let Some(backend) = &self.backend {
+                    backend.answer_pick(request, outcome);
+                }
+            }
+            PickTarget::Themes => {
+                if let (PickEnd::Choose, Some(name)) = (end, self.themes.get(pick.active)) {
+                    self.switch_theme(name.clone());
+                }
+            }
         }
         cx.notify();
+    }
+
+    fn open_theme_picker(&mut self) {
+        let items = self
+            .themes
+            .iter()
+            .map(|name| PickItem {
+                label: name.clone(),
+                detail: None,
+                section: None,
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            self.notice(THEMES_UNAVAILABLE.to_owned());
+            return;
+        }
+        let active = self
+            .theme
+            .as_ref()
+            .and_then(|theme| self.themes.iter().position(|name| name == theme))
+            .unwrap_or(0);
+        self.pick = Some(PendingPick {
+            target: PickTarget::Themes,
+            title: THEME_PICKER_TITLE.to_owned(),
+            footer: vec![(PICK_HINT.to_owned(), PICK_HINT_ACTION.to_owned())],
+            items,
+            active,
+        });
+    }
+
+    fn switch_theme(&mut self, name: String) {
+        let Some(backend) = &self.backend else {
+            self.notice(DISCONNECTED.to_owned());
+            return;
+        };
+        if let Err(error) = backend.set_theme(name) {
+            self.notice(error);
+        }
     }
 
     fn on_update(&mut self, update: SessionUpdate, cx: &mut Context<Self>) {
@@ -416,6 +565,14 @@ impl ChatApp {
             }
             SessionUpdate::AvailableCommandsUpdate(update) => {
                 self.commands = update.available_commands;
+                if !self
+                    .commands
+                    .iter()
+                    .any(|command| command.name == THEME_COMMAND)
+                {
+                    self.commands
+                        .push(AvailableCommand::new(THEME_COMMAND, THEME_DESCRIPTION));
+                }
                 self.refresh_slash(cx);
             }
             SessionUpdate::UsageUpdate(usage) => {
@@ -580,7 +737,7 @@ impl ChatApp {
             return;
         };
         let head = value[..slot.start].to_owned();
-        let insertion = argument_insertion(&item.insertion);
+        let insertion = argument_insertion(&item.insertion, slot.braced);
         self.input.update(cx, |state, cx| {
             state.set_value(head, window, cx);
             state.insert(insertion, window, cx);
@@ -705,17 +862,37 @@ impl ChatApp {
         true
     }
 
+    /// Other live makima processes: our pid and the agent we spawned are ours.
+    fn instance_rows(&self) -> Vec<(String, String, u32)> {
+        self.instances
+            .iter()
+            .filter(|instance| !instance.is_self() && Some(instance.pid) != self.agent_pid)
+            .map(|instance| {
+                (
+                    instance.kind.label().to_owned(),
+                    Path::new(&instance.cwd).file_name().map_or_else(
+                        || instance.cwd.clone(),
+                        |name| name.to_string_lossy().into_owned(),
+                    ),
+                    instance.pid,
+                )
+            })
+            .collect()
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let session_label = self
             .backend
             .as_ref()
             .map(|backend| format!("Session {}", backend.session))
             .unwrap_or_else(|| "No session".to_owned());
+        let instances = self.instance_rows();
         let location = self
             .backend
             .as_ref()
             .map(|backend| format!("{} · {}", backend.target, backend.cwd.display()))
             .unwrap_or_default();
+        let theme = self.theme.clone();
 
         Sidebar::new("sidebar")
             .w(px(240.))
@@ -753,12 +930,33 @@ impl ChatApp {
                         .active(true)]),
                 ),
             )
+            .when(!instances.is_empty(), |this| {
+                this.child(
+                    SidebarGroup::new("Instances").child(SidebarMenu::new().children(
+                        instances.into_iter().map(|(kind, folder, pid)| {
+                            SidebarMenuItem::new(format!("{kind} · {folder} · {pid}"))
+                        }),
+                    )),
+                )
+            })
             .footer(
                 SidebarFooter::new().child(
-                    h_flex()
-                        .gap_2()
-                        .child(IconName::Folder)
-                        .child(div().text_xs().overflow_hidden().child(location)),
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(IconName::Folder)
+                                .child(div().text_xs().overflow_hidden().child(location)),
+                        )
+                        .when_some(theme, |this, theme| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("Theme · {theme}")),
+                            )
+                        }),
                 ),
             )
     }
@@ -1005,6 +1203,7 @@ impl ChatApp {
                     }
                     meta.push_str(detail);
                 }
+                let (label, description) = row_colors(active, cx);
                 v_flex()
                     .id(("pick", row))
                     .w_full()
@@ -1012,14 +1211,9 @@ impl ChatApp {
                     .py_1()
                     .rounded(cx.theme().radius)
                     .when(active, |this| this.bg(cx.theme().accent))
-                    .child(div().text_sm().child(item.label.clone()))
+                    .child(div().text_sm().text_color(label).child(item.label.clone()))
                     .when(!meta.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(meta),
-                        )
+                        this.child(div().text_xs().text_color(description).child(meta))
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(pick) = &mut this.pick {
@@ -1083,6 +1277,7 @@ impl ChatApp {
             .map(|(row, index)| {
                 let command = &self.commands[*index];
                 let active = row == menu.active;
+                let (label, description) = row_colors(active, cx);
                 h_flex()
                     .id(("slash", row))
                     .w_full()
@@ -1095,6 +1290,7 @@ impl ChatApp {
                     .child(
                         div()
                             .text_sm()
+                            .text_color(label)
                             .child(format!("{SLASH_PREFIX}{}", command.name)),
                     )
                     .child(
@@ -1102,7 +1298,7 @@ impl ChatApp {
                             .flex_1()
                             .text_xs()
                             .overflow_hidden()
-                            .text_color(cx.theme().muted_foreground)
+                            .text_color(description)
                             .child(command.description.clone()),
                     )
                     .on_click(
@@ -1130,6 +1326,7 @@ impl ChatApp {
             .map(|(row, index)| {
                 let item = &menu.items[*index];
                 let active = row == menu.active;
+                let (label, detail) = row_colors(active, cx);
                 h_flex()
                     .id(("argument", row))
                     .w_full()
@@ -1139,14 +1336,14 @@ impl ChatApp {
                     .py_1()
                     .rounded(cx.theme().radius)
                     .when(active, |this| this.bg(cx.theme().accent))
-                    .child(div().text_sm().child(item.label.clone()))
+                    .child(div().text_sm().text_color(label).child(item.label.clone()))
                     .when_some(item.description.clone(), |this, description| {
                         this.child(
                             div()
                                 .flex_1()
                                 .text_xs()
                                 .overflow_hidden()
-                                .text_color(cx.theme().muted_foreground)
+                                .text_color(detail)
                                 .child(description),
                         )
                     })
@@ -1299,38 +1496,155 @@ fn slash_query(value: &str) -> Option<String> {
         .then(|| rest.to_lowercase())
 }
 
-/// The token being typed after the command name, and where it starts.
+#[derive(Debug, PartialEq, Eq)]
+enum LocalCommand {
+    ThemePicker,
+    Theme(String),
+}
+
+fn local_command(text: &str) -> Option<LocalCommand> {
+    let rest = text
+        .strip_prefix(SLASH_PREFIX)?
+        .strip_prefix(THEME_COMMAND)?;
+    Some(match rest.trim() {
+        "" => LocalCommand::ThemePicker,
+        name => LocalCommand::Theme(name.to_owned()),
+    })
+}
+
+/// The token being typed after the command name, where it starts, and whether
+/// it sits inside a `{..}` field list that a space does not close.
 struct ArgumentSlot {
     start: usize,
     query: String,
+    braced: bool,
 }
+
+const FIELD_OPEN: char = '{';
+const FIELD_CLOSE: char = '}';
+const FIELD_SEPARATOR: char = ',';
 
 fn argument_slot(value: &str) -> Option<ArgumentSlot> {
     let command_end = value.find(char::is_whitespace)?;
     if !value.starts_with(SLASH_PREFIX) {
         return None;
     }
+    let arguments = &value[command_end..];
+    if let Some(open) = arguments
+        .rfind(FIELD_OPEN)
+        .filter(|open| !arguments[*open..].contains(FIELD_CLOSE))
+    {
+        let inner = &arguments[open + 1..];
+        let field_start = inner
+            .rfind(FIELD_SEPARATOR)
+            .map_or(0, |separator| separator + 1);
+        let after_separator = &inner[field_start..];
+        let field = after_separator.trim_start();
+        return Some(ArgumentSlot {
+            start: command_end + open + 1 + field_start + after_separator.len() - field.len(),
+            query: field.to_lowercase(),
+            braced: true,
+        });
+    }
     if value.ends_with(char::is_whitespace) {
         return Some(ArgumentSlot {
             start: value.len(),
             query: String::new(),
+            braced: false,
         });
     }
-    let token = value[command_end..]
-        .trim_start()
-        .rsplit(char::is_whitespace)
-        .next()?;
+    let token = arguments.trim_start().rsplit(char::is_whitespace).next()?;
     Some(ArgumentSlot {
         start: value.len() - token.len(),
         query: token.to_lowercase(),
+        braced: false,
     })
 }
 
 /// A directory insertion leaves the token open so the next level lists, and
 /// everything else gets the separating space done.
-fn argument_insertion(insertion: &str) -> String {
+/// Paints the window with the CLI theme the agent reported: the roles it
+/// knows are applied, everything else keeps the desktop default.
+fn apply_palette(palette: &acp::ThemePalette, cx: &mut App) {
+    let mode = if palette.is_light() {
+        ThemeMode::Light
+    } else {
+        ThemeMode::Dark
+    };
+    Theme::change(mode, None, cx);
+    let colors = &mut Theme::global_mut(cx).colors;
+    let paint = |role: &str, slot: &mut Hsla| {
+        if let Some(color) = palette.rgb(role) {
+            *slot = hsla(color);
+        }
+    };
+    paint("background", &mut colors.background);
+    paint("foreground", &mut colors.foreground);
+    paint("foreground", &mut colors.popover_foreground);
+    paint("muted", &mut colors.muted_foreground);
+    paint("border", &mut colors.border);
+    paint("border", &mut colors.sidebar_border);
+    paint("input_border", &mut colors.input);
+    paint("selection", &mut colors.selection);
+    paint("selection", &mut colors.list_active);
+    if let Some(accent) = palette.rgb("accent") {
+        // The fills and their text move together, so buttons and rings stay
+        // readable on light accents too.
+        let fill = hsla(accent);
+        colors.accent = fill;
+        colors.primary = fill;
+        colors.ring = fill;
+        colors.caret = fill;
+        colors.accent_foreground = accent_text(fill);
+        colors.primary_foreground = accent_text(fill);
+    }
+    paint("tool_background", &mut colors.popover);
+    paint("tool_background", &mut colors.sidebar);
+    paint("tool_background", &mut colors.muted);
+    paint("tool", &mut colors.sidebar_foreground);
+    paint("selection", &mut colors.sidebar_accent);
+    paint("accent", &mut colors.sidebar_accent_foreground);
+    paint("user", &mut colors.sidebar_primary);
+    paint("error", &mut colors.danger);
+    paint("error", &mut colors.red);
+    paint("success", &mut colors.success);
+    paint("success", &mut colors.green);
+    paint("warning", &mut colors.warning);
+    paint("warning", &mut colors.yellow);
+}
+
+/// Label and description colors for a row, readable on its own background:
+/// the accent fill needs its own foreground, a plain row keeps the theme's.
+fn row_colors(active: bool, cx: &App) -> (Hsla, Hsla) {
+    if !active {
+        return (cx.theme().foreground, cx.theme().muted_foreground);
+    }
+    let label = accent_text(cx.theme().accent);
+    (label, label.opacity(ACTIVE_DESCRIPTION_ALPHA))
+}
+
+/// Accent fills are light in some themes and dark in others, so the text on
+/// them flips with the fill's lightness.
+fn accent_text(accent: Hsla) -> Hsla {
+    hsla(if accent.l > LIGHT_ACCENT {
+        ON_LIGHT_ACCENT
+    } else {
+        ON_DARK_ACCENT
+    })
+}
+
+fn hsla([red, green, blue]: [u8; 3]) -> Hsla {
+    Hsla::from(rgb(u32::from(red) << 16
+        | u32::from(green) << 8
+        | u32::from(blue)))
+}
+
+fn argument_insertion(insertion: &str, braced: bool) -> String {
     if insertion.ends_with(std::path::is_separator) {
         return insertion.to_owned();
+    }
+    if braced {
+        return format!("{},", quote_argument(insertion));
     }
     format!("{} ", quote_argument(insertion))
 }
@@ -1396,9 +1710,11 @@ impl Render for ChatApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgumentMenu, SLASH_PREFIX, argument_insertion, argument_slot, quote_argument, slash_query,
+        ArgumentMenu, FIELD_CLOSE, LocalCommand, SLASH_PREFIX, accent_text, argument_insertion,
+        argument_slot, local_command, quote_argument, slash_query,
     };
     use crate::acp::ArgItem;
+    use gpui_kit::{Hsla, rgb};
     use test_case::test_case;
 
     #[test]
@@ -1420,17 +1736,46 @@ mod tests {
         );
     }
 
+    #[test_case("/theme", Some(LocalCommand::ThemePicker) ; "bare theme opens the picker")]
+    #[test_case("/theme dracula", Some(LocalCommand::Theme("dracula".to_owned())) ; "named theme")]
+    #[test_case("/theme  dracula ", Some(LocalCommand::Theme("dracula".to_owned())) ; "trimmed")]
+    #[test_case("/themeology", Some(LocalCommand::Theme("ology".to_owned())) ; "prefix match keeps the word")]
+    #[test_case("/theming", None ; "other command")]
+    #[test_case("hello", None ; "plain text")]
+    fn local_command_recognizes_theme(text: &str, expected: Option<LocalCommand>) {
+        assert_eq!(local_command(text), expected);
+    }
+
+    #[test_case("/model {anthropic/opus", (8, "anthropic/opus") ; "first field")]
+    #[test_case("/model {anthropic/opus,thin", (23, "thin") ; "next field")]
+    #[test_case("/model {a/b, thinking=h", (13, "thinking=h") ; "field after a space")]
+    #[test_case("/model {a/b} ", (13, "") ; "closed field list is an argument")]
+    fn argument_slot_opens_field_lists(value: &str, expected: (usize, &str)) {
+        let slot = argument_slot(value).unwrap();
+        assert_eq!((slot.start, slot.query.as_str()), expected);
+        assert_eq!(slot.braced, !value.contains(FIELD_CLOSE));
+    }
+
     #[test_case("all", "all" ; "single word")]
     #[test_case("import mcp", "\"import mcp\"" ; "quoted when it has a space")]
     fn quote_argument_wraps_only_spaced_values(insertion: &str, expected: &str) {
         assert_eq!(quote_argument(insertion), expected);
     }
 
-    #[test_case("all", "all " ; "command argument closes with a space")]
-    #[test_case("import mcp", "\"import mcp\" " ; "spaced value is quoted")]
-    #[test_case("src/", "src/" ; "directory stays open for the next level")]
-    fn argument_insertion_closes_or_keeps_the_token(insertion: &str, expected: &str) {
-        assert_eq!(argument_insertion(insertion), expected);
+    #[test_case("all", false, "all " ; "command argument closes with a space")]
+    #[test_case("import mcp", false, "\"import mcp\" " ; "spaced value is quoted")]
+    #[test_case("src/", false, "src/" ; "directory stays open for the next level")]
+    #[test_case("thinking=high", true, "thinking=high," ; "field list opens the next field")]
+    fn argument_insertion_closes_or_keeps_the_token(insertion: &str, braced: bool, expected: &str) {
+        assert_eq!(argument_insertion(insertion, braced), expected);
+    }
+
+    #[test_case(0xe8dcc8, true ; "beige fill takes dark text")]
+    #[test_case(0xc0e8e0, true ; "pale teal fill takes dark text")]
+    #[test_case(0x203040, false ; "dark fill takes light text")]
+    fn accent_text_flips_with_the_fill_lightness(fill: u32, dark_text: bool) {
+        let text = accent_text(Hsla::from(rgb(fill)));
+        assert_eq!(text.l < 0.2, dark_text);
     }
 
     #[test]

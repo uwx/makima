@@ -13,6 +13,34 @@ use maki_storage::StateDir;
 
 use crate::setup;
 
+/// The CLI theme store: the desktop switches themes through it, so the TUI and
+/// the next run agree.
+struct UiThemes;
+
+impl maki_acp::ThemeSource for UiThemes {
+    fn names(&self) -> Vec<String> {
+        maki_ui::theme_names()
+    }
+
+    fn current(&self) -> maki_acp::AcpTheme {
+        palette()
+    }
+
+    fn install(&self, name: &str) -> Result<maki_acp::AcpTheme, String> {
+        maki_ui::select_theme(name)?;
+        Ok(palette())
+    }
+}
+
+fn palette() -> maki_acp::AcpTheme {
+    let (name, colors) = maki_ui::theme_palette();
+    colors
+        .into_iter()
+        .fold(maki_acp::AcpTheme::new(name), |theme, (role, rgb)| {
+            theme.with_color(role, rgb)
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     cwd: PathBuf,
@@ -27,6 +55,15 @@ pub fn run(
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
+    let _instance = maki_storage::instances::InstanceGuard::register(
+        &storage,
+        maki_storage::instances::InstanceKind::Acp,
+        &cwd,
+        None,
+    );
+    if let Err(error) = &_instance {
+        eprintln!("warning: cannot record this instance: {error}");
+    }
 
     let trust = project::resolve(&storage, &cwd, trust_mode);
     load_env_files(&trust.project_config);
@@ -63,12 +100,16 @@ pub fn run(
     super::seed_automode(&mut config, automode_on);
     config.validate()?;
 
+    let timeouts = maki_providers::Timeouts::from(&config.provider);
     let catalog = maki_lua::orchestration::ModelCatalog::offline(&config.provider.model_policy);
     let standard_commands = command::StandardCommands::register(
         &command_registry,
         &command::discover_commands(&cwd, &trust.project_config),
         command::StandardCompletions {
-            model: Some(Arc::new(command::ModelSpecSource::new(catalog.specs()))),
+            model: Some(Arc::new(maki_acp::completion::ModelArgSource::new(
+                catalog.specs(),
+                timeouts,
+            ))),
             theme: None,
         },
     )
@@ -77,8 +118,6 @@ pub fn run(
     plugin_host
         .load_builtins(&config.plugins)
         .context("load builtin plugins")?;
-
-    let timeouts = maki_providers::Timeouts::from(&config.provider);
 
     let model = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
 
@@ -112,6 +151,7 @@ pub fn run(
         trust_mode,
         trust_policy: Arc::new(config.trust),
         ui,
+        themes: Some(Arc::new(UiThemes)),
     });
     drop(standard_commands);
     result
