@@ -43,6 +43,8 @@ use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{
     MAX_SERVER_NAME_LEN, PermissionsConfig, ProjectConfig, SessionDefaults, TrustConfig,
 };
+use maki_lan::discovery::Advertisement;
+use maki_lan::{link, reachable, token as lan_token};
 use maki_lua::orchestration::{AgentOrchestration, ModelCatalog, TrustedTarget};
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
@@ -331,14 +333,16 @@ struct Share {
     bound: SocketAddr,
     token: Arc<str>,
     stop: Sender<()>,
+    /// Withdraws the announcement when the listener stops.
+    _announcement: Option<Advertisement>,
 }
 
 impl Share {
     fn reply(&self) -> Value {
         json!({
             "bind": self.bound.to_string(),
-            "address": share::reachable(self.bound).to_string(),
-            "link": share::link(self.bound),
+            "address": reachable(self.bound).to_string(),
+            "link": link(self.bound),
             "token": &*self.token,
         })
     }
@@ -427,7 +431,9 @@ pub async fn serve_tcp(
     token: String,
 ) -> color_eyre::Result<()> {
     let listener = TcpListener::bind(listen).await?;
-    info!(address = %listener.local_addr()?, "ACP listening over TCP");
+    let bound = listener.local_addr()?;
+    info!(address = %bound, "ACP listening over TCP");
+    let _announcement = Advertisement::start(bound, &params.initial_wd);
     // One thread serves every connection, so attaching costs no thread and
     // `AcpParams` need not be `Sync`. Nothing ever stops this listener, so its
     // stop signal is held for as long as the process lives.
@@ -454,7 +460,9 @@ pub async fn serve_shared(
     token: String,
 ) -> color_eyre::Result<()> {
     let listener = TcpListener::bind(listen).await?;
-    info!(address = %listener.local_addr()?, "ACP sharing this session over TCP");
+    let bound = listener.local_addr()?;
+    info!(address = %bound, "ACP sharing this session over TCP");
+    let _announcement = Advertisement::start(bound, &params.initial_wd);
     let params = Rc::new(params);
     let taps: Arc<Taps> = Arc::default();
     let token: Arc<str> = Arc::from(token);
@@ -886,7 +894,7 @@ async fn open_share(srv: &mut Server, raw: &Value, host: &mut Host) -> Result<Va
             format!("read the address to share: {error}"),
         )
     })?;
-    let token: Arc<str> = share::token(host.params.storage.path())
+    let token: Arc<str> = lan_token(host.params.storage.path())
         .map_err(|error| {
             AcpError::new(
                 share::SHARE_FAILED_CODE,
@@ -921,9 +929,10 @@ async fn open_share(srv: &mut Server, raw: &Value, host: &mut Host) -> Result<Va
         bound,
         token,
         stop,
+        _announcement: Advertisement::start(bound, &host.params.initial_wd),
     };
     let reply = share.reply();
-    info!(address = %bound, link = %share::link(bound), "ACP session shared");
+    info!(address = %bound, link = %link(bound), "ACP session shared");
     host.share = Some(share);
     Ok(reply)
 }
@@ -8683,7 +8692,7 @@ mod tests {
 
             let first = open_share(&mut srv, &ask, &mut host).await.unwrap();
             let link = first["link"].as_str().unwrap().to_owned();
-            assert!(link.starts_with(share::LINK_SCHEME), "{link}");
+            assert!(link.starts_with(maki_lan::LINK_SCHEME), "{link}");
             assert_eq!(first["token"].as_str().unwrap().len(), 32);
             assert_eq!(
                 maki_storage::lan::token(state.path()).unwrap(),

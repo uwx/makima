@@ -20,6 +20,7 @@ path = "src/main.rs"
 maki-ui = { workspace = true }
 maki-agent = { workspace = true }
 maki-acp = { workspace = true }
+maki-lan = { workspace = true }
 maki-config = { workspace = true }
 maki-commands = { workspace = true }
 maki-providers = { workspace = true }
@@ -63,6 +64,7 @@ members = [
   "maki-docgen",
   "maki-highlight",
   "maki-interpreter",
+  "maki-lan",
   "maki-lua",
   "maki-markdown",
   "maki-match",
@@ -92,6 +94,7 @@ maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
 maki-storage = { path = "maki-storage" }
 maki-ui = { path = "maki-ui" }
+maki-lan = { path = "maki-lan" }
 maki-lua = { path = "maki-lua" }
 maki-config-macro = { path = "maki-config-macro" }
 maki-lua-macro = { path = "maki-lua-macro" }
@@ -152,6 +155,7 @@ arc-swap = "1"
 bitflags = "2"
 async-io = "2"
 event-listener = "5"
+mdns-sd = "0.21"
 futures-lite = "2"
 futures = "0.3"
 isahc = { version = "1.7", default-features = false, features = ["text-decoding", "static-curl", "static-ssl"] }

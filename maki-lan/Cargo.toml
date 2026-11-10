@@ -1,0 +1,18 @@
+[package]
+name = "maki-lan"
+description = "The LAN link, token and discovery an agent shares and a client follows"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mdns-sd = { workspace = true }
+maki-storage = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }
+tempfile = { workspace = true }

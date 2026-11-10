@@ -195,5 +195,5 @@ pub fn run(
 /// The token a TCP client must present: `--token`, then `MAKIMA_LAN_TOKEN`,
 /// then the one stored for this machine, generated on first use.
 fn lan_token(storage: &StateDir) -> Result<String> {
-    maki_acp::share::token(storage.path()).context("read the LAN token")
+    maki_lan::token(storage.path()).context("read the LAN token")
 }

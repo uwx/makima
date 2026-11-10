@@ -2795,7 +2795,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.20",
- "windows 0.58.0",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -4000,6 +4000,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "ignore"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4903,6 +4913,7 @@ dependencies = [
  "maki-agent",
  "maki-commands",
  "maki-config",
+ "maki-lan",
  "maki-lua",
  "maki-providers",
  "maki-storage",
@@ -4933,9 +4944,11 @@ dependencies = [
  "maki-agent",
  "maki-commands",
  "maki-config",
+ "maki-lan",
  "maki-lua",
  "maki-providers",
  "maki-storage",
+ "mdns-sd",
  "serde",
  "serde_json",
  "smol",
@@ -5097,6 +5110,17 @@ dependencies = [
  "serde_json",
  "test-case",
  "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "maki-lan"
+version = "0.5.5-makima"
+dependencies = [
+ "maki-storage",
+ "mdns-sd",
+ "tempfile",
+ "test-case",
  "tracing",
 ]
 
@@ -5433,6 +5457,21 @@ checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if",
  "digest 0.10.7",
+]
+
+[[package]]
+name = "mdns-sd"
+version = "0.21.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6743ed743ff2bada2b8651ef298d3f98addb0b74844f19cdd57137d8bd0219e"
+dependencies = [
+ "fastrand",
+ "flume 0.12.0",
+ "if-addrs",
+ "log",
+ "mio",
+ "socket-pktinfo",
+ "socket2",
 ]
 
 [[package]]
@@ -8689,6 +8728,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eeb7109d23f319619d4cc0de5464613c8b7b1a09db2774a58101459cf6be2f10"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "socket-pktinfo"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "612942246d0cc239cfd83af1dfd39be47f649208a3524e5e9da651910128e0ac"
+dependencies = [
+ "libc",
+ "socket2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

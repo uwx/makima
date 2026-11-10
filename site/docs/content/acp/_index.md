@@ -85,6 +85,21 @@ Only the connection that owns the session can share it: a watching connection ge
 
 The desktop window has the same thing as a status bar toggle. `Share` opens the listener and shows the address with buttons for the link and the token, `Stop sharing` closes it. Another window reaches it with `MAKI_DESKTOP_REMOTE=lan://192.168.2.4:60667` and `MAKI_DESKTOP_LAN_TOKEN=...`. The link names no directory: that window watches the session the other machine serves instead of starting one.
 
+### Finding a session on the local network
+
+While a listener is open, the agent announces it over mDNS as `_maki._tcp`, so a client on the same network finds it without being told an address:
+
+```
+makima on LITTLESCREAMER._maki._tcp.local.
+  project=makima
+  version=1
+  192.168.2.4:47445
+```
+
+The name is the project directory and the machine, and `project` repeats the directory for clients that show a list. The token is never announced: reaching the session still needs it, so discovery only replaces typing the address.
+
+The announcement follows the listener. It appears when `--listen`, `--share` or `maki/share` opens one and is withdrawn when it closes. A listener bound to loopback is not announced, because no other machine can reach it.
+
 ### Watching a session
 
 While a connection owns a session, other connections can watch it read only. `maki/live` lists what this process serves:
