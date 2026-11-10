@@ -102,6 +102,17 @@ def build_library(target: str, ndk: Path, debug: bool) -> Path:
     return library
 
 
+def stage(ndk: Path, library: Path, abi: str, debug: bool) -> Path:
+    """A copy the APK gets, stripped of symbols unless this is a debug build."""
+    out = ROOT / "target" / "android" / "lib" / abi / library.name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(library, out)
+    if not debug:
+        strip = ndk / "toolchains" / "llvm" / "prebuilt" / "windows-x86_64" / "bin" / "llvm-strip.exe"
+        run([strip, "--strip-unneeded", out])
+    return out
+
+
 def manifest(debug: bool) -> Path:
     """The debug build is debuggable so `run-as` can write the attach file."""
     if not debug:
@@ -146,7 +157,7 @@ def assemble(sdk: Path, abis: dict[str, Path], debug: bool) -> Path:
     return unsigned
 
 
-def sign(sdk: Path, unsigned: Path, debug: bool) -> Path:
+def sign(sdk: Path, unsigned: Path, debug: bool, abis: list[str]) -> Path:
     keystore = Path.home() / ".android" / "debug.keystore"
     keystore.parent.mkdir(parents=True, exist_ok=True)
     if not keystore.exists():
@@ -172,9 +183,10 @@ def sign(sdk: Path, unsigned: Path, debug: bool) -> Path:
                 "CN=Android Debug,O=Android,C=US",
             ]
         )
-    aligned = unsigned.with_name(unsigned.stem.replace("-unsigned", "") + "-aligned.apk")
+    stem = "makima" + ("-debug" if debug else "") + "-" + "-".join(abis)
+    aligned = unsigned.with_name(f"{stem}-aligned.apk")
     run([sdk_tool(sdk, "zipalign"), "-f", "-p", "4", unsigned, aligned])
-    signed = unsigned.with_name(unsigned.stem.replace("-unsigned", "") + ("-debug" if debug else "") + ".apk")
+    signed = unsigned.with_name(f"{stem}.apk")
     env = dict(os.environ)
     env["JAVA_HOME"] = str(java().parent.parent)
     env["PATH"] = str(java().parent) + os.pathsep + env.get("PATH", "")
@@ -216,12 +228,12 @@ def main() -> int:
     ndk = ndk_root(sdk)
     abis = args.abi or (["arm64-v8a"] if args.debug else list(ABIS))
     libraries = {
-        abi: build_library(ABIS[abi], ndk, args.debug)
+        abi: stage(ndk, build_library(ABIS[abi], ndk, args.debug), abi, args.debug)
         for abi in abis
     }
     unsigned = assemble(sdk, libraries, args.debug)
-    apk = sign(sdk, unsigned, args.debug)
-    print(f"apk: {apk}")
+    apk = sign(sdk, unsigned, args.debug, abis)
+    print(f"apk: {apk} ({apk.stat().st_size // (1024 * 1024)} MB)")
     if args.install:
         install(apk)
     return 0

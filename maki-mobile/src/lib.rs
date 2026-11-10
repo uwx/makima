@@ -31,8 +31,11 @@ mod app {
     const TITLE: &str = "makima";
     const SUBTITLE: &str = "A coding agent, in your pocket";
 
-    /// What a phone with no session configured shows.
-    struct Welcome;
+    /// What a phone with no session configured shows, and where to put the
+    /// file that configures one.
+    struct Welcome {
+        hint: Option<String>,
+    }
 
     impl Render for Welcome {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
@@ -43,18 +46,31 @@ mod app {
                 .items_center()
                 .justify_center()
                 .gap_2()
+                .px_6()
                 .bg(rgb(BACKGROUND))
                 .child(div().text_2xl().text_color(rgb(FOREGROUND)).child(TITLE))
                 .child(div().text_sm().text_color(rgb(MUTED)).child(SUBTITLE))
+                .children(self.hint.clone().map(|hint| {
+                    div()
+                        .mt_6()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(gpui::SharedString::from(hint))
+                }))
         }
     }
 
-    pub fn open_main_window(cx: &mut App, files: Option<PathBuf>) {
+    pub fn open_main_window(cx: &mut App, dirs: &[PathBuf]) {
         gpui_kit::init(cx);
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
-        let content: AnyView = match files.as_deref().and_then(Attach::read) {
+        let content: AnyView = match dirs.iter().find_map(|dir| Attach::read(dir)) {
             Some(attach) => Session::open(cx, attach).into(),
-            None => cx.new(|_| Welcome).into(),
+            None => {
+                let hint = dirs
+                    .first()
+                    .map(|dir| format!("put attach.json in {}", dir.display()));
+                cx.new(|_| Welcome { hint }).into()
+            }
         };
         let window = cx.open_window(
             WindowOptions {
@@ -79,14 +95,17 @@ mod app {
         );
         gpui_mobile::android::jni::install_panic_hook();
         let _platform = gpui_mobile::android::jni::init_platform(&app);
-        let files = app.internal_data_path();
+        let dirs: Vec<PathBuf> = [app.internal_data_path(), app.external_data_path()]
+            .into_iter()
+            .flatten()
+            .collect();
         let Some(shared) = gpui_mobile::android::jni::shared_platform() else {
             log::error!("the Android platform did not come up");
             return;
         };
         // Blocks for the life of the activity, so the platform and the app
         // context it hands out stay alive on this stack frame.
-        Application::with_platform(shared.into_rc()).run(move |cx| open_main_window(cx, files));
+        Application::with_platform(shared.into_rc()).run(move |cx| open_main_window(cx, &dirs));
     }
 }
 
