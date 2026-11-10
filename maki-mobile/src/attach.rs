@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 const ATTACH_FILE: &str = "attach.json";
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Attach {
     pub link: String,
     pub token: String,
