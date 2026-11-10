@@ -75,6 +75,7 @@ members = [
   "maki-config-macro",
   "maki-lua-macro",
   "maki-ui",
+  "maki-chat",
   "maki-mobile",
 ]
 # Forked from longbridge/gpui-mobile: upstream pins its own gpui-pre snapshot,
@@ -101,6 +102,7 @@ maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
 maki-storage = { path = "maki-storage" }
 maki-ui = { path = "maki-ui" }
+maki-chat = { path = "maki-chat" }
 maki-lan = { path = "maki-lan" }
 maki-lua = { path = "maki-lua" }
 maki-config-macro = { path = "maki-config-macro" }

@@ -4,7 +4,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
-mod backend;
 
 use gpui_kit::assets::Assets;
 use gpui_kit::*;

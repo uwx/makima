@@ -5179,6 +5179,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "maki-chat"
+version = "0.5.5-makima"
+dependencies = [
+ "agent-client-protocol-schema",
+ "flume 0.11.1",
+ "gpui-kit",
+ "jiff",
+ "maki-acp-client",
+ "maki-lan",
+ "serde_json",
+ "test-case",
+]
+
+[[package]]
 name = "maki-commands"
 version = "0.5.5-makima"
 dependencies = [
@@ -5226,10 +5240,10 @@ dependencies = [
  "gpui-kit",
  "jiff",
  "maki-acp-client",
+ "maki-chat",
  "maki-lan",
  "maki-storage",
  "serde_json",
- "test-case",
 ]
 
 [[package]]
@@ -5426,6 +5440,7 @@ dependencies = [
  "gpui-pre-mobile",
  "log",
  "maki-acp-client",
+ "maki-chat",
  "serde",
  "serde_json",
 ]

@@ -22,6 +22,7 @@ gpui = { workspace = true }
 gpui-kit = { workspace = true }
 gpui-mobile = { workspace = true }
 maki-acp-client = { workspace = true }
+maki-chat = { workspace = true }
 serde = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]

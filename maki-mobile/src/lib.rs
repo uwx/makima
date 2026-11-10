@@ -12,7 +12,6 @@ mod session;
 const BACKGROUND: u32 = 0x101014;
 const FOREGROUND: u32 = 0xf0f0f5;
 const MUTED: u32 = 0x9090a0;
-const NOTICE: u32 = 0x2a2a33;
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
 mod app {
@@ -24,7 +23,7 @@ mod app {
     };
 
     use super::attach::Attach;
-    use super::session::Session;
+    use super::session::Phone;
     use super::{BACKGROUND, FOREGROUND, MUTED};
 
     const TAG: &str = "makima-mobile";
@@ -63,21 +62,22 @@ mod app {
     pub fn open_main_window(cx: &mut App, dirs: &[PathBuf]) {
         gpui_kit::init(cx);
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
-        let content: AnyView = match dirs.iter().find_map(|dir| Attach::read(dir)) {
-            Some(attach) => Session::open(cx, attach).into(),
-            None => {
-                let hint = dirs
-                    .first()
-                    .map(|dir| format!("put attach.json in {}", dir.display()));
-                cx.new(|_| Welcome { hint }).into()
-            }
-        };
+        let attach = dirs.iter().find_map(|dir| Attach::read(dir));
+        let hint = dirs
+            .first()
+            .map(|dir| format!("put attach.json in {}", dir.display()));
         let window = cx.open_window(
             WindowOptions {
                 window_bounds: None,
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| gpui_kit::component::Root::new(content, window, cx)),
+            |window, cx| {
+                let content: AnyView = match attach {
+                    Some(attach) => cx.new(|cx| Phone::new(window, cx, attach)).into(),
+                    None => cx.new(|_| Welcome { hint }).into(),
+                };
+                cx.new(|cx| gpui_kit::component::Root::new(content, window, cx))
+            },
         );
         if let Err(error) = window {
             log::error!("could not open the window: {error:#}");
