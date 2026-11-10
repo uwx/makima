@@ -1,3 +1,4 @@
+pub mod attach;
 pub mod completion;
 pub mod elicitation;
 pub mod methods;

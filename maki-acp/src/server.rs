@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,6 +58,7 @@ use smol::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use smol::net::TcpListener;
 use tracing::{debug, info, warn};
 
+use crate::attach::{self, SessionTap, Taps};
 use crate::ui::{COMPLETE_METHOD, REWOUND_METHOD, UI_CAPABILITY_PATH, UiBridge};
 use crate::{AcpParams, THEME_METHOD, ThemeParams, methods, permissions, translate};
 
@@ -72,6 +74,16 @@ const ROOT_CONFIG_UNAVAILABLE: &str = "session root configuration is unavailable
 const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const COMMAND_PREFIX: char = '/';
 const SESSIONS_METHOD: &str = "maki/sessions";
+/// Session-scoped methods a watching connection cannot call. Everything
+/// else, including `initialize`, themes and completion, stays available.
+const WRITE_METHODS: [&str; 6] = [
+    "session/prompt",
+    "session/new",
+    "session/load",
+    "session/set_mode",
+    "session/set_config_option",
+    REWIND_METHOD,
+];
 /// Client to server: list the user turns a rewind can return to, or rewind to
 /// the one whose `offset` is in the params.
 const REWIND_METHOD: &str = "maki/rewind";
@@ -242,6 +254,9 @@ struct SessionState {
     event_pump: EventPump,
     option_projection: Option<Arc<OptionProjection>>,
     option_projection_task: smol::Task<()>,
+    /// Plugin UI actions belong to the connection that owns the session, so
+    /// this starts with the session and stops with it.
+    ui_forward: smol::Task<()>,
     lock: Option<session_lock::LockHeartbeat>,
 }
 
@@ -271,6 +286,13 @@ struct InstallSession<'a> {
 
 struct Server {
     out_tx: Sender<Value>,
+    /// This connection's writer. Watched sessions replay into it directly, so
+    /// their updates are not recorded again.
+    wire: Sender<Value>,
+    /// The live sessions this process serves, for `maki/attach`.
+    taps: Arc<Taps>,
+    /// Set while this connection only watches a session.
+    attached: Option<Arc<SessionTap>>,
     catalog: ModelCatalog,
     session: Option<SessionState>,
     /// Whether the client advertised form elicitation support at `initialize`.
@@ -320,7 +342,8 @@ const BAD_HANDSHAKE: &str = "invalid handshake";
 pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let input = smol::io::BufReader::new(smol::Unblock::new(std::io::stdin()));
     let output = smol::Unblock::new(std::io::stdout());
-    serve_connection(&params, input, output).await
+    let taps = Arc::new(Taps::default());
+    serve_connection(&params, &taps, input, output).await
 }
 
 /// ACP over TCP, one connection at a time. Each connection owns its session,
@@ -334,27 +357,43 @@ pub async fn serve_tcp(
     let listener = TcpListener::bind(listen).await?;
     info!(address = %listener.local_addr()?, "ACP listening over TCP");
     let token: Arc<str> = Arc::from(token);
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let (read_half, write_half) = smol::io::split(stream);
-        let mut reader = smol::io::BufReader::new(read_half);
-        let mut writer = write_half;
-        match handshake(&mut reader, &mut writer, &token).await {
-            Ok(true) => {}
-            Ok(false) => {
-                warn!(%peer, "ACP client rejected: wrong or missing LAN token");
-                continue;
+    let params = Rc::new(params);
+    let taps: Arc<Taps> = Arc::default();
+    // One thread serves every connection, so attaching costs no thread and
+    // `AcpParams` need not be `Sync`.
+    let executor = smol::LocalExecutor::new();
+    executor
+        .run(async {
+            loop {
+                let (stream, peer) = listener.accept().await?;
+                let params = Rc::clone(&params);
+                let taps = Arc::clone(&taps);
+                let token = Arc::clone(&token);
+                executor
+                    .spawn(async move {
+                        let (read_half, write_half) = smol::io::split(stream);
+                        let mut reader = smol::io::BufReader::new(read_half);
+                        let mut writer = write_half;
+                        match handshake(&mut reader, &mut writer, &token).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(%peer, "ACP client rejected: wrong or missing LAN token");
+                                return;
+                            }
+                            Err(error) => {
+                                debug!(%peer, %error, "ACP handshake failed");
+                                return;
+                            }
+                        }
+                        info!(%peer, "ACP client connected");
+                        if let Err(error) = serve_connection(&params, &taps, reader, writer).await {
+                            warn!(%peer, %error, "ACP connection failed");
+                        }
+                    })
+                    .detach();
             }
-            Err(error) => {
-                debug!(%peer, %error, "ACP handshake failed");
-                continue;
-            }
-        }
-        info!(%peer, "ACP client connected");
-        if let Err(error) = serve_connection(&params, reader, writer).await {
-            warn!(%peer, %error, "ACP connection failed");
-        }
-    }
+        })
+        .await
 }
 
 /// Checks the opening line of a TCP connection against {token}, answering
@@ -411,14 +450,16 @@ fn token_matches(given: &str, expected: &str) -> bool {
 /// TCP, which differ only in the streams and in the handshake before them.
 async fn serve_connection(
     params: &AcpParams,
+    taps: &Arc<Taps>,
     input: impl AsyncBufRead + Unpin + Send + 'static,
     output: impl AsyncWrite + Unpin + Send + 'static,
 ) -> color_eyre::Result<()> {
     let (out_tx, out_rx) = flume::unbounded::<Value>();
+    let (wire, wire_rx) = flume::unbounded::<Value>();
 
     let writer_task = smol::spawn(async move {
         let mut output = output;
-        while let Ok(msg) = out_rx.recv_async().await {
+        while let Ok(msg) = wire_rx.recv_async().await {
             let Ok(mut bytes) = serde_json::to_vec(&msg) else {
                 continue;
             };
@@ -429,18 +470,25 @@ async fn serve_connection(
         }
     });
 
-    let ui_forward = smol::spawn({
-        let out_tx = out_tx.clone();
-        let events = params.ui.events.clone();
+    // Records what the session emits for watchers before writing it out.
+    let forward_task = smol::spawn({
+        let taps = Arc::clone(taps);
+        let wire = wire.clone();
         async move {
-            while let Ok(message) = events.recv_async().await {
-                let _ = out_tx.send(message);
+            while let Ok(msg) = out_rx.recv_async().await {
+                taps.observe(&msg);
+                if wire.send(msg).is_err() {
+                    return;
+                }
             }
         }
     });
 
     let mut server = Server {
         out_tx,
+        wire,
+        taps: Arc::clone(taps),
+        attached: None,
         catalog: params.catalog.clone(),
         session: None,
         elicitation: false,
@@ -491,10 +539,11 @@ async fn serve_connection(
         finish_in_flight(session).await;
     }
     close_session(&mut server).await;
+    if let Some(tap) = server.attached.take() {
+        tap.detach(&server.wire);
+    }
     drop(server);
-    // The forwarder holds an out_tx clone, so the writer would wait for a
-    // channel that never closes; stop it so the last writes can drain.
-    ui_forward.cancel().await;
+    forward_task.await;
     writer_task.await;
 
     Ok(())
@@ -545,6 +594,31 @@ fn request_id(v: &Value) -> RequestId {
     serde_json::from_value(v.clone()).unwrap_or(RequestId::Null)
 }
 
+/// Watches the session named in the request: its recorded updates go to this
+/// connection, then live ones follow. The connection keeps no session of its
+/// own, which is what makes every session-scoped write fail.
+fn attach_session(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
+    let id = raw
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(AcpError::invalid_params)?;
+    let tap = srv
+        .taps
+        .get(id)
+        .ok_or_else(|| AcpError::resource_not_found(Some(format!("session/{id}"))))?;
+    if let Some(previous) = srv.attached.take() {
+        previous.detach(&srv.wire);
+    }
+    let (replayed, truncated) = tap.subscribe(srv.wire.clone());
+    srv.attached = Some(tap);
+    Ok(json!({
+        "sessionId": id,
+        "readOnly": true,
+        "replayed": replayed,
+        "truncated": truncated,
+    }))
+}
+
 async fn handle_request(
     srv: &mut Server,
     method: &str,
@@ -552,6 +626,16 @@ async fn handle_request(
     raw: &Value,
     params: &AcpParams,
 ) {
+    if srv.attached.is_some() && WRITE_METHODS.contains(&method) {
+        srv.respond(
+            id,
+            Err(AcpError::new(
+                attach::READ_ONLY_CODE,
+                attach::READ_ONLY_MESSAGE,
+            )),
+        );
+        return;
+    }
     let result = match method {
         "initialize" => {
             srv.supports_boolean = supports_boolean_config(raw);
@@ -570,6 +654,16 @@ async fn handle_request(
         }
         "session/new" => new_session(srv, raw, params).await,
         "session/load" => load_session(srv, raw, params).await,
+        attach::ATTACH_METHOD => {
+            let result = attach_session(srv, raw);
+            send(&srv.out_tx, Response::new(id, result));
+            return;
+        }
+        attach::LIVE_METHOD => {
+            let result = json!({ "sessions": srv.taps.live() });
+            send(&srv.out_tx, Response::new(id, Ok::<Value, AcpError>(result)));
+            return;
+        }
         "session/prompt" => match start_prompt(srv, raw, &id) {
             Ok(()) => return,
             Err(e) => Err(e),
@@ -680,6 +774,9 @@ async fn new_session(
     params: &AcpParams,
 ) -> Result<AgentResponse, AcpError> {
     let req: NewSessionRequest = parse_params(raw)?;
+    if srv.session.is_none() && srv.taps.owner().is_some() {
+        return Err(AcpError::new(attach::BUSY_CODE, attach::BUSY_MESSAGE));
+    }
     let cwd = req.cwd.clone();
     let project_config = trusted_project_config(
         &req.cwd,
@@ -713,6 +810,11 @@ async fn new_session(
         },
     );
     let session_id = handle.session_id.to_string();
+    if !srv.taps.claim(&session_id) {
+        rollback_install(handle, mcp, None).await;
+        return Err(AcpError::new(attach::BUSY_CODE, attach::BUSY_MESSAGE));
+    }
+    srv.taps.ensure(&session_id);
     let spec = params.model.spec();
     let persisted_options = Default::default();
     let snapshot = install_session(
@@ -730,7 +832,11 @@ async fn new_session(
         },
     )
     .await
-    .map_err(session_registration_error)?;
+    .map_err(|error| {
+        srv.taps.remove(&session_id);
+        srv.taps.release(&session_id);
+        session_registration_error(error)
+    })?;
     let mode = committed_mode(srv).await?;
     let resp =
         methods::new_session_response(&session_id, &mode, &srv.lua_event_handle.mode_registry())
@@ -747,6 +853,9 @@ async fn load_session(
     params: &AcpParams,
 ) -> Result<AgentResponse, AcpError> {
     let req: LoadSessionRequest = parse_params(raw)?;
+    if srv.session.is_none() && srv.taps.owner().is_some() {
+        return Err(AcpError::new(attach::BUSY_CODE, attach::BUSY_MESSAGE));
+    }
     let session_ref: SessionRef = req
         .session_id
         .0
@@ -770,6 +879,10 @@ async fn load_session(
     )
     .await;
     let sid = SessionId::from(session_ref.to_string());
+    if !srv.taps.claim(&sid.0) {
+        return Err(AcpError::new(attach::BUSY_CODE, attach::BUSY_MESSAGE));
+    }
+    srv.taps.ensure(&sid.0);
     let home = maki_storage::paths::home();
     let recorded_model = match params.providers.model(&restored.model) {
         Ok(model) if params.model_policy.allows(&model.spec()) => model,
@@ -824,7 +937,11 @@ async fn load_session(
         },
     )
     .await
-    .map_err(session_registration_error)?;
+    .map_err(|error| {
+        srv.taps.remove(&sid.0);
+        srv.taps.release(&sid.0);
+        session_registration_error(error)
+    })?;
     if let Some(session) = &srv.session
         && let Some(orchestration) = &session.orchestration
         && let Err(error) = async {
@@ -1033,6 +1150,9 @@ async fn close_session(srv: &mut Server) {
     let Some(mut state) = srv.session.take() else {
         return;
     };
+    let session_id = state.handle.session_id.to_string();
+    srv.taps.remove(&session_id);
+    srv.taps.release(&session_id);
     srv.lua_event_handle.clear_orchestration_services();
     // The event pump dies with the session, so the requests it owed answers to
     // have to be answered here or the client waits on them forever.
@@ -1063,6 +1183,7 @@ async fn close_session(srv: &mut Server) {
     state.command_projection_task.cancel().await;
     state.event_pump.finish().await;
     state.option_projection_task.cancel().await;
+    state.ui_forward.cancel().await;
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
     }
@@ -1257,6 +1378,15 @@ async fn install_session_with_lock(
         Arc::clone(&option_projection),
         coordinator.read().subscribe(),
     );
+    let ui_forward = smol::spawn({
+        let out_tx = srv.out_tx.clone();
+        let events = params.ui.events.clone();
+        async move {
+            while let Ok(message) = events.recv_async().await {
+                let _ = out_tx.send(message);
+            }
+        }
+    });
     srv.session = Some(SessionState {
         handle,
         coordinator: Some(coordinator),
@@ -1270,6 +1400,7 @@ async fn install_session_with_lock(
         event_pump,
         option_projection: Some(option_projection),
         option_projection_task,
+        ui_forward,
         lock: Some(lock),
     });
     Ok(option_snapshot)
@@ -3874,6 +4005,9 @@ mod tests {
         );
         let server = Server {
             out_tx: out_tx.clone(),
+            wire: flume::unbounded::<Value>().0,
+            taps: Arc::default(),
+            attached: None,
             catalog: ModelCatalog::default(),
             session: Some(SessionState {
                 option_projection: Some(Arc::new(OptionProjection {
@@ -3897,6 +4031,7 @@ mod tests {
                 command_projection_task: smol::spawn(async {}),
                 event_pump: EventPump::idle(),
                 option_projection_task: smol::spawn(async {}),
+                ui_forward: smol::spawn(async {}),
                 lock: None,
             }),
             elicitation: false,
@@ -3929,6 +4064,9 @@ mod tests {
             let (out_tx, _) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
+                wire: flume::unbounded::<Value>().0,
+                taps: Arc::default(),
+                attached: None,
                 catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
@@ -3995,6 +4133,9 @@ mod tests {
             let (out_tx, _) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
+                wire: flume::unbounded::<Value>().0,
+                taps: Arc::default(),
+                attached: None,
                 catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
@@ -4556,6 +4697,9 @@ mod tests {
             let (out_tx, _out_rx) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
+                wire: flume::unbounded::<Value>().0,
+                taps: Arc::default(),
+                attached: None,
                 catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
@@ -4624,6 +4768,9 @@ mod tests {
             let (out_tx, _out_rx) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
+                wire: flume::unbounded::<Value>().0,
+                taps: Arc::default(),
+                attached: None,
                 catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
@@ -7743,6 +7890,9 @@ mod tests {
             let (out_tx, _out_rx) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
+                wire: flume::unbounded::<Value>().0,
+                taps: Arc::default(),
+                attached: None,
                 catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
@@ -7786,6 +7936,9 @@ mod tests {
             let (out_tx, out_rx) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
+                wire: flume::unbounded::<Value>().0,
+                taps: Arc::default(),
+                attached: None,
                 catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,

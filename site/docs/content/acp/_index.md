@@ -53,9 +53,35 @@ After that, ACP messages flow one JSON-RPC message per line. A refused handshake
 
 The token comes from `--token`, then `MAKIMA_LAN_TOKEN`, then `lan-token` in the Makima state directory, which is created on first use with owner only permissions. The command prints the token when it starts.
 
-Each connection gets its own session, and Makima serves one connection at a time: the next client waits until the current one disconnects. Closing the connection ends its session, like closing an agent's stdin.
+A process serves one session at a time. Closing the connection that owns it ends it, like closing an agent's stdin; until then another connection that asks for a new session is refused with error code `-32011`, and can watch instead.
 
 The listener speaks plain TCP, and the token is its only gate. Use it on a network you trust or over a private network such as Tailscale, and prefer `127.0.0.1` unless another machine needs it.
+
+### Watching a session
+
+While a connection owns a session, other connections can watch it read only. `maki/live` lists what this process serves:
+
+```json
+{"sessions":[{"sessionId":"...","watchers":0}]}
+```
+
+Then send `maki/attach` with the session id:
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"maki/attach","params":{"sessionId":"..."}}
+```
+
+Makima first replays what the session already emitted, as the same `session/update` notifications a client already renders, then streams new ones. The reply follows the replay:
+
+```json
+{"sessionId":"...","readOnly":true,"replayed":12,"truncated":false}
+```
+
+`replayed` counts the updates sent before the reply, and `truncated` says the oldest ones were dropped because the session ran past the recording limit. Several connections can watch one session.
+
+A watching connection cannot write: `session/prompt`, `session/new`, `session/load`, `session/set_mode`, `session/set_config_option` and `maki/rewind` answer with error code `-32010`. It can still initialize, switch themes and complete arguments.
+
+The recording follows the session, not the connection: when the owner rewinds, watchers receive `maki/ui/rewind` and the recording starts over from the rewound transcript. When the owning connection ends, the session ends and watchers lose it.
 
 ## What works
 
