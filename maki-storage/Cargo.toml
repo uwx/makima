@@ -4,13 +4,17 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+default = ["version"]
+# The GitHub release check. Off for the phone, which updates through its store
+# and cannot build a TLS stack there.
+version = ["dep:isahc"]
 test-util = []
 
 [dependencies]
 event-listener = { workspace = true }
 maki-domain = { workspace = true }
 getrandom = { workspace = true }
-isahc = { workspace = true }
+isahc = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

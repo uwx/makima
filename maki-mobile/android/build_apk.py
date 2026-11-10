@@ -102,6 +102,22 @@ def build_library(target: str, ndk: Path, debug: bool) -> Path:
     return library
 
 
+def manifest(debug: bool) -> Path:
+    """The debug build is debuggable so `run-as` can write the attach file."""
+    if not debug:
+        return ANDROID / "AndroidManifest.xml"
+    text = (ANDROID / "AndroidManifest.xml").read_text(encoding="utf-8")
+    text = text.replace(
+        'android:label="makima"',
+        'android:debuggable="true" android:label="makima"',
+        1,
+    )
+    path = ROOT / "target" / "android" / "AndroidManifest.debug.xml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
 def assemble(sdk: Path, abis: dict[str, Path], debug: bool) -> Path:
     out = ROOT / "target" / "android"
     out.mkdir(parents=True, exist_ok=True)
@@ -115,7 +131,7 @@ def assemble(sdk: Path, abis: dict[str, Path], debug: bool) -> Path:
             "-o",
             unsigned,
             "--manifest",
-            ANDROID / "AndroidManifest.xml",
+            manifest(debug),
             "-I",
             platform,
             "--min-sdk-version",

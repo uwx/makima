@@ -4,22 +4,34 @@
 //! runs, the same way `makima attach` and the desktop do. This crate is the
 //! window and its start-up; the session arrives over ACP.
 
+mod attach;
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+mod session;
+
+const BACKGROUND: u32 = 0x101014;
+const FOREGROUND: u32 = 0xf0f0f5;
+const MUTED: u32 = 0x9090a0;
+const NOTICE: u32 = 0x2a2a33;
+
 #[cfg(any(target_os = "android", target_os = "ios"))]
 mod app {
+    use std::path::PathBuf;
+
     use gpui::{
-        App, AppContext, Application, Context, IntoElement, ParentElement, Render, Styled, Window,
-        WindowOptions, div, rgb,
+        AnyView, App, AppContext, Application, Context, IntoElement, ParentElement, Render, Styled,
+        Window, WindowOptions, div, rgb,
     };
+
+    use super::attach::Attach;
+    use super::session::Session;
+    use super::{BACKGROUND, FOREGROUND, MUTED};
 
     const TAG: &str = "makima-mobile";
     const TITLE: &str = "makima";
     const SUBTITLE: &str = "A coding agent, in your pocket";
-    const BACKGROUND: u32 = 0x101014;
-    const FOREGROUND: u32 = 0xf0f0f5;
-    const MUTED: u32 = 0x9090a0;
 
-    /// The first screen. It exists to prove the platform, text and GPU path on
-    /// a device before a session is wired in.
+    /// What a phone with no session configured shows.
     struct Welcome;
 
     impl Render for Welcome {
@@ -37,18 +49,19 @@ mod app {
         }
     }
 
-    pub fn open_main_window(cx: &mut App) {
+    pub fn open_main_window(cx: &mut App, files: Option<PathBuf>) {
         gpui_kit::init(cx);
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+        let content: AnyView = match files.as_deref().and_then(Attach::read) {
+            Some(attach) => Session::open(cx, attach).into(),
+            None => cx.new(|_| Welcome).into(),
+        };
         let window = cx.open_window(
             WindowOptions {
                 window_bounds: None,
                 ..Default::default()
             },
-            |window, cx| {
-                let welcome = cx.new(|_| Welcome);
-                cx.new(|cx| gpui_kit::component::Root::new(welcome, window, cx))
-            },
+            |window, cx| cx.new(|cx| gpui_kit::component::Root::new(content, window, cx)),
         );
         if let Err(error) = window {
             log::error!("could not open the window: {error:#}");
@@ -66,13 +79,14 @@ mod app {
         );
         gpui_mobile::android::jni::install_panic_hook();
         let _platform = gpui_mobile::android::jni::init_platform(&app);
+        let files = app.internal_data_path();
         let Some(shared) = gpui_mobile::android::jni::shared_platform() else {
             log::error!("the Android platform did not come up");
             return;
         };
         // Blocks for the life of the activity, so the platform and the app
         // context it hands out stay alive on this stack frame.
-        Application::with_platform(shared.into_rc()).run(open_main_window);
+        Application::with_platform(shared.into_rc()).run(move |cx| open_main_window(cx, files));
     }
 }
 

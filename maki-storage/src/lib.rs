@@ -20,6 +20,7 @@ pub mod session_lock;
 pub mod sessions;
 pub mod theme;
 pub mod trusted_folders;
+#[cfg(feature = "version")]
 pub mod version;
 
 use std::fs;

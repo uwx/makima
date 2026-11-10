@@ -10,7 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 mdns-sd = { workspace = true }
-maki-storage = { workspace = true }
+maki-storage = { workspace = true, default-features = false }
 tracing = { workspace = true }
 
 [dev-dependencies]
