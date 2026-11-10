@@ -129,11 +129,12 @@ A watching connection that does not hold control cannot write: `session/prompt`,
 `makima attach <link>` is a terminal client for a shared session:
 
 ```bash
-makima attach 192.168.2.4:60667        # token from $MAKIMA_LAN_TOKEN or the state directory
+makima attach                           # pick from what the network announces
+makima attach 192.168.2.4:60667         # token from $MAKIMA_LAN_TOKEN or the state directory
 makima attach lan://192.168.2.4:60667 --token my-token
 ```
 
-It replays the session, then follows it. Lines are prompts once you type `/take`; `/cancel` stops a turn, `/quit` leaves. Tool calls print as `→ title` and `✓ title`, permission requests print their options and take a number, and pickers take a number too.
+With no link it waits a few seconds and lists the announced sessions to choose from. It replays the chosen session, then follows it. Lines are prompts once you type `/take`; `/cancel` stops a turn, `/quit` leaves. Tool calls print as `→ title` and `✓ title`, permission requests print their options and take a number, and pickers take a number too.
 
 ### Taking control
 

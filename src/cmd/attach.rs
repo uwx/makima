@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
@@ -12,6 +13,7 @@ use maki_acp_client::{
     Connection, ContentBlock, Event, PermissionOption, PickOutcome, PickPrompt, PermissionPrompt,
     SessionUpdate, StopReason, Target, ToolCallStatus,
 };
+use maki_lan::discovery::{Browser, Discovered, Found};
 use maki_storage::StateDir;
 
 const TAKE_COMMAND: &str = "take";
@@ -30,9 +32,24 @@ const READ_ONLY_PROMPT: &str = "read-only; /take before prompting";
 const AGENT_GONE: &str = "the agent went away";
 const PERMISSION_QUESTION: &str = "Allow? Enter denies";
 const PICK_QUESTION: &str = "Choose? Enter closes";
+const CHOOSE_QUESTION: &str = "Which one? Enter cancels";
+const TOKEN_QUESTION: &str = "Token (Enter uses the one on this machine)";
+const ANNOUNCED_HEADER: &str = "shared sessions on the local network:";
+const NOTHING_ANNOUNCED: &str =
+    "no shared session was announced; pass a link, like `makima attach 192.168.2.4:60667`";
+const NOTHING_CHOSEN: &str = "nothing chosen";
+/// How long a terminal listens for announcements before showing what it has.
+const ANNOUNCE_WAIT: Duration = Duration::from_secs(3);
 
-pub fn run(link: String, token: Option<String>, prompt: Option<String>) -> Result<()> {
+pub fn run(link: Option<String>, token: Option<String>, prompt: Option<String>) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
+    let (link, token) = match link {
+        Some(link) => (link, token),
+        None => match choose(&token)? {
+            Some(chosen) => chosen,
+            None => return Ok(()),
+        },
+    };
     let token = token_for(token, &storage)?;
     let target = Target::lan(&with_scheme(&link), Some(&token)).map_err(|error| eyre!(error))?;
     let connection = maki_acp_client::connect(&target).map_err(|error| eyre!(error))?;
@@ -44,6 +61,92 @@ pub fn run(link: String, token: Option<String>, prompt: Option<String>) -> Resul
         }
         None => session.interactive(),
     }
+}
+
+/// Which announced session to attach to, and the token it expects. A terminal
+/// started without a link picks from what the local network offers.
+fn choose(given: &Option<String>) -> Result<Option<(String, Option<String>)>> {
+    let found = announced();
+    let mut printer = Printer::new();
+    if found.is_empty() {
+        bail!(NOTHING_ANNOUNCED);
+    }
+    printer.line(ANNOUNCED_HEADER);
+    for (index, session) in found.iter().enumerate() {
+        printer.line(&format!(
+            "  {}. {} · {}",
+            index + 1,
+            label(session),
+            session.address
+        ));
+    }
+    let Some(answer) = read_answer(&mut printer, CHOOSE_QUESTION)? else {
+        return Ok(None);
+    };
+    let Some(session) = picked(&answer, found.len()).and_then(|index| found.get(index)) else {
+        printer.line(NOTHING_CHOSEN);
+        return Ok(None);
+    };
+    let token = match given {
+        Some(token) => Some(token.clone()),
+        None => ask_token()?,
+    };
+    Ok(Some((maki_lan::link(session.address), token)))
+}
+
+/// What the local network announces, waiting long enough to hear back.
+fn announced() -> Vec<Found> {
+    let Some(browser) = Browser::start() else {
+        return Vec::new();
+    };
+    let deadline = Instant::now() + ANNOUNCE_WAIT;
+    let mut found: Vec<Found> = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match browser.next(left) {
+            Some(Discovered::Found(session)) => {
+                if !found
+                    .iter()
+                    .any(|known| known.fullname == session.fullname)
+                {
+                    found.push(session);
+                }
+            }
+            Some(Discovered::Gone(fullname)) => {
+                found.retain(|known| known.fullname != fullname);
+            }
+            // Nothing was announced before the deadline, or browsing stopped.
+            None => break,
+        }
+    }
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found
+}
+
+/// The name to show for an announced session: its directory, or what it calls
+/// itself when it says nothing about one.
+fn label(found: &Found) -> &str {
+    if found.project.is_empty() {
+        &found.name
+    } else {
+        &found.project
+    }
+}
+
+/// The index a typed number names, counting from one.
+fn picked(answer: &str, count: usize) -> Option<usize> {
+    let index = answer.trim().parse::<usize>().ok()?.checked_sub(1)?;
+    (index < count).then_some(index)
+}
+
+/// Asks for the token the chosen agent expects, where an empty answer keeps the
+/// one this machine already has.
+fn ask_token() -> Result<Option<String>> {
+    let mut printer = Printer::new();
+    let token = read_answer(&mut printer, TOKEN_QUESTION)?
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    Ok((!token.is_empty()).then_some(token))
 }
 
 /// The token the agent expects: the flag, then the environment, then the one
@@ -292,14 +395,22 @@ fn read_line() -> Result<Option<String>> {
     Ok(Some(line))
 }
 
+/// Asks {question} and reads the answer, where the input ending means none came.
+fn read_answer(printer: &mut Printer, question: &str) -> Result<Option<String>> {
+    printer.line(question);
+    printer.prompt(PROMPT_MARKER);
+    read_line()
+}
+
 /// Reads a numbered choice, where an empty answer or anything unparsable means
 /// none was made.
 fn read_choice(printer: &mut Printer, question: &str) -> Result<Option<usize>> {
-    printer.line(question);
-    printer.prompt(PROMPT_MARKER);
-    Ok(read_line()?
-        .and_then(|line| line.trim().parse::<usize>().ok())
-        .and_then(|number| number.checked_sub(1)))
+    Ok(read_answer(printer, question)?.and_then(|line| {
+        line.trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+    }))
 }
 
 struct Printer {
@@ -396,7 +507,7 @@ impl Printer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, command, with_scheme};
+    use super::{Command, command, picked, with_scheme};
     use test_case::test_case;
 
     fn action(line: &str) -> &'static str {
@@ -430,5 +541,15 @@ mod tests {
     #[test_case("lan://box:7331:/srv/app" => "lan://box:7331:/srv/app"; "a full link is kept")]
     fn a_link_gets_the_scheme_it_needs(link: &str) -> String {
         with_scheme(link)
+    }
+
+    #[test_case("1", 2 => Some(0); "the first of two")]
+    #[test_case(" 2 ", 2 => Some(1); "surrounding space is ignored")]
+    #[test_case("3", 2 => None; "past the end")]
+    #[test_case("0", 2 => None; "counting starts at one")]
+    #[test_case("", 2 => None; "nothing typed")]
+    #[test_case("two", 2 => None; "not a number")]
+    fn a_typed_number_names_an_announced_session(answer: &str, count: usize) -> Option<usize> {
+        picked(answer, count)
     }
 }

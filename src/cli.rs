@@ -282,8 +282,9 @@ pub enum Command {
     },
     /// Attach to the agent another machine shares, from this terminal
     Attach {
-        /// Where the agent is: host:port, or lan://host:port:/directory to start a session there
-        link: String,
+        /// Where the agent is: host:port, or lan://host:port:/directory to start a session there.
+        /// Without it, pick from what the local network announces
+        link: Option<String>,
         /// Token the agent expects. Defaults to $MAKIMA_LAN_TOKEN, then the stored token
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
