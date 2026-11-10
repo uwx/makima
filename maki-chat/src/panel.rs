@@ -317,6 +317,13 @@ impl SessionPanel {
                 events,
                 read_only,
             }) => {
+                // A panel that failed once gets a second chance, so the old
+                // error and its transcript must not linger under the replay.
+                self.failed = false;
+                self.closed = false;
+                self.busy = false;
+                self.pending = None;
+                self.views.clear();
                 self.read_only = read_only;
                 if read_only {
                     self.notice(WATCHING_NOTICE.to_owned());
