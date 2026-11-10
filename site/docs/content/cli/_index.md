@@ -147,10 +147,11 @@ Uses the same install locations as the install scripts.
 makima acp
 makima acp -m anthropic/claude-sonnet-4-6
 makima acp --yolo
+makima acp --listen 0.0.0.0:7331
 makima --no-jit acp
 ```
 
-Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags like `--no-jit` must come before the subcommand.
+Starts an [ACP](/docs/acp/) server on stdio for editors like Zed, or over TCP with `--listen` for [remote agents](/docs/acp/#remote-agents-over-tcp). Subcommand flags are `-m` / `--model`, `--yolo`, `--listen` and `--token`. Global flags like `--no-jit` must come before the subcommand.
 
 ### `makima index`
 

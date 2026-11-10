@@ -114,6 +114,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             model,
             yolo,
             automode,
+            listen,
+            token,
         }) => {
             acp::run(
                 startup_cwd()?,
@@ -125,6 +127,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 cli.system_prompt,
                 cli.append_system_prompt,
                 trust_mode,
+                listen,
+                token,
             )?;
         }
         Some(Command::Trust { action }) => {

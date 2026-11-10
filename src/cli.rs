@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -269,6 +270,12 @@ pub enum Command {
         /// Gate every bash command through the auto-mode classifier
         #[arg(long)]
         automode: bool,
+        /// Serve ACP over TCP at this address instead of stdio, like 0.0.0.0:7331
+        #[arg(long, value_name = "ADDR")]
+        listen: Option<SocketAddr>,
+        /// Token TCP clients must present. Defaults to $MAKIMA_LAN_TOKEN, then the stored token
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
     },
     /// Show the rendered system prompt or tool definitions
     Prompt {

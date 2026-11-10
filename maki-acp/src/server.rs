@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::Write;
 use std::iter;
+use std::net::SocketAddr;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agent_client_protocol_schema::{
     AgentNotification, AgentRequest, AgentResponse, AvailableCommand, AvailableCommandInput,
@@ -52,7 +53,8 @@ use maki_storage::session_lock;
 use maki_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, StoredTokenUsage, read_prefs};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use smol::io::AsyncBufReadExt;
+use smol::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use smol::net::TcpListener;
 use tracing::{debug, info, warn};
 
 use crate::ui::{COMPLETE_METHOD, REWOUND_METHOD, UI_CAPABILITY_PATH, UiBridge};
@@ -305,16 +307,124 @@ impl Server {
     }
 }
 
+/// The first line of a TCP connection: `{"maki":"lan","version":1,"token":"..."}`.
+/// The reply repeats the version with `ok`, and an `error` when it refused.
+pub const HANDSHAKE_KIND: &str = "lan";
+pub const HANDSHAKE_VERSION: u64 = 1;
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const UNAUTHORIZED: &str = "unauthorized";
+const BAD_HANDSHAKE: &str = "invalid handshake";
+
+/// ACP over stdio: the client owns the process and its only connection.
 pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
+    let input = smol::io::BufReader::new(smol::Unblock::new(std::io::stdin()));
+    let output = smol::Unblock::new(std::io::stdout());
+    serve_connection(&params, input, output).await
+}
+
+/// ACP over TCP, one connection at a time. Each connection owns its session,
+/// like a stdio agent does, and must open with the handshake, so a client that
+/// cannot name the token never reaches the agent.
+pub async fn serve_tcp(
+    params: AcpParams,
+    listen: SocketAddr,
+    token: String,
+) -> color_eyre::Result<()> {
+    let listener = TcpListener::bind(listen).await?;
+    info!(address = %listener.local_addr()?, "ACP listening over TCP");
+    let token: Arc<str> = Arc::from(token);
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let (read_half, write_half) = smol::io::split(stream);
+        let mut reader = smol::io::BufReader::new(read_half);
+        let mut writer = write_half;
+        match handshake(&mut reader, &mut writer, &token).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(%peer, "ACP client rejected: wrong or missing LAN token");
+                continue;
+            }
+            Err(error) => {
+                debug!(%peer, %error, "ACP handshake failed");
+                continue;
+            }
+        }
+        info!(%peer, "ACP client connected");
+        if let Err(error) = serve_connection(&params, reader, writer).await {
+            warn!(%peer, %error, "ACP connection failed");
+        }
+    }
+}
+
+/// Checks the opening line of a TCP connection against {token}, answering
+/// either way. A read that times out counts as an empty line, which fails the
+/// handshake instead of holding the listener.
+async fn handshake(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    token: &str,
+) -> std::io::Result<bool> {
+    let mut line = String::new();
+    let read = smol::future::or(
+        async { reader.read_line(&mut line).await },
+        async {
+            smol::Timer::after(HANDSHAKE_TIMEOUT).await;
+            Ok(0)
+        },
+    )
+    .await?;
+    let request: Option<Value> = serde_json::from_str(line.trim()).ok();
+    let wanted = request.as_ref().is_some_and(|request| {
+        request["maki"] == HANDSHAKE_KIND && request["version"] == HANDSHAKE_VERSION
+    });
+    let authorized = read > 0
+        && wanted
+        && request
+            .as_ref()
+            .is_some_and(|request| token_matches(request["token"].as_str().unwrap_or_default(), token));
+    let reply = json!({
+        "maki": HANDSHAKE_KIND,
+        "version": HANDSHAKE_VERSION,
+        "ok": authorized,
+        "error": (!authorized).then_some(if wanted { UNAUTHORIZED } else { BAD_HANDSHAKE }),
+    });
+    let mut bytes = serde_json::to_vec(&reply).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    writer.write_all(&bytes).await?;
+    writer.flush().await?;
+    Ok(authorized)
+}
+
+/// Compares without an early exit, so a wrong token reveals nothing by timing.
+fn token_matches(given: &str, expected: &str) -> bool {
+    let (given, expected) = (given.as_bytes(), expected.as_bytes());
+    given.len() == expected.len()
+        && given
+            .iter()
+            .zip(expected)
+            .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
+}
+
+/// Runs ACP on a pair of streams until the input ends. Shared by stdio and
+/// TCP, which differ only in the streams and in the handshake before them.
+async fn serve_connection(
+    params: &AcpParams,
+    input: impl AsyncBufRead + Unpin + Send + 'static,
+    output: impl AsyncWrite + Unpin + Send + 'static,
+) -> color_eyre::Result<()> {
     let (out_tx, out_rx) = flume::unbounded::<Value>();
 
     let writer_task = smol::spawn(async move {
-        let stdout = std::io::stdout();
+        let mut output = output;
         while let Ok(msg) = out_rx.recv_async().await {
-            let mut handle = stdout.lock();
-            if serde_json::to_writer(&mut handle, &msg).is_ok() {
-                let _ = handle.write_all(b"\n");
-                let _ = handle.flush();
+            let Ok(mut bytes) = serde_json::to_vec(&msg) else {
+                continue;
+            };
+            bytes.push(b'\n');
+            if output.write_all(&bytes).await.is_err() || output.flush().await.is_err() {
+                return;
             }
         }
     });
@@ -346,7 +456,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         |_| {},
     );
     let (in_tx, in_rx) = flume::unbounded::<String>();
-    let _reader_task = smol::spawn(read_stdin(in_tx));
+    let _reader_task = smol::spawn(read_lines(input, in_tx));
     let next_line = || async {
         in_rx
             .recv_async()
@@ -364,7 +474,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
             None => next_line().await,
         };
         match step {
-            Step::Line(line) => handle_line(&mut server, &line, &params).await,
+            Step::Line(line) => handle_line(&mut server, &line, params).await,
             Step::Dispatched(dispatched) => respond_dispatch(&mut server, dispatched).await,
             Step::InputClosed => break,
         }
@@ -390,11 +500,13 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     Ok(())
 }
 
-async fn read_stdin(tx: Sender<String>) -> std::io::Result<()> {
-    let mut reader = smol::io::BufReader::new(smol::Unblock::new(std::io::stdin()));
+async fn read_lines(
+    mut input: impl AsyncBufRead + Unpin,
+    tx: Sender<String>,
+) -> std::io::Result<()> {
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 {
+        if input.read_line(&mut line).await? == 0 {
             return Ok(());
         }
         if tx.send_async(line).await.is_err() {

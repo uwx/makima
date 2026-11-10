@@ -33,6 +33,30 @@ Add Makima as a custom agent in Zed's `settings.json`:
 
 The `model` value is a `provider/model-id` spec, same format as `makima --model`.
 
+## Remote agents over TCP
+
+ACP only standardizes stdio, but the protocol is transport agnostic, so `makima acp --listen` serves the same newline delimited JSON-RPC over TCP:
+
+```bash
+makima acp --listen 0.0.0.0:7331
+makima acp --listen 127.0.0.1:7331 --token my-token
+```
+
+Every connection opens with a handshake line, so a client that cannot name the token never reaches the agent:
+
+```
+client -> {"maki":"lan","version":1,"token":"..."}
+server -> {"maki":"lan","version":1,"ok":true}
+```
+
+After that, ACP messages flow one JSON-RPC message per line. A refused handshake answers `{"ok":false,"error":"unauthorized"}` and closes the connection.
+
+The token comes from `--token`, then `MAKIMA_LAN_TOKEN`, then `lan-token` in the Makima state directory, which is created on first use with owner only permissions. The command prints the token when it starts.
+
+Each connection gets its own session, and Makima serves one connection at a time: the next client waits until the current one disconnects. Closing the connection ends its session, like closing an agent's stdin.
+
+The listener speaks plain TCP, and the token is its only gate. Use it on a network you trust or over a private network such as Tailscale, and prefer `127.0.0.1` unless another machine needs it.
+
 ## What works
 
 - Sessions persist. Loading a session replays the full conversation in the editor. A session that is open in another terminal cannot be loaded.
@@ -62,7 +86,7 @@ makima acp --yolo
 makima --no-jit acp
 ```
 
-`makima acp` only takes `-m` / `--model` and `--yolo` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`makima --no-jit acp`, not `makima acp --no-jit`).
+`makima acp` takes `-m` / `--model`, `--yolo`, `--listen` and `--token` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`makima --no-jit acp`, not `makima acp --no-jit`).
 
 When the client closes stdin, the prompt still running finishes and gets its response, and subagents still working in the background finish too, along with the turns their results start, then the server exits. Permission requests and questions that come after that are refused, since the client can no longer answer them. Send `session/cancel` first to stop the prompt instead.
 

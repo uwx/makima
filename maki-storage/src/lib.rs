@@ -9,6 +9,7 @@ pub mod id;
 pub mod input_history;
 pub mod instances;
 pub mod intern;
+pub mod lan;
 pub mod lock;
 pub mod log;
 pub mod model;

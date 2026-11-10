@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,6 +13,8 @@ use maki_lua::ui_sink::HostUi;
 use maki_storage::StateDir;
 
 use crate::setup;
+
+const LAN_TOKEN_ENV: &str = "MAKIMA_LAN_TOKEN";
 
 /// The CLI theme store: the desktop switches themes through it, so the TUI and
 /// the next run agree.
@@ -52,8 +55,19 @@ pub fn run(
     system_prompt_override: Option<String>,
     append_system_prompt: Option<String>,
     trust_mode: TrustMode,
+    listen: Option<SocketAddr>,
+    token: Option<String>,
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
+    let lan = listen
+        .map(|listen| -> Result<(SocketAddr, String)> {
+            let token = match token {
+                Some(token) => token,
+                None => lan_token(&storage)?,
+            };
+            Ok((listen, token))
+        })
+        .transpose()?;
     maki_providers::model_registry::load_from_storage(&storage);
     let _instance = maki_storage::instances::InstanceGuard::register(
         &storage,
@@ -137,7 +151,7 @@ pub fn run(
     let lua_event_handle = plugin_host.event_handle();
     let yolo = config.permissions.yolo;
 
-    let result = maki_acp::run(maki_acp::AcpParams {
+    let params = maki_acp::AcpParams {
         model,
         config: config.agent,
         permissions_config: config.permissions,
@@ -159,7 +173,25 @@ pub fn run(
         trust_policy: Arc::new(config.trust),
         ui,
         themes: Some(Arc::new(UiThemes)),
-    });
+    };
     drop(standard_commands);
-    result
+    match lan {
+        Some((listen, token)) => {
+            eprintln!("ACP listening on {listen}; LAN token: {token}");
+            maki_acp::run_tcp(params, listen, token)
+        }
+        None => maki_acp::run(params),
+    }
+}
+
+/// The token a TCP client must present: `--token`, then `MAKIMA_LAN_TOKEN`,
+/// then the one stored for this machine, generated on first use.
+fn lan_token(storage: &StateDir) -> Result<String> {
+    if let Ok(token) = std::env::var(LAN_TOKEN_ENV) {
+        let token = token.trim();
+        if !token.is_empty() {
+            return Ok(token.to_owned());
+        }
+    }
+    maki_storage::lan::token(storage.path()).context("read the LAN token")
 }

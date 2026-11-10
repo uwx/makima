@@ -103,3 +103,13 @@ pub struct AcpParams {
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {
     smol::block_on(server::serve(params))
 }
+
+/// Serves ACP over TCP at {listen}, requiring {token} in each connection's
+/// opening handshake.
+pub fn run_tcp(
+    params: AcpParams,
+    listen: std::net::SocketAddr,
+    token: String,
+) -> color_eyre::Result<()> {
+    smol::block_on(server::serve_tcp(params, listen, token))
+}
