@@ -17,66 +17,25 @@ const MUTED: u32 = 0x9090a0;
 mod app {
     use std::path::PathBuf;
 
-    use gpui::{
-        AnyView, App, AppContext, Application, Context, IntoElement, ParentElement, Render, Styled,
-        Window, WindowOptions, div, rgb,
-    };
+    use gpui::{AnyView, App, AppContext, Application, WindowOptions};
+    use gpui_mobile::android::jni::{init_platform, install_panic_hook, shared_platform};
 
-    use super::attach::Attach;
     use super::session::Phone;
-    use super::{BACKGROUND, FOREGROUND, MUTED};
 
     const TAG: &str = "makima-mobile";
-    const TITLE: &str = "makima";
-    const SUBTITLE: &str = "A coding agent, in your pocket";
-
-    /// What a phone with no session configured shows, and where to put the
-    /// file that configures one.
-    struct Welcome {
-        hint: Option<String>,
-    }
-
-    impl Render for Welcome {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .px_6()
-                .bg(rgb(BACKGROUND))
-                .child(div().text_2xl().text_color(rgb(FOREGROUND)).child(TITLE))
-                .child(div().text_sm().text_color(rgb(MUTED)).child(SUBTITLE))
-                .children(self.hint.clone().map(|hint| {
-                    div()
-                        .mt_6()
-                        .text_xs()
-                        .text_color(rgb(MUTED))
-                        .child(gpui::SharedString::from(hint))
-                }))
-        }
-    }
 
     pub fn open_main_window(cx: &mut App, dirs: &[PathBuf]) {
         gpui_kit::init(cx);
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
-        let attach = dirs.iter().find_map(|dir| Attach::read(dir));
-        let hint = dirs
-            .first()
-            .map(|dir| format!("put attach.json in {}", dir.display()));
+        let dirs = dirs.to_vec();
         let window = cx.open_window(
             WindowOptions {
                 window_bounds: None,
                 ..Default::default()
             },
             |window, cx| {
-                let content: AnyView = match attach {
-                    Some(attach) => cx.new(|cx| Phone::new(window, cx, attach)).into(),
-                    None => cx.new(|_| Welcome { hint }).into(),
-                };
-                cx.new(|cx| gpui_kit::component::Root::new(content, window, cx))
+                let phone: AnyView = cx.new(|cx| Phone::new(window, cx, dirs)).into();
+                cx.new(|cx| gpui_kit::component::Root::new(phone, window, cx))
             },
         );
         if let Err(error) = window {
@@ -93,13 +52,13 @@ mod app {
                 .with_max_level(log::LevelFilter::Info)
                 .with_tag(TAG),
         );
-        gpui_mobile::android::jni::install_panic_hook();
-        let _platform = gpui_mobile::android::jni::init_platform(&app);
+        install_panic_hook();
+        let _platform = init_platform(&app);
         let dirs: Vec<PathBuf> = [app.internal_data_path(), app.external_data_path()]
             .into_iter()
             .flatten()
             .collect();
-        let Some(shared) = gpui_mobile::android::jni::shared_platform() else {
+        let Some(shared) = shared_platform() else {
             log::error!("the Android platform did not come up");
             return;
         };

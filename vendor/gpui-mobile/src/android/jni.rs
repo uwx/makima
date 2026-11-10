@@ -53,6 +53,12 @@ use std::{
     time::Duration,
 };
 
+/// `WindowInsets.Type.ime()`, which JNI would otherwise have to ask a Java
+/// class object for.
+const IME_TYPE: i32 = 8;
+/// How long the keyboard takes to be laid out before its inset is readable.
+const IME_SETTLE: Duration = Duration::from_millis(300);
+
 /// Whether the deferred init-window callback has already been invoked.
 ///
 /// Reset to `false` on `TerminateWindow` so that when the surface is
@@ -1529,6 +1535,102 @@ fn refresh_safe_area(win: &super::AndroidWindow, app: &AndroidApp) {
     if let Some(bars) = system_bar_insets() {
         win.merge_safe_area_insets(bars);
     }
+    win.set_ime_inset(ime_inset().unwrap_or(0.0));
+}
+
+/// Reads the insets again once the keyboard has settled.
+///
+/// A NativeActivity gets no insets callback when the keyboard opens and keeps its
+/// full height, so the keyboard's height is only readable a moment after asking
+/// for it. Everything the insets move has to be laid out again by hand.
+fn refresh_insets_later() {
+    let _ = std::thread::Builder::new()
+        .name("maki-insets".into())
+        .spawn(|| {
+            std::thread::sleep(IME_SETTLE);
+            let Some(app) = android_app() else {
+                return;
+            };
+            let Some(platform) = PLATFORM.get() else {
+                return;
+            };
+            let Some(win) = platform.primary_window() else {
+                return;
+            };
+            refresh_safe_area(&win, &app);
+            win.notify_insets_changed();
+        });
+}
+
+/// The software keyboard's height in physical pixels, zero when it is down.
+///
+/// Needs the API 30 `getInsets`, which is why the older getters above cannot
+/// stand in for it.
+pub fn ime_inset() -> Option<f32> {
+    with_env(|env| {
+        let activity = activity(env)?;
+        let window = env
+            .call_method(
+                &activity,
+                jni::jni_str!("getWindow"),
+                jni::jni_sig!("()Landroid/view/Window;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        let decor = env
+            .call_method(
+                &window,
+                jni::jni_str!("getDecorView"),
+                jni::jni_sig!("()Landroid/view/View;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        let insets = env
+            .call_method(
+                &decor,
+                jni::jni_str!("getRootWindowInsets"),
+                jni::jni_sig!("()Landroid/view/WindowInsets;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        let ime = env
+            .call_method(
+                &insets,
+                jni::jni_str!("getInsets"),
+                jni::jni_sig!("(I)Landroid/graphics/Insets;"),
+                &[JValue::Int(IME_TYPE)],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        let bottom = env
+            .get_field(
+                &ime,
+                jni::jni_str!("bottom"),
+                jni::jni_sig!("I"),
+            )
+            .and_then(|value| value.i())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        Ok(bottom as f32)
+    })
+    .ok()
 }
 
 /// The system bars' insets in physical pixels, as the window reports them now.
@@ -1682,6 +1784,12 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
             env.exception_clear();
             Ok(())
         });
+        // A plain NativeActivity has no InputConnection, so the system shows its
+        // keyboard and sends the keystrokes as key events, which we already handle.
+        if let Some(app) = android_app() {
+            app.show_soft_input(true);
+            refresh_insets_later();
+        }
     }
 }
 
@@ -1706,6 +1814,7 @@ pub fn hide_keyboard_android() {
     });
     if let Some(app) = android_app() {
         app.hide_soft_input(false);
+        refresh_insets_later();
     }
 }
 

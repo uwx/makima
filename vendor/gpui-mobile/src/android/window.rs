@@ -346,6 +346,12 @@ struct WindowState {
     /// and the bottom inset accounts for the navigation bar / gesture area.
     safe_area_insets: SafeAreaInsets,
 
+    /// The software keyboard's height in physical pixels, zero when it is down.
+    ime_inset: f32,
+
+    /// Called whenever the insets above change, so GPUI can lay out again.
+    insets_changed_callback: Option<Box<dyn FnMut(gpui::WindowInsets)>>,
+
     /// Current appearance.
     appearance: WindowAppearance,
 
@@ -474,6 +480,8 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            ime_inset: 0.0,
+            insets_changed_callback: None,
             appearance: WindowAppearance::Light,
             is_active: true,
             transparent,
@@ -510,6 +518,8 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            ime_inset: 0.0,
+            insets_changed_callback: None,
             appearance: WindowAppearance::Light,
             is_active: false,
             transparent: false,
@@ -1122,6 +1132,43 @@ impl AndroidWindow {
         state.safe_area_insets = insets;
     }
 
+    /// The insets as GPUI sees them, in logical pixels.
+    fn window_insets(state: &WindowState) -> gpui::WindowInsets {
+        let scale = state.scale_factor;
+        let safe = state.safe_area_insets;
+        let logical = |value: f32| gpui::px(value / scale);
+        gpui::WindowInsets {
+            safe_area: gpui::Edges {
+                top: logical(safe.top),
+                right: logical(safe.right),
+                bottom: logical(safe.bottom),
+                left: logical(safe.left),
+            },
+            ime: gpui::Edges {
+                bottom: logical(state.ime_inset),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Tells GPUI the insets moved, so it lays out again.
+    pub fn notify_insets_changed(&self) {
+        let (mut callback, insets) = {
+            let mut state = self.state.lock();
+            (state.insets_changed_callback.take(), Self::window_insets(&state))
+        };
+        if let Some(callback) = &mut callback {
+            callback(insets);
+        }
+        self.state.lock().insets_changed_callback = callback;
+    }
+
+    /// Sets how much of the window the software keyboard covers.
+    pub fn set_ime_inset(&self, physical: f32) {
+        self.state.lock().ime_inset = physical;
+    }
+
     /// Widens the safe area with insets the window reports for its system bars.
     pub fn merge_safe_area_insets(&self, insets: SafeAreaInsets) {
         let mut state = self.state.lock();
@@ -1552,16 +1599,11 @@ impl PlatformWindow for AndroidPlatformWindow {
     }
 
     fn insets(&self) -> gpui::WindowInsets {
-        let insets = self.window.safe_area_insets_logical();
-        gpui::WindowInsets {
-            safe_area: gpui::Edges {
-                top: gpui::px(insets.top),
-                right: gpui::px(insets.right),
-                bottom: gpui::px(insets.bottom),
-                left: gpui::px(insets.left),
-            },
-            ..Default::default()
-        }
+        AndroidWindow::window_insets(&self.window.state.lock())
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(gpui::WindowInsets)>) {
+        self.window.state.lock().insets_changed_callback = Some(callback);
     }
 
     fn appearance(&self) -> gpui::WindowAppearance {
