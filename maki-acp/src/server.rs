@@ -293,6 +293,11 @@ struct Server {
     taps: Arc<Taps>,
     /// Set while this connection only watches a session.
     attached: Option<Arc<SessionTap>>,
+    /// The tap of the session this connection owns, watching or not.
+    own_tap: Arc<SessionTap>,
+    /// Where the response to the line being handled goes, when the line came
+    /// from a watching connection.
+    origin: Option<Sender<Value>>,
     catalog: ModelCatalog,
     session: Option<SessionState>,
     /// Whether the client advertised form elicitation support at `initialize`.
@@ -319,13 +324,36 @@ struct PendingDispatch {
 
 enum Step {
     Line(String),
+    Remote(attach::RemoteRequest),
     InputClosed,
     Dispatched(InputDispatch),
 }
 
 impl Server {
+    /// Where a response to the current line belongs: the connection that asked,
+    /// or this connection's own client.
+    fn reply(&self) -> &Sender<Value> {
+        self.origin.as_ref().unwrap_or(&self.wire)
+    }
+
     fn respond(&self, id: RequestId, result: Result<AgentResponse, AcpError>) {
-        send(&self.out_tx, Response::new(id, result));
+        send(self.reply(), Response::new(id, result));
+    }
+
+    /// The tap of the session this connection owns.
+    fn session_tap(&self) -> Option<Arc<SessionTap>> {
+        let id = self.session.as_ref()?.handle.session_id.to_string();
+        self.taps.get(&id)
+    }
+
+    /// Whether this connection is the one allowed to act on the session it owns
+    /// or watches.
+    fn controls_session(&self) -> bool {
+        match self.attached.clone().or_else(|| self.session_tap()) {
+            // A tap nobody registered a controller for has nothing to arbitrate.
+            Some(tap) => tap.controller().is_none() || tap.controller_is(&self.wire),
+            None => true,
+        }
     }
 }
 
@@ -456,6 +484,7 @@ async fn serve_connection(
 ) -> color_eyre::Result<()> {
     let (out_tx, out_rx) = flume::unbounded::<Value>();
     let (wire, wire_rx) = flume::unbounded::<Value>();
+    let own_tap: Arc<SessionTap> = Arc::default();
 
     let writer_task = smol::spawn(async move {
         let mut output = output;
@@ -474,9 +503,18 @@ async fn serve_connection(
     let forward_task = smol::spawn({
         let taps = Arc::clone(taps);
         let wire = wire.clone();
+        let own_tap = Arc::clone(&own_tap);
         async move {
             while let Ok(msg) = out_rx.recv_async().await {
                 taps.observe(&msg);
+                // Answers and server requests belong to whoever controls the
+                // session, which need not be the connection that owns it.
+                if msg.get("id").is_some()
+                    && let Some(controller) = own_tap.controller()
+                    && controller.send(msg.clone()).is_ok()
+                {
+                    continue;
+                }
                 if wire.send(msg).is_err() {
                     return;
                 }
@@ -489,6 +527,8 @@ async fn serve_connection(
         wire,
         taps: Arc::clone(taps),
         attached: None,
+        own_tap: Arc::clone(&own_tap),
+        origin: None,
         catalog: params.catalog.clone(),
         session: None,
         elicitation: false,
@@ -505,24 +545,38 @@ async fn serve_connection(
     );
     let (in_tx, in_rx) = flume::unbounded::<String>();
     let _reader_task = smol::spawn(read_lines(input, in_tx));
+    let inbox = own_tap.inbox();
     let next_line = || async {
         in_rx
             .recv_async()
             .await
             .map_or(Step::InputClosed, Step::Line)
     };
+    let next_remote = || async {
+        if let Ok(request) = inbox.recv_async().await {
+            Step::Remote(request)
+        } else {
+            std::future::pending::<Step>().await
+        }
+    };
     loop {
         let step = match server.dispatch.as_mut() {
             Some(dispatch) => {
-                smol::future::or(next_line(), async {
-                    Step::Dispatched((&mut dispatch.future).await)
-                })
+                smol::future::or(
+                    smol::future::or(next_line(), next_remote()),
+                    async { Step::Dispatched((&mut dispatch.future).await) },
+                )
                 .await
             }
-            None => next_line().await,
+            None => smol::future::or(next_line(), next_remote()).await,
         };
         match step {
             Step::Line(line) => handle_line(&mut server, &line, params).await,
+            Step::Remote(request) => {
+                server.origin = Some(request.reply);
+                handle_line(&mut server, &request.message.to_string(), params).await;
+                server.origin = None;
+            }
             Step::Dispatched(dispatched) => respond_dispatch(&mut server, dispatched).await,
             Step::InputClosed => break,
         }
@@ -577,6 +631,11 @@ async fn handle_line(server: &mut Server, line: &str, params: &AcpParams) {
             return;
         }
     };
+    if let Some(tap) = &server.attached
+        && forward_to_owner(server, tap, &raw)
+    {
+        return;
+    }
     let id = raw.get("id").map(request_id);
     if raw.get("result").is_some() || raw.get("error").is_some() {
         handle_incoming_response(server, &raw);
@@ -597,6 +656,73 @@ fn request_id(v: &Value) -> RequestId {
 /// Watches the session named in the request: its recorded updates go to this
 /// connection, then live ones follow. The connection keeps no session of its
 /// own, which is what makes every session-scoped write fail.
+/// Methods a watching connection answers itself. Everything else is session
+/// traffic and belongs to the loop that owns the session.
+fn handled_locally(raw: &Value) -> bool {
+    if raw.get("result").is_some() || raw.get("error").is_some() {
+        return false;
+    }
+    matches!(
+        raw.get("method").and_then(Value::as_str),
+        Some(
+            "initialize"
+                | THEME_METHOD
+                | COMPLETE_METHOD
+                | SESSIONS_METHOD
+                | attach::ATTACH_METHOD
+                | attach::LIVE_METHOD
+        )
+    )
+}
+
+/// Passes {raw} to the owning loop when this connection holds control, which
+/// includes `maki/take_control` while it does not.
+fn forward_to_owner(srv: &Server, tap: &SessionTap, raw: &Value) -> bool {
+    let takes_control = raw.get("method").and_then(Value::as_str) == Some(attach::TAKE_CONTROL_METHOD);
+    if !takes_control && (handled_locally(raw) || !tap.controller_is(&srv.wire)) {
+        return false;
+    }
+    tap.forward(raw.clone(), srv.wire.clone())
+}
+
+/// Makes the asking connection the one that may act. Only an idle session can
+/// change hands, so no permission request or turn is left without its client.
+fn take_control(srv: &mut Server) -> Result<Value, AcpError> {
+    let pending = srv
+        .session
+        .as_ref()
+        .map(|session| session.pending.lock().unwrap());
+    let idle = srv.dispatch.is_none()
+        && pending.as_ref().is_some_and(|pending| {
+            pending.operation.is_none()
+                && pending.permissions.is_empty()
+                && pending.elicitation.is_none()
+        });
+    drop(pending);
+    if !idle {
+        return Err(AcpError::new(
+            attach::BUSY_CONTROL_CODE,
+            attach::BUSY_CONTROL_MESSAGE,
+        ));
+    }
+    let tap = srv.session_tap().ok_or_else(|| {
+        AcpError::new(attach::BUSY_CONTROL_CODE, "no session to control")
+    })?;
+    let target = srv.reply().clone();
+    let previous = tap.controller();
+    tap.set_controller(target.clone());
+    if let Some(previous) = previous
+        && !previous.same_channel(&target)
+    {
+        let _ = previous.send(json!({
+            "jsonrpc": "2.0",
+            "method": attach::CONTROL_METHOD,
+            "params": { "controller": false },
+        }));
+    }
+    Ok(json!({ "controller": true }))
+}
+
 fn attach_session(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
     let id = raw
         .pointer("/params/sessionId")
@@ -626,7 +752,10 @@ async fn handle_request(
     raw: &Value,
     params: &AcpParams,
 ) {
-    if srv.attached.is_some() && WRITE_METHODS.contains(&method) {
+    // Forwarded requests only arrive from the connection that holds control,
+    // so only this connection's own client is checked against it.
+    let writes_session = (srv.attached.is_some() || srv.session.is_some()) && srv.origin.is_none();
+    if writes_session && WRITE_METHODS.contains(&method) && !srv.controls_session() {
         srv.respond(
             id,
             Err(AcpError::new(
@@ -656,12 +785,17 @@ async fn handle_request(
         "session/load" => load_session(srv, raw, params).await,
         attach::ATTACH_METHOD => {
             let result = attach_session(srv, raw);
-            send(&srv.out_tx, Response::new(id, result));
+            send(srv.reply(), Response::new(id, result));
             return;
         }
         attach::LIVE_METHOD => {
             let result = json!({ "sessions": srv.taps.live() });
-            send(&srv.out_tx, Response::new(id, Ok::<Value, AcpError>(result)));
+            send(srv.reply(), Response::new(id, Ok::<Value, AcpError>(result)));
+            return;
+        }
+        attach::TAKE_CONTROL_METHOD => {
+            let result = take_control(srv);
+            send(srv.reply(), Response::new(id, result));
             return;
         }
         "session/prompt" => match start_prompt(srv, raw, &id) {
@@ -676,10 +810,7 @@ async fn handle_request(
                 return;
             }
             let result = list_sessions(srv, params);
-            send(
-                &srv.out_tx,
-                Response::new(id, Ok::<Value, AcpError>(result)),
-            );
+            send(srv.reply(), Response::new(id, Ok::<Value, AcpError>(result)));
             return;
         }
         REWIND_METHOD => {
@@ -688,7 +819,7 @@ async fn handle_request(
                 return;
             }
             let result = rewind_session(srv, raw).await;
-            send(&srv.out_tx, Response::new(id, result));
+            send(srv.reply(), Response::new(id, result));
             return;
         }
         THEME_METHOD => {
@@ -703,7 +834,7 @@ async fn handle_request(
                     .map_err(|error| AcpError::new(INVALID_THEME_CODE, error)),
                 Err(error) => Err(error),
             };
-            send(&srv.out_tx, Response::new(id, result));
+            send(srv.reply(), Response::new(id, result));
             return;
         }
         COMPLETE_METHOD => {
@@ -712,10 +843,7 @@ async fn handle_request(
                 return;
             }
             let result = complete_arguments(srv, raw).await;
-            send(
-                &srv.out_tx,
-                Response::new(id, Ok::<Value, AcpError>(result)),
-            );
+            send(srv.reply(), Response::new(id, Ok::<Value, AcpError>(result)));
             return;
         }
         _ => Err(AcpError::method_not_found()),
@@ -814,7 +942,8 @@ async fn new_session(
         rollback_install(handle, mcp, None).await;
         return Err(AcpError::new(attach::BUSY_CODE, attach::BUSY_MESSAGE));
     }
-    srv.taps.ensure(&session_id);
+    srv.taps.register(&session_id, Arc::clone(&srv.own_tap));
+    srv.own_tap.set_controller(srv.wire.clone());
     let spec = params.model.spec();
     let persisted_options = Default::default();
     let snapshot = install_session(
@@ -882,7 +1011,8 @@ async fn load_session(
     if !srv.taps.claim(&sid.0) {
         return Err(AcpError::new(attach::BUSY_CODE, attach::BUSY_MESSAGE));
     }
-    srv.taps.ensure(&sid.0);
+    srv.taps.register(&sid.0, Arc::clone(&srv.own_tap));
+    srv.own_tap.set_controller(srv.wire.clone());
     let home = maki_storage::paths::home();
     let recorded_model = match params.providers.model(&restored.model) {
         Ok(model) if params.model_policy.allows(&model.spec()) => model,
@@ -1153,6 +1283,7 @@ async fn close_session(srv: &mut Server) {
     let session_id = state.handle.session_id.to_string();
     srv.taps.remove(&session_id);
     srv.taps.release(&session_id);
+    srv.own_tap.clear_controller();
     srv.lua_event_handle.clear_orchestration_services();
     // The event pump dies with the session, so the requests it owed answers to
     // have to be answered here or the client waits on them forever.
@@ -4004,10 +4135,12 @@ mod tests {
             ),
         );
         let server = Server {
+            wire: out_tx.clone(),
             out_tx: out_tx.clone(),
-            wire: flume::unbounded::<Value>().0,
             taps: Arc::default(),
             attached: None,
+            own_tap: Arc::default(),
+            origin: None,
             catalog: ModelCatalog::default(),
             session: Some(SessionState {
                 option_projection: Some(Arc::new(OptionProjection {
@@ -4063,10 +4196,12 @@ mod tests {
             let params = test_params(spec_providers().model(OFFLINE_SPEC).unwrap(), state_path);
             let (out_tx, _) = flume::unbounded();
             let mut srv = Server {
+                wire: out_tx.clone(),
                 out_tx,
-                wire: flume::unbounded::<Value>().0,
                 taps: Arc::default(),
                 attached: None,
+                own_tap: Arc::default(),
+                origin: None,
                 catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
@@ -4132,10 +4267,12 @@ mod tests {
             );
             let (out_tx, _) = flume::unbounded();
             let mut srv = Server {
+                wire: out_tx.clone(),
                 out_tx,
-                wire: flume::unbounded::<Value>().0,
                 taps: Arc::default(),
                 attached: None,
+                own_tap: Arc::default(),
+                origin: None,
                 catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
@@ -4696,10 +4833,12 @@ mod tests {
             params.lua_event_handle = host.event_handle();
             let (out_tx, _out_rx) = flume::unbounded();
             let mut srv = Server {
+                wire: out_tx.clone(),
                 out_tx,
-                wire: flume::unbounded::<Value>().0,
                 taps: Arc::default(),
                 attached: None,
+                own_tap: Arc::default(),
+                origin: None,
                 catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
@@ -4767,10 +4906,12 @@ mod tests {
             let params = test_params(test_model(SPAWN_TEST_SPEC), cwd.path().to_path_buf());
             let (out_tx, _out_rx) = flume::unbounded();
             let mut srv = Server {
+                wire: out_tx.clone(),
                 out_tx,
-                wire: flume::unbounded::<Value>().0,
                 taps: Arc::default(),
                 attached: None,
+                own_tap: Arc::default(),
+                origin: None,
                 catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
@@ -7889,10 +8030,12 @@ mod tests {
             });
             let (out_tx, _out_rx) = flume::unbounded();
             let mut srv = Server {
+                wire: out_tx.clone(),
                 out_tx,
-                wire: flume::unbounded::<Value>().0,
                 taps: Arc::default(),
                 attached: None,
+                own_tap: Arc::default(),
+                origin: None,
                 catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
@@ -7935,10 +8078,12 @@ mod tests {
             );
             let (out_tx, out_rx) = flume::unbounded();
             let mut srv = Server {
+                wire: out_tx.clone(),
                 out_tx,
-                wire: flume::unbounded::<Value>().0,
                 taps: Arc::default(),
                 attached: None,
+                own_tap: Arc::default(),
+                origin: None,
                 catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,

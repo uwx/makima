@@ -79,7 +79,23 @@ Makima first replays what the session already emitted, as the same `session/upda
 
 `replayed` counts the updates sent before the reply, and `truncated` says the oldest ones were dropped because the session ran past the recording limit. Several connections can watch one session.
 
-A watching connection cannot write: `session/prompt`, `session/new`, `session/load`, `session/set_mode`, `session/set_config_option` and `maki/rewind` answer with error code `-32010`. It can still initialize, switch themes and complete arguments.
+A watching connection that does not hold control cannot write: `session/prompt`, `session/new`, `session/load`, `session/set_mode`, `session/set_config_option` and `maki/rewind` answer with error code `-32010`. It can still initialize, list sessions, switch themes and complete arguments.
+
+### Taking control
+
+The connection that created or loaded the session controls it at first. To move control, any connection sends `maki/take_control`, and the reply says whether it now holds it:
+
+```json
+{"controller":true}
+```
+
+Only an idle session changes hands. While a turn runs or a permission question is open, the request answers `-32012`, so no request is left without the connection that asked for it. The connection that loses control receives a notification:
+
+```json
+{"method":"maki/ui/control","params":{"controller":false}}
+```
+
+The controller prompts, cancels, answers permission questions and rewinds. The owning connection can take control back the same way.
 
 The recording follows the session, not the connection: when the owner rewinds, watchers receive `maki/ui/rewind` and the recording starts over from the rewound transcript. When the owning connection ends, the session ends and watchers lose it.
 
