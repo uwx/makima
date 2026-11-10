@@ -4,6 +4,7 @@ pub mod elicitation;
 pub mod methods;
 pub mod permissions;
 pub mod server;
+pub mod share;
 pub mod translate;
 pub mod ui;
 

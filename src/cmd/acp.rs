@@ -14,7 +14,6 @@ use maki_storage::StateDir;
 
 use crate::setup;
 
-const LAN_TOKEN_ENV: &str = "MAKIMA_LAN_TOKEN";
 
 /// The CLI theme store: the desktop switches themes through it, so the TUI and
 /// the next run agree.
@@ -196,11 +195,5 @@ pub fn run(
 /// The token a TCP client must present: `--token`, then `MAKIMA_LAN_TOKEN`,
 /// then the one stored for this machine, generated on first use.
 fn lan_token(storage: &StateDir) -> Result<String> {
-    if let Ok(token) = std::env::var(LAN_TOKEN_ENV) {
-        let token = token.trim();
-        if !token.is_empty() {
-            return Ok(token.to_owned());
-        }
-    }
-    maki_storage::lan::token(storage.path()).context("read the LAN token")
+    maki_acp::share::token(storage.path()).context("read the LAN token")
 }

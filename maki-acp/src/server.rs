@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::iter;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -57,6 +57,8 @@ use serde_json::{Value, json};
 use smol::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use smol::net::TcpListener;
 use tracing::{debug, info, warn};
+
+use crate::share;
 
 use crate::attach::{self, SessionTap, Taps};
 use crate::ui::{COMPLETE_METHOD, REWOUND_METHOD, UI_CAPABILITY_PATH, UiBridge};
@@ -312,6 +314,36 @@ struct Server {
     dispatch: Option<PendingDispatch>,
 }
 
+/// The executor a process serves its connections on, so a running session can
+/// start tasks of its own.
+type Local = Rc<smol::LocalExecutor<'static>>;
+
+/// What a connection shares with the tasks it starts: the process parameters,
+/// the executor that runs them, and the listener it opened for other machines.
+struct Host {
+    params: Rc<AcpParams>,
+    executor: Local,
+    share: Option<Share>,
+}
+
+/// A listener this connection opened so other machines can watch its session.
+struct Share {
+    bound: SocketAddr,
+    token: Arc<str>,
+    stop: Sender<()>,
+}
+
+impl Share {
+    fn reply(&self) -> Value {
+        json!({
+            "bind": self.bound.to_string(),
+            "address": share::reachable(self.bound).to_string(),
+            "link": share::link(self.bound),
+            "token": &*self.token,
+        })
+    }
+}
+
 struct PendingDispatch {
     /// The prompt's own operation; `None` while it dispatches beside a
     /// running turn its message may join.
@@ -371,7 +403,20 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let input = smol::io::BufReader::new(smol::Unblock::new(std::io::stdin()));
     let output = smol::Unblock::new(std::io::stdout());
     let taps = Arc::new(Taps::default());
-    serve_connection(&params, &taps, input, output).await
+    let executor = local_executor();
+    executor
+        .run(serve_connection(
+            Rc::new(params),
+            &taps,
+            Local::clone(&executor),
+            input,
+            output,
+        ))
+        .await
+}
+
+fn local_executor() -> Local {
+    Rc::new(smol::LocalExecutor::new())
 }
 
 /// ACP over TCP only, one connection at a time. Each connection owns its
@@ -383,14 +428,20 @@ pub async fn serve_tcp(
 ) -> color_eyre::Result<()> {
     let listener = TcpListener::bind(listen).await?;
     info!(address = %listener.local_addr()?, "ACP listening over TCP");
-    let params = Rc::new(params);
-    let taps: Arc<Taps> = Arc::default();
-    let token: Arc<str> = Arc::from(token);
     // One thread serves every connection, so attaching costs no thread and
-    // `AcpParams` need not be `Sync`.
-    let executor = smol::LocalExecutor::new();
+    // `AcpParams` need not be `Sync`. Nothing ever stops this listener, so its
+    // stop signal is held for as long as the process lives.
+    let (_stop, stopped) = flume::bounded(1);
+    let executor = local_executor();
     executor
-        .run(accept_connections(&executor, listener, params, taps, token))
+        .run(accept_connections(
+            listener,
+            Rc::new(params),
+            Arc::default(),
+            Arc::from(token),
+            Local::clone(&executor),
+            stopped,
+        ))
         .await
 }
 
@@ -409,30 +460,52 @@ pub async fn serve_shared(
     let token: Arc<str> = Arc::from(token);
     let input = smol::io::BufReader::new(smol::Unblock::new(std::io::stdin()));
     let output = smol::Unblock::new(std::io::stdout());
-    let executor = smol::LocalExecutor::new();
+    let (_stop, stopped) = flume::bounded(1);
+    let executor = local_executor();
     // Whichever ends first ends the process: stdio closes when the client
     // goes away, and the listener only ends on an accept failure.
     executor
         .run(smol::future::or(
-            serve_connection(&params, &taps, input, output),
-            accept_connections(&executor, listener, Rc::clone(&params), Arc::clone(&taps), token),
+            serve_connection(Rc::clone(&params), &taps, Local::clone(&executor), input, output),
+            accept_connections(
+                listener,
+                params,
+                Arc::clone(&taps),
+                token,
+                Local::clone(&executor),
+                stopped,
+            ),
         ))
         .await
 }
 
+/// Serves the clients that connect with {token} until {stop} is signalled.
 async fn accept_connections(
-    executor: &smol::LocalExecutor<'_>,
     listener: TcpListener,
     params: Rc<AcpParams>,
     taps: Arc<Taps>,
     token: Arc<str>,
+    executor: Local,
+    stop: Receiver<()>,
 ) -> color_eyre::Result<()> {
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let params = params.clone();
+        let accepted = smol::future::or(
+            async { listener.accept().await.map(Some) },
+            async {
+                stop.recv_async().await.ok();
+                Ok(None)
+            },
+        )
+        .await?;
+        let Some((stream, peer)) = accepted else {
+            return Ok(());
+        };
+        let params = Rc::clone(&params);
         let taps = Arc::clone(&taps);
-        let token = token.clone();
+        let token = Arc::clone(&token);
+        let connection_executor = Local::clone(&executor);
         executor
+            .clone()
             .spawn(async move {
                 let (read_half, write_half) = smol::io::split(stream);
                 let mut reader = smol::io::BufReader::new(read_half);
@@ -449,7 +522,9 @@ async fn accept_connections(
                     }
                 }
                 info!(%peer, "ACP client connected");
-                if let Err(error) = serve_connection(&params, &taps, reader, writer).await {
+                if let Err(error) =
+                    serve_connection(params, &taps, connection_executor, reader, writer).await
+                {
                     warn!(%peer, %error, "ACP connection failed");
                 }
             })
@@ -510,8 +585,9 @@ fn token_matches(given: &str, expected: &str) -> bool {
 /// Runs ACP on a pair of streams until the input ends. Shared by stdio and
 /// TCP, which differ only in the streams and in the handshake before them.
 async fn serve_connection(
-    params: &AcpParams,
+    params: Rc<AcpParams>,
     taps: &Arc<Taps>,
+    executor: Local,
     input: impl AsyncBufRead + Unpin + Send + 'static,
     output: impl AsyncWrite + Unpin + Send + 'static,
 ) -> color_eyre::Result<()> {
@@ -571,9 +647,14 @@ async fn serve_connection(
         dispatch: None,
     };
 
+    let mut host = Host {
+        params,
+        executor,
+        share: None,
+    };
     let _discovery = server.catalog.discover(
-        Arc::clone(&params.model_policy),
-        params.model.provider.to_string(),
+        Arc::clone(&host.params.model_policy),
+        host.params.model.provider.to_string(),
         |_| {},
     );
     let (in_tx, in_rx) = flume::unbounded::<String>();
@@ -604,10 +685,10 @@ async fn serve_connection(
             None => smol::future::or(next_line(), next_remote()).await,
         };
         match step {
-            Step::Line(line) => handle_line(&mut server, &line, params).await,
+            Step::Line(line) => handle_line(&mut server, &line, &mut host).await,
             Step::Remote(request) => {
                 server.origin = Some(request.reply);
-                handle_line(&mut server, &request.message.to_string(), params).await;
+                handle_line(&mut server, &request.message.to_string(), &mut host).await;
                 server.origin = None;
             }
             Step::Dispatched(dispatched) => respond_dispatch(&mut server, dispatched).await,
@@ -628,6 +709,9 @@ async fn serve_connection(
     close_session(&mut server).await;
     if let Some(tap) = server.attached.take() {
         tap.detach(&server.wire);
+    }
+    if let Some(share) = host.share.take() {
+        let _ = share.stop.send(());
     }
     drop(server);
     forward_task.await;
@@ -651,7 +735,7 @@ async fn read_lines(
     }
 }
 
-async fn handle_line(server: &mut Server, line: &str, params: &AcpParams) {
+async fn handle_line(server: &mut Server, line: &str, host: &mut Host) {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return;
@@ -674,7 +758,7 @@ async fn handle_line(server: &mut Server, line: &str, params: &AcpParams) {
         handle_incoming_response(server, &raw);
     } else if let Some(method) = raw.get("method").and_then(Value::as_str) {
         match id {
-            Some(id) => handle_request(server, method, id, &raw, params).await,
+            Some(id) => handle_request(server, method, id, &raw, host).await,
             None => handle_notification(server, method, &raw),
         }
     } else if let Some(id) = id {
@@ -720,6 +804,8 @@ fn handled_locally(raw: &Value) -> bool {
                 | SESSIONS_METHOD
                 | attach::ATTACH_METHOD
                 | attach::LIVE_METHOD
+                | share::SHARE_METHOD
+                | share::UNSHARE_METHOD
         )
     )
 }
@@ -772,6 +858,85 @@ fn take_control(srv: &mut Server) -> Result<Value, AcpError> {
     Ok(json!({ "controller": true }))
 }
 
+/// Listens for other machines, so they can watch a session that is already
+/// running. Answers the same link when it is already open.
+async fn open_share(srv: &mut Server, raw: &Value, host: &mut Host) -> Result<Value, AcpError> {
+    if let Some(share) = &host.share {
+        return Ok(share.reply());
+    }
+    if srv.session.is_none() || srv.attached.is_some() {
+        return Err(AcpError::new(
+            share::NOT_OWNER_CODE,
+            share::NOT_OWNER_MESSAGE,
+        ));
+    }
+    let bind = match raw.pointer("/params/bind").and_then(Value::as_str) {
+        Some(spec) => spec.parse().map_err(|_| AcpError::invalid_params())?,
+        None => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+    };
+    let listener = TcpListener::bind(bind).await.map_err(|error| {
+        AcpError::new(
+            share::SHARE_FAILED_CODE,
+            format!("listen on {bind}: {error}"),
+        )
+    })?;
+    let bound = listener.local_addr().map_err(|error| {
+        AcpError::new(
+            share::SHARE_FAILED_CODE,
+            format!("read the address to share: {error}"),
+        )
+    })?;
+    let token: Arc<str> = share::token(host.params.storage.path())
+        .map_err(|error| {
+            AcpError::new(
+                share::SHARE_FAILED_CODE,
+                format!("read the LAN token: {error}"),
+            )
+        })?
+        .into();
+    let (stop, stopped) = flume::bounded(1);
+    let executor = Local::clone(&host.executor);
+    let params = Rc::clone(&host.params);
+    let taps = Arc::clone(&srv.taps);
+    let listening_token = Arc::clone(&token);
+    let listener_executor = Local::clone(&executor);
+    executor
+        .clone()
+        .spawn(async move {
+            let served = accept_connections(
+                listener,
+                params,
+                taps,
+                listening_token,
+                listener_executor,
+                stopped,
+            )
+            .await;
+            if let Err(error) = served {
+                warn!(%error, "shared ACP listener stopped");
+            }
+        })
+        .detach();
+    let share = Share {
+        bound,
+        token,
+        stop,
+    };
+    let reply = share.reply();
+    info!(address = %bound, link = %share::link(bound), "ACP session shared");
+    host.share = Some(share);
+    Ok(reply)
+}
+
+/// Stops the listener this connection opened, if it opened one.
+fn close_share(host: &mut Host) -> Value {
+    if let Some(share) = host.share.take() {
+        let _ = share.stop.send(());
+        info!(address = %share.bound, "ACP session no longer shared");
+    }
+    json!({ "shared": false })
+}
+
 fn attach_session(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
     let id = raw
         .pointer("/params/sessionId")
@@ -801,8 +966,9 @@ async fn handle_request(
     method: &str,
     id: RequestId,
     raw: &Value,
-    params: &AcpParams,
+    host: &mut Host,
 ) {
+    let params = &host.params;
     // Forwarded requests only arrive from the connection that holds control,
     // so only this connection's own client is checked against it.
     let writes_session = (srv.attached.is_some() || srv.session.is_some()) && srv.origin.is_none();
@@ -847,6 +1013,16 @@ async fn handle_request(
         attach::TAKE_CONTROL_METHOD => {
             let result = take_control(srv);
             send(srv.reply(), Response::new(id, result));
+            return;
+        }
+        share::SHARE_METHOD => {
+            let result = open_share(srv, raw, host).await;
+            send(srv.reply(), Response::new(id, result));
+            return;
+        }
+        share::UNSHARE_METHOD => {
+            let result = close_share(host);
+            send(srv.reply(), Response::new(id, Ok::<Value, AcpError>(result)));
             return;
         }
         "session/prompt" => match start_prompt(srv, raw, &id) {
@@ -3227,6 +3403,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use agent_client_protocol_schema::ErrorCode;
     use maki_agent::{AgentMode, TurnTicket};
     use maki_commands::TargetCapabilities;
     use maki_lua::orchestration::{OrchestrationServices, TurnCompletion};
@@ -3915,6 +4092,15 @@ mod tests {
         let mut request_id = None;
         finish_active_operation(pending, kind, |id| request_id = Some(id));
         request_id
+    }
+
+    /// A connection's host: nothing is shared and the executor is never run.
+    fn test_host(params: AcpParams) -> Host {
+        Host {
+            params: Rc::new(params),
+            executor: Rc::new(smol::LocalExecutor::new()),
+            share: None,
+        }
     }
 
     fn test_params(model: Model, cwd: PathBuf) -> AcpParams {
@@ -5322,10 +5508,10 @@ mod tests {
         smol::block_on(async {
             let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             let old_session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
-            let params = test_params(
+            let mut host = test_host(test_params(
                 spec_providers().model(OFFLINE_SPEC).unwrap(),
                 PathBuf::from("/project"),
-            );
+            ));
             handle_prompt(
                 &mut srv,
                 &prompt_request(&old_session_id, "first", false),
@@ -5344,7 +5530,7 @@ mod tests {
                     "params": { "sessionId": old_session_id }
                 })
                 .to_string(),
-                &params,
+                &mut host,
             )
             .await;
             handle_line(
@@ -5359,7 +5545,7 @@ mod tests {
                     }
                 })
                 .to_string(),
-                &params,
+                &mut host,
             )
             .await;
             let rejected = out_rx.recv_async().await.unwrap();
@@ -5373,10 +5559,10 @@ mod tests {
             turns.assert_cancelled(&first).await;
 
             let cwd = TempDir::new().unwrap();
-            let params = test_params(
+            let mut host = test_host(test_params(
                 spec_providers().model(OFFLINE_SPEC).unwrap(),
                 cwd.path().to_owned(),
-            );
+            ));
             handle_line(
                 &mut srv,
                 &serde_json::json!({
@@ -5386,7 +5572,7 @@ mod tests {
                     "params": { "cwd": cwd.path(), "mcpServers": [] }
                 })
                 .to_string(),
-                &params,
+                &mut host,
             )
             .await;
 
@@ -7274,7 +7460,7 @@ mod tests {
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
             let model = test_model(SPAWN_TEST_SPEC);
-            let params = test_params(model, cwd.clone());
+            let mut host = test_host(test_params(model, cwd.clone()));
             let request = serde_json::json!({
                 "params": { "cwd": cwd, "mcpServers": [] }
             });
@@ -7284,7 +7470,7 @@ mod tests {
                 "session/new",
                 RequestId::Number(82),
                 &request,
-                &params,
+                &mut host,
             )
             .await;
             let new_response = out_rx.recv_async().await.unwrap();
@@ -7327,7 +7513,7 @@ mod tests {
                 "session/prompt",
                 RequestId::Number(83),
                 &prompt_request(&session_id, "immediate prompt", false),
-                &params,
+                &mut host,
             )
             .await;
 
@@ -7364,6 +7550,7 @@ mod tests {
             assert_ne!(model.context_window, DISCOVERED_WINDOW);
             let mut params = test_params(model, cwd.clone());
             params.providers = Arc::clone(&providers);
+            let mut host = test_host(params);
             srv.catalog =
                 ModelCatalog::offline(Arc::clone(&providers), &maki_config::ModelPolicy::default());
             handle_request(
@@ -7371,7 +7558,7 @@ mod tests {
                 "session/new",
                 RequestId::Number(NEW_SESSION_REQUEST),
                 &serde_json::json!({ "params": { "cwd": cwd, "mcpServers": [] } }),
-                &params,
+                &mut host,
             )
             .await;
             assert_eq!(
@@ -8480,6 +8667,52 @@ mod tests {
             };
             let call = &request["params"]["toolCall"];
             assert_eq!(call["rawInput"]["content"], "new text");
+        });
+    }
+
+    #[test]
+    fn sharing_a_running_session_answers_a_link_and_keeps_it() {
+        smol::block_on(async {
+            let (mut srv, _, _, _) = server_awaiting_answer();
+            let state = TempDir::new().unwrap();
+            let mut host = test_host(test_params(
+                test_model(SPAWN_TEST_SPEC),
+                state.path().to_owned(),
+            ));
+            let ask = serde_json::json!({ "params": { "bind": "127.0.0.1:0" } });
+
+            let first = open_share(&mut srv, &ask, &mut host).await.unwrap();
+            let link = first["link"].as_str().unwrap().to_owned();
+            assert!(link.starts_with(share::LINK_SCHEME), "{link}");
+            assert_eq!(first["token"].as_str().unwrap().len(), 32);
+            assert_eq!(
+                maki_storage::lan::token(state.path()).unwrap(),
+                first["token"].as_str().unwrap()
+            );
+
+            let again = open_share(&mut srv, &ask, &mut host).await.unwrap();
+            assert_eq!(again["link"], first["link"]);
+
+            assert_eq!(close_share(&mut host), json!({ "shared": false }));
+            assert!(host.share.is_none());
+        });
+    }
+
+    #[test]
+    fn a_watching_connection_cannot_share_the_session_it_watches() {
+        smol::block_on(async {
+            let (mut srv, _, _, _) = server_awaiting_answer();
+            let mut host = test_host(test_params(
+                test_model(SPAWN_TEST_SPEC),
+                PathBuf::from("/project"),
+            ));
+            srv.attached = Some(Arc::default());
+
+            let refused = open_share(&mut srv, &json!({}), &mut host).await;
+            let error = refused.unwrap_err();
+            assert_eq!(error.code, ErrorCode::Other(share::NOT_OWNER_CODE));
+            assert_eq!(error.message, share::NOT_OWNER_MESSAGE);
+            assert!(host.share.is_none());
         });
     }
 }
