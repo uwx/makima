@@ -5425,6 +5425,9 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-mobile",
  "log",
+ "maki-acp-client",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
