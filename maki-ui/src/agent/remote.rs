@@ -62,6 +62,13 @@ impl AcpBackend {
     /// A watched session belongs to whoever controls it. Prompting is the
     /// explicit act that claims it, and a refusal is reported as the turn's
     /// failure instead of being silently retried.
+    /// Updates the agent sent before this window started a turn: the replay of
+    /// an attached session's history. The transcript here starts at the first
+    /// turn, so they are dropped rather than interleaved into it.
+    fn discard_replay(&self) {
+        while self.events.try_recv().is_ok() {}
+    }
+
     fn claim(&self) -> Result<(), String> {
         if !self.read_only.load(Ordering::Acquire) {
             return Ok(());
@@ -114,6 +121,7 @@ impl ActorBackend for AcpBackend {
                     },
                 ));
             }
+            self.discard_replay();
             let blocks = blocks(&input);
             let answers = self
                 .answers

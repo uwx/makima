@@ -366,9 +366,12 @@ pub fn run(
 
     let can_ask =
         !cli.print && !cli.is_sdk_mode() && io::stdin().is_terminal() && io::stderr().is_terminal();
-    let mut notice = remote
-        .as_ref()
-        .map(|remote| format!("attached to {}", remote.label));
+    let mut notice = remote.as_ref().map(|remote| {
+        format!(
+            "attached to {} (its earlier messages stay on the machine that runs it)",
+            remote.label
+        )
+    });
     let answer = trust.state.unanswered().and_then(|question| {
         policy_grant(question, &stack.config.trust)
             .map(|pattern| {

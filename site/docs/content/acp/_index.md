@@ -135,7 +135,7 @@ makima attach lan://192.168.2.4:60667 --token my-token
 makima attach 192.168.2.4:60667 --plain # line rendering instead
 ```
 
-With no link it waits a few seconds and lists the announced sessions to choose from. The window replays the chosen session and then follows it: the chat renders the streamed text, thinking and tool calls, and permissions get the usual prompt. Each turn is a `session/prompt` sent to the machine that runs the agent, so the model, the tools and the files all stay there. Prompting a session you only watch takes control of it.
+With no link it waits a few seconds and lists the announced sessions to choose from. The chat then shows the turn you start: streamed text, thinking, tool calls, and the usual permission prompt. Each turn is a `session/prompt` sent to the machine that runs the agent, so the model, the tools and the files all stay there, and prompting a session you only watch takes control of it. Messages from before you attached stay on that machine; `--plain` prints them in line mode.
 
 `--plain` keeps the line renderer for a terminal that cannot take the full screen, which is also what a pipe gets. There the session is watched read only until you type `/take`; `/cancel` stops a turn, `/quit` leaves, tool calls print as `→ title` and `✓ title`, and permissions and pickers take a number.
 
