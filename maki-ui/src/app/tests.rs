@@ -6100,6 +6100,23 @@ fn clears_queue_focus_on_terminate(setup: fn() -> App, terminate: fn(&mut App)) 
 }
 
 #[test]
+fn a_turn_the_app_never_adopted_takes_over_the_run() {
+    let (mut app, _rx) = running_root_app();
+    let live = root_actor(&app).reserve_presentation(app.run_id);
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::TextDelta {
+            text: "live".into(),
+        },
+        live,
+    ));
+
+    assert_eq!(app.run_id, live);
+    app.main_chat().flush();
+    assert_eq!(app.main_chat().last_message_text(), "live");
+}
+
+#[test]
 fn stale_events_ignored_after_run_id_increment() {
     let mut app = streaming_app();
 

@@ -2611,15 +2611,17 @@ impl App {
         vec![Action::CancelAgent { turn_id, run_id }]
     }
 
+    /// Follow the run the actor is actually in. A turn can start without the
+    /// app hearing of it, and every event it sends is then fenced off as stale
+    /// while the status stays `Streaming`: no tokens, no tool rows, and a
+    /// spinner that never stops. The actor's own counter is the authority on
+    /// what is live, so any root work stamped past the app's run id takes over
+    /// the run. Work from before it is still dropped.
     pub(crate) fn adopt_actor_presentation(&mut self, envelope: &Envelope) {
         let Some(presentation) = envelope.presentation() else {
             return;
         };
         if envelope.subagent.is_none()
-            && matches!(
-                envelope.event,
-                AgentEvent::QueueItemConsumed { .. } | AgentEvent::ModelSwitched { .. }
-            )
             && presentation > self.run_id
             && self.queue.accepts_actor_presentation(presentation)
         {
