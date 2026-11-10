@@ -114,3 +114,12 @@ pub fn run_tcp(
 ) -> color_eyre::Result<()> {
     smol::block_on(server::serve_tcp(params, listen, token))
 }
+
+/// Serves ACP over stdio and shares the same session over TCP at {listen}.
+pub fn run_shared(
+    params: AcpParams,
+    listen: std::net::SocketAddr,
+    token: String,
+) -> color_eyre::Result<()> {
+    smol::block_on(server::serve_shared(params, listen, token))
+}

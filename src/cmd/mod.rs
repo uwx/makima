@@ -115,6 +115,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             yolo,
             automode,
             listen,
+            share,
             token,
         }) => {
             acp::run(
@@ -128,6 +129,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 cli.append_system_prompt,
                 trust_mode,
                 listen,
+                share,
                 token,
             )?;
         }

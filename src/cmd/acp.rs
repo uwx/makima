@@ -56,18 +56,23 @@ pub fn run(
     append_system_prompt: Option<String>,
     trust_mode: TrustMode,
     listen: Option<SocketAddr>,
+    share: Option<SocketAddr>,
     token: Option<String>,
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
-    let lan = listen
-        .map(|listen| -> Result<(SocketAddr, String)> {
-            let token = match token {
-                Some(token) => token,
-                None => lan_token(&storage)?,
-            };
-            Ok((listen, token))
-        })
-        .transpose()?;
+    let lan = match (listen, share) {
+        (Some(address), _) => Some((address, false)),
+        (None, Some(address)) => Some((address, true)),
+        (None, None) => None,
+    }
+    .map(|(address, shared)| -> Result<(SocketAddr, bool, String)> {
+        let token = match token {
+            Some(token) => token,
+            None => lan_token(&storage)?,
+        };
+        Ok((address, shared, token))
+    })
+    .transpose()?;
     maki_providers::model_registry::load_from_storage(&storage);
     let _instance = maki_storage::instances::InstanceGuard::register(
         &storage,
@@ -176,9 +181,13 @@ pub fn run(
     };
     drop(standard_commands);
     match lan {
-        Some((listen, token)) => {
-            eprintln!("ACP listening on {listen}; LAN token: {token}");
-            maki_acp::run_tcp(params, listen, token)
+        Some((address, shared, token)) => {
+            eprintln!("ACP listening on {address}; LAN token: {token}");
+            if shared {
+                maki_acp::run_shared(params, address, token)
+            } else {
+                maki_acp::run_tcp(params, address, token)
+            }
         }
         None => maki_acp::run(params),
     }

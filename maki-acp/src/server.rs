@@ -374,9 +374,8 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     serve_connection(&params, &taps, input, output).await
 }
 
-/// ACP over TCP, one connection at a time. Each connection owns its session,
-/// like a stdio agent does, and must open with the handshake, so a client that
-/// cannot name the token never reaches the agent.
+/// ACP over TCP only, one connection at a time. Each connection owns its
+/// session, like a stdio agent does, and must open with the handshake.
 pub async fn serve_tcp(
     params: AcpParams,
     listen: SocketAddr,
@@ -384,44 +383,78 @@ pub async fn serve_tcp(
 ) -> color_eyre::Result<()> {
     let listener = TcpListener::bind(listen).await?;
     info!(address = %listener.local_addr()?, "ACP listening over TCP");
-    let token: Arc<str> = Arc::from(token);
     let params = Rc::new(params);
     let taps: Arc<Taps> = Arc::default();
+    let token: Arc<str> = Arc::from(token);
     // One thread serves every connection, so attaching costs no thread and
     // `AcpParams` need not be `Sync`.
     let executor = smol::LocalExecutor::new();
     executor
-        .run(async {
-            loop {
-                let (stream, peer) = listener.accept().await?;
-                let params = Rc::clone(&params);
-                let taps = Arc::clone(&taps);
-                let token = Arc::clone(&token);
-                executor
-                    .spawn(async move {
-                        let (read_half, write_half) = smol::io::split(stream);
-                        let mut reader = smol::io::BufReader::new(read_half);
-                        let mut writer = write_half;
-                        match handshake(&mut reader, &mut writer, &token).await {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                warn!(%peer, "ACP client rejected: wrong or missing LAN token");
-                                return;
-                            }
-                            Err(error) => {
-                                debug!(%peer, %error, "ACP handshake failed");
-                                return;
-                            }
-                        }
-                        info!(%peer, "ACP client connected");
-                        if let Err(error) = serve_connection(&params, &taps, reader, writer).await {
-                            warn!(%peer, %error, "ACP connection failed");
-                        }
-                    })
-                    .detach();
-            }
-        })
+        .run(accept_connections(&executor, listener, params, taps, token))
         .await
+}
+
+/// ACP over stdio and TCP at once: this process owns the session, and clients
+/// that know the token may watch it. Ends when stdio does, because the session
+/// lives in that connection.
+pub async fn serve_shared(
+    params: AcpParams,
+    listen: SocketAddr,
+    token: String,
+) -> color_eyre::Result<()> {
+    let listener = TcpListener::bind(listen).await?;
+    info!(address = %listener.local_addr()?, "ACP sharing this session over TCP");
+    let params = Rc::new(params);
+    let taps: Arc<Taps> = Arc::default();
+    let token: Arc<str> = Arc::from(token);
+    let input = smol::io::BufReader::new(smol::Unblock::new(std::io::stdin()));
+    let output = smol::Unblock::new(std::io::stdout());
+    let executor = smol::LocalExecutor::new();
+    // Whichever ends first ends the process: stdio closes when the client
+    // goes away, and the listener only ends on an accept failure.
+    executor
+        .run(smol::future::or(
+            serve_connection(&params, &taps, input, output),
+            accept_connections(&executor, listener, Rc::clone(&params), Arc::clone(&taps), token),
+        ))
+        .await
+}
+
+async fn accept_connections(
+    executor: &smol::LocalExecutor<'_>,
+    listener: TcpListener,
+    params: Rc<AcpParams>,
+    taps: Arc<Taps>,
+    token: Arc<str>,
+) -> color_eyre::Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let params = params.clone();
+        let taps = Arc::clone(&taps);
+        let token = token.clone();
+        executor
+            .spawn(async move {
+                let (read_half, write_half) = smol::io::split(stream);
+                let mut reader = smol::io::BufReader::new(read_half);
+                let mut writer = write_half;
+                match handshake(&mut reader, &mut writer, &token).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!(%peer, "ACP client rejected: wrong or missing LAN token");
+                        return;
+                    }
+                    Err(error) => {
+                        debug!(%peer, %error, "ACP handshake failed");
+                        return;
+                    }
+                }
+                info!(%peer, "ACP client connected");
+                if let Err(error) = serve_connection(&params, &taps, reader, writer).await {
+                    warn!(%peer, %error, "ACP connection failed");
+                }
+            })
+            .detach();
+    }
 }
 
 /// Checks the opening line of a TCP connection against {token}, answering

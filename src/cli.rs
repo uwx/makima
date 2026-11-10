@@ -270,9 +270,12 @@ pub enum Command {
         /// Gate every bash command through the auto-mode classifier
         #[arg(long)]
         automode: bool,
-        /// Serve ACP over TCP at this address instead of stdio, like 0.0.0.0:7331
-        #[arg(long, value_name = "ADDR")]
+        /// Serve ACP over TCP only at this address, like 0.0.0.0:7331
+        #[arg(long, value_name = "ADDR", conflicts_with = "share")]
         listen: Option<SocketAddr>,
+        /// Keep serving stdio and share that same session over TCP, like 0.0.0.0:7331
+        #[arg(long, value_name = "ADDR")]
+        share: Option<SocketAddr>,
         /// Token TCP clients must present. Defaults to $MAKIMA_LAN_TOKEN, then the stored token
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
