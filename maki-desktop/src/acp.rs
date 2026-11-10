@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::net::TcpStream;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,11 @@ const AGENT_ENV: &str = "MAKI_DESKTOP_AGENT";
 const REMOTE_ENV: &str = "MAKI_DESKTOP_REMOTE";
 const MODEL_ENV: &str = "MAKI_DESKTOP_MODEL";
 const DEFAULT_AGENT: &str = "makima";
+const LAN_SCHEME: &str = "lan://";
+const LAN_TOKEN_ENV: &str = "MAKI_DESKTOP_LAN_TOKEN";
+const LAN_KIND: &str = "lan";
+const LAN_VERSION: u64 = 1;
+const LAN_TIMEOUT: Duration = Duration::from_secs(10);
 const ACP_SUBCOMMAND: &str = "acp";
 const MODEL_FLAG: &str = "--model";
 const SSH_PROGRAM: &str = "ssh";
@@ -259,13 +265,20 @@ pub fn diff_text(content: &[ToolCallContent]) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Where the ACP agent lives: a local process or an SSH connection.
+/// Where the ACP agent lives: a local process, an SSH connection, or an agent
+/// another machine shares over the LAN.
 pub struct Target {
     label: String,
     program: String,
     args: Vec<String>,
     process_cwd: Option<PathBuf>,
     session_cwd: PathBuf,
+    lan: Option<Lan>,
+}
+
+struct Lan {
+    address: String,
+    token: String,
 }
 
 impl Target {
@@ -275,6 +288,10 @@ impl Target {
         let agent = std::env::var(AGENT_ENV).unwrap_or_else(|_| DEFAULT_AGENT.to_owned());
         let model = std::env::var(MODEL_ENV).ok();
         match std::env::var(REMOTE_ENV) {
+            Ok(remote) if remote.trim().starts_with(LAN_SCHEME) => {
+                let token = std::env::var(LAN_TOKEN_ENV).ok();
+                Self::lan(remote.trim(), token.as_deref())
+            }
             Ok(remote) if !remote.trim().is_empty() => {
                 Self::remote(remote.trim(), &agent, model.as_deref())
             }
@@ -299,7 +316,37 @@ impl Target {
             args,
             process_cwd: Some(cwd.clone()),
             session_cwd: cwd,
+            lan: None,
         }
+    }
+
+    /// `lan://host:port:/absolute/path`: the session runs on the machine that
+    /// shares it, so the path is that machine's.
+    fn lan(spec: &str, token: Option<&str>) -> Result<Self, String> {
+        let rest = spec
+            .strip_prefix(LAN_SCHEME)
+            .ok_or_else(|| format!("{LAN_SCHEME} expected, got {spec:?}"))?;
+        let (address, path) = rest
+            .split_once(":/")
+            .filter(|(address, path)| !address.is_empty() && !path.is_empty())
+            .ok_or_else(|| {
+                format!("{REMOTE_ENV} must be {LAN_SCHEME}host:port:/absolute/path, got {spec:?}")
+            })?;
+        let token = token
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| format!("{LAN_TOKEN_ENV} must hold the token the listener printed"))?;
+        Ok(Self {
+            label: spec.to_owned(),
+            program: String::new(),
+            args: Vec::new(),
+            process_cwd: None,
+            session_cwd: PathBuf::from(format!("/{path}")),
+            lan: Some(Lan {
+                address: address.to_owned(),
+                token: token.to_owned(),
+            }),
+        })
     }
 
     fn remote(spec: &str, agent: &str, model: Option<&str>) -> Result<Self, String> {
@@ -325,7 +372,38 @@ impl Target {
             args: vec![host.to_owned(), remote_command],
             process_cwd: None,
             session_cwd: path,
+            lan: None,
         })
+    }
+
+    /// The agent's input and output, plus the child to reap when there is one.
+    fn open(&self) -> Result<(Reader, Writer, Option<Child>), String> {
+        if let Some(lan) = &self.lan {
+            let mut stream = TcpStream::connect(&lan.address)
+                .map_err(|error| format!("connect to {} over the LAN: {error}", lan.address))?;
+            stream.set_read_timeout(Some(LAN_TIMEOUT)).map_err(|error| {
+                format!("set the LAN connect timeout for {}: {error}", lan.address)
+            })?;
+            let _ = stream.set_nodelay(true);
+            handshake(&mut stream, &lan.token)?;
+            stream
+                .set_read_timeout(None)
+                .map_err(|error| format!("clear the LAN connect timeout: {error}"))?;
+            let reader = stream
+                .try_clone()
+                .map_err(|error| format!("split the LAN stream: {error}"))?;
+            return Ok((Box::new(reader), Box::new(stream), None));
+        }
+        let mut child = self.spawn()?;
+        let writer = child
+            .stdin
+            .take()
+            .ok_or_else(|| "agent has no stdin".to_owned())?;
+        let reader = child
+            .stdout
+            .take()
+            .ok_or_else(|| "agent has no stdout".to_owned())?;
+        Ok((Box::new(reader), Box::new(writer), Some(child)))
     }
 
     fn spawn(&self) -> Result<Child, String> {
@@ -346,6 +424,9 @@ impl Target {
     }
 }
 
+type Reader = Box<dyn Read + Send>;
+type Writer = Box<dyn Write + Send>;
+
 pub struct Connection {
     pub client: Arc<Client>,
     pub options: SessionView,
@@ -356,15 +437,7 @@ pub struct Connection {
 }
 
 pub fn connect(target: &Target) -> Result<Connection, String> {
-    let mut child = target.spawn()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "agent has no stdin".to_owned())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "agent has no stdout".to_owned())?;
+    let (reader, writer, child) = target.open()?;
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let (events_tx, events_rx) = flume::unbounded::<Event>();
@@ -376,14 +449,16 @@ pub fn connect(target: &Target) -> Result<Connection, String> {
         session: Mutex::new(None),
     });
 
-    spawn_writer(stdin, out_rx)?;
-    spawn_reader(stdout, Arc::downgrade(&client))?;
-    thread::Builder::new()
-        .name("acp-wait".into())
-        .spawn(move || {
-            let _ = child.wait();
-        })
-        .map_err(|error| format!("start agent waiter: {error}"))?;
+    spawn_writer(writer, out_rx)?;
+    spawn_reader(reader, Arc::downgrade(&client))?;
+    if let Some(mut child) = child {
+        thread::Builder::new()
+            .name("acp-wait".into())
+            .spawn(move || {
+                let _ = child.wait();
+            })
+            .map_err(|error| format!("start agent waiter: {error}"))?;
+    }
 
     let themes = client.initialize()?;
     let (session, model, options) = client.new_session(target.session_cwd())?;
@@ -395,6 +470,41 @@ pub fn connect(target: &Target) -> Result<Connection, String> {
         options,
         themes,
     })
+}
+
+/// Opens a shared session: the listener answers with `ok`, and anything else
+/// means it will not serve this token.
+fn handshake(stream: &mut TcpStream, token: &str) -> Result<(), String> {
+    let mut line = json!({ "maki": LAN_KIND, "version": LAN_VERSION, "token": token }).to_string();
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|error| format!("send the LAN handshake: {error}"))?;
+    let reply = read_line(stream)?;
+    let reply: Value =
+        serde_json::from_str(&reply).map_err(|error| format!("decode the LAN handshake: {error}"))?;
+    if reply["ok"] != true {
+        let reason = reply["error"].as_str().unwrap_or("no reason given");
+        return Err(format!("LAN handshake refused: {reason}"));
+    }
+    Ok(())
+}
+
+/// Reads one line without buffering past it, so the same stream can be handed
+/// to the reader thread afterwards.
+fn read_line(stream: &mut TcpStream) -> Result<String, String> {
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => line.push(byte[0]),
+            Err(error) => return Err(format!("read the LAN handshake: {error}")),
+        }
+    }
+    String::from_utf8(line).map_err(|error| format!("decode the LAN handshake: {error}"))
 }
 
 fn spawn_writer(
@@ -979,5 +1089,73 @@ old
     #[test_case("buildbox:relative/path" ; "path not absolute")]
     fn remote_rejects_malformed_spec(spec: &str) {
         assert!(Target::remote(spec, "makima", None).is_err());
+    }
+
+    #[test]
+    fn lan_target_keeps_the_address_and_the_remote_directory() {
+        let target = Target::lan("lan://buildbox:7331:/srv/app", Some("token")).unwrap();
+        assert_eq!(target.label(), "lan://buildbox:7331:/srv/app");
+        assert_eq!(target.session_cwd(), Path::new("/srv/app"));
+        assert!(target.lan.is_some());
+    }
+
+    #[test_case("lan://buildbox" ; "missing directory")]
+    #[test_case("lan://:/srv/app" ; "missing address")]
+    fn lan_rejects_malformed_spec(spec: &str) {
+        assert!(Target::lan(spec, Some("token")).is_err());
+    }
+
+    #[test]
+    fn lan_requires_a_token() {
+        assert!(Target::lan("lan://buildbox:7331:/srv/app", None).is_err());
+        assert!(Target::lan("lan://buildbox:7331:/srv/app", Some(" ")).is_err());
+    }
+
+    #[test]
+    fn lan_connect_handshakes_and_opens_a_session() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        use agent_client_protocol_schema::{NewSessionResponse, SessionId};
+        use serde_json::{Value, json};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let handshake: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(handshake["token"], "token");
+            stream
+                .write_all(b"{\"maki\":\"lan\",\"version\":1,\"ok\":true}\n")
+                .unwrap();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(line.trim()).unwrap();
+                let result = match request["method"].as_str() {
+                    Some("initialize") => json!({ "protocolVersion": 1 }),
+                    Some("session/new") => serde_json::to_value(NewSessionResponse::new(
+                        SessionId::new("sess-lan"),
+                    ))
+                    .unwrap(),
+                    _ => continue,
+                };
+                let reply = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result });
+                stream.write_all(reply.to_string().as_bytes()).unwrap();
+                stream.write_all(b"\n").unwrap();
+                if request["method"] == "session/new" {
+                    break;
+                }
+            }
+        });
+        let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
+        let connection = super::connect(&target).unwrap();
+        assert_eq!(&*connection.session.0, "sess-lan");
+        server.join().unwrap();
     }
 }
