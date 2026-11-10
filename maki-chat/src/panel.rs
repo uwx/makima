@@ -115,6 +115,9 @@ enum ChatView {
     },
     Tool(ToolCard),
     Notice(SharedString),
+    /// The transcript starts with how to start typing, when the session is
+    /// somebody else's. It goes away once this window takes control.
+    Watching,
 }
 
 struct ToolCard {
@@ -326,7 +329,7 @@ impl SessionPanel {
                 self.views.clear();
                 self.read_only = read_only;
                 if read_only {
-                    self.notice(WATCHING_NOTICE.to_owned());
+                    self.views.push(ChatView::Watching);
                 }
                 self.status = session_status(&backend);
                 self.themes = backend.themes.names.clone();
@@ -555,11 +558,14 @@ impl SessionPanel {
             Event::Flash(text) => self.notice(text),
             Event::Control(controller) => {
                 self.read_only = !controller;
-                self.notice(if controller {
-                    CONTROL_TAKEN.to_owned()
+                self.views
+                    .retain(|view| !matches!(view, ChatView::Watching));
+                if controller {
+                    self.notice(CONTROL_TAKEN.to_owned());
                 } else {
-                    CONTROL_LOST.to_owned()
-                });
+                    self.views.push(ChatView::Watching);
+                    self.notice(CONTROL_LOST.to_owned());
+                }
                 cx.notify();
             }
             Event::Share(result) => {
@@ -647,7 +653,8 @@ impl SessionPanel {
                     self.notice(error);
                 }
             }
-            Event::Attached => self.busy = false,
+            Event::Attached { busy } => self.busy = busy,
+            Event::Turn(running) => self.busy = running,
             Event::Closed(reason) => {
                 self.backend = None;
                 self.closed = true;
@@ -1413,6 +1420,21 @@ impl SessionPanel {
                 .text_color(cx.theme().muted_foreground)
                 .child(text.clone())
                 .into_any_element(),
+            ChatView::Watching => h_flex()
+                .w_full()
+                .items_center()
+                .gap_3()
+                .flex_wrap()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(WATCHING_NOTICE)
+                .child(
+                    Button::new("take-control-row")
+                        .label(TAKE_CONTROL_LABEL)
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| this.take_control(cx))),
+                )
+                .into_any_element(),
         }
     }
 
@@ -1707,6 +1729,15 @@ impl SessionPanel {
             .w_full()
             .border_t_1()
             .border_color(cx.theme().border)
+            // A finger is less precise than a pointer, so the whole row focuses
+            // the field rather than only the text.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    let handle = this.input.read(cx).focus_handle(cx);
+                    handle.focus(window, cx);
+                }),
+            )
             .child(
                 v_flex()
                     .w_full()

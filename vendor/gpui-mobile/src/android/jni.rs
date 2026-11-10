@@ -53,9 +53,11 @@ use std::{
     time::Duration,
 };
 
-/// `WindowInsets.Type.ime()`, which JNI would otherwise have to ask a Java
-/// class object for.
-const IME_TYPE: i32 = 8;
+/// `WindowInsets.Type` masks. JNI would otherwise have to ask a Java class
+/// object for them.
+const SYSTEM_BARS_TYPE: i32 = 0x3;
+const DISPLAY_CUTOUT_TYPE: i32 = 0x80;
+const IME_TYPE: i32 = 0x8;
 /// How long the keyboard takes to be laid out before its inset is readable.
 const IME_SETTLE: Duration = Duration::from_millis(300);
 
@@ -1562,83 +1564,12 @@ fn refresh_insets_later() {
         });
 }
 
-/// The software keyboard's height in physical pixels, zero when it is down.
+/// The insets Android reports for one `WindowInsets.Type` mask, in physical
+/// pixels, as `(left, top, right, bottom)`.
 ///
-/// Needs the API 30 `getInsets`, which is why the older getters above cannot
-/// stand in for it.
-pub fn ime_inset() -> Option<f32> {
-    with_env(|env| {
-        let activity = activity(env)?;
-        let window = env
-            .call_method(
-                &activity,
-                jni::jni_str!("getWindow"),
-                jni::jni_sig!("()Landroid/view/Window;"),
-                &[],
-            )
-            .and_then(|value| value.l())
-            .map_err(|error| {
-                env.exception_clear();
-                error.to_string()
-            })?;
-        let decor = env
-            .call_method(
-                &window,
-                jni::jni_str!("getDecorView"),
-                jni::jni_sig!("()Landroid/view/View;"),
-                &[],
-            )
-            .and_then(|value| value.l())
-            .map_err(|error| {
-                env.exception_clear();
-                error.to_string()
-            })?;
-        let insets = env
-            .call_method(
-                &decor,
-                jni::jni_str!("getRootWindowInsets"),
-                jni::jni_sig!("()Landroid/view/WindowInsets;"),
-                &[],
-            )
-            .and_then(|value| value.l())
-            .map_err(|error| {
-                env.exception_clear();
-                error.to_string()
-            })?;
-        let ime = env
-            .call_method(
-                &insets,
-                jni::jni_str!("getInsets"),
-                jni::jni_sig!("(I)Landroid/graphics/Insets;"),
-                &[JValue::Int(IME_TYPE)],
-            )
-            .and_then(|value| value.l())
-            .map_err(|error| {
-                env.exception_clear();
-                error.to_string()
-            })?;
-        let bottom = env
-            .get_field(
-                &ime,
-                jni::jni_str!("bottom"),
-                jni::jni_sig!("I"),
-            )
-            .and_then(|value| value.i())
-            .map_err(|error| {
-                env.exception_clear();
-                error.to_string()
-            })?;
-        Ok(bottom as f32)
-    })
-    .ok()
-}
-
-/// The system bars' insets in physical pixels, as the window reports them now.
-///
-/// The content rect stays the whole window when the app draws edge to edge
-/// under the bars, so the insets have to be asked for directly. None until the
-/// window exists.
-pub fn system_bar_insets() -> Option<super::SafeAreaInsets> {
+/// Uses the API 30 `getInsets`, because the older getters are zeroed for apps
+/// that target SDK 35 and let the system draw them edge to edge.
+fn insets_of_type(mask: i32) -> Option<(f32, f32, f32, f32)> {
     with_env(|env| {
         let activity = activity(env)?;
         let window = env
@@ -1680,10 +1611,21 @@ pub fn system_bar_insets() -> Option<super::SafeAreaInsets> {
         if insets.is_null() {
             return Err("the window has no insets yet".into());
         }
-        // Deprecated since API 30, and still the one call that works below it.
-        macro_rules! inset {
-            ($method:literal) => {
-                env.call_method(&insets, jni::jni_str!($method), jni::jni_sig!("()I"), &[])
+        let edges = env
+            .call_method(
+                &insets,
+                jni::jni_str!("getInsets"),
+                jni::jni_sig!("(I)Landroid/graphics/Insets;"),
+                &[JValue::Int(mask)],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        macro_rules! edge {
+            ($field:literal) => {
+                env.get_field(&edges, jni::jni_str!($field), jni::jni_sig!("I"))
                     .and_then(|value| value.i())
                     .map_err(|error| {
                         env.exception_clear();
@@ -1691,14 +1633,29 @@ pub fn system_bar_insets() -> Option<super::SafeAreaInsets> {
                     })? as f32
             };
         }
-        Ok(super::SafeAreaInsets {
-            top: inset!("getSystemWindowInsetTop"),
-            bottom: inset!("getSystemWindowInsetBottom"),
-            left: inset!("getSystemWindowInsetLeft"),
-            right: inset!("getSystemWindowInsetRight"),
-        })
+        Ok((edge!("left"), edge!("top"), edge!("right"), edge!("bottom")))
     })
     .ok()
+}
+
+/// The system bars the content must stay clear of.
+///
+/// The status bar, the navigation bar or gesture area, and any display cutout;
+/// the last one matters because the bars may be hidden under it.
+pub fn system_bar_insets() -> Option<super::SafeAreaInsets> {
+    let bars = insets_of_type(SYSTEM_BARS_TYPE)?;
+    let cutout = insets_of_type(DISPLAY_CUTOUT_TYPE).unwrap_or_default();
+    Some(super::SafeAreaInsets {
+        left: bars.0.max(cutout.0),
+        top: bars.1.max(cutout.1),
+        right: bars.2.max(cutout.2),
+        bottom: bars.3.max(cutout.3),
+    })
+}
+
+/// The software keyboard's height in physical pixels, zero when it is down.
+pub fn ime_inset() -> Option<f32> {
+    insets_of_type(IME_TYPE).map(|(_, _, _, bottom)| bottom)
 }
 
 // ── software keyboard (IME) control ───────────────────────────────────────────

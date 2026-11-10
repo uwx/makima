@@ -66,6 +66,7 @@ const TAKE_CONTROL_METHOD: &str = "maki/take_control";
 const SHARE_METHOD: &str = "maki/share";
 const UNSHARE_METHOD: &str = "maki/unshare";
 const CONTROL_METHOD: &str = "maki/ui/control";
+const TURN_METHOD: &str = "maki/ui/turn";
 const REWIND_METHOD: &str = "maki/rewind";
 const REWOUND_METHOD: &str = "maki/ui/rewind";
 const SHORT_SESSION_CHARS: usize = 8;
@@ -103,8 +104,12 @@ pub enum Event {
     RewindDone(Result<String, String>),
     PromptDone(Result<StopReason, String>),
     /// A shared session finished replaying its transcript; from here on its
-    /// updates are live.
-    Attached,
+    /// updates are live, and `busy` says whether a turn is already running.
+    Attached {
+        busy: bool,
+    },
+    /// The session started (true) or finished (false) a turn.
+    Turn(bool),
     Closed(String),
 }
 
@@ -587,7 +592,8 @@ fn open_session(
                 let _ = client.emit(Event::Flash(TRUNCATED_HISTORY.to_owned()));
             }
             // Queued behind the replay, so a watcher knows where history ends.
-            let _ = client.emit(Event::Attached);
+            let busy = reply.get("busy").and_then(Value::as_bool) == Some(true);
+            let _ = client.emit(Event::Attached { busy });
             let options = session_options(&reply);
             let view = session_view(&options);
             let model = view.model.clone().unwrap_or_default();
@@ -953,6 +959,11 @@ impl Client {
             }
             REWOUND_METHOD => {
                 let _ = self.emit(Event::Rewound);
+            }
+            TURN_METHOD => {
+                if let Some(running) = message.pointer("/params/running").and_then(Value::as_bool) {
+                    let _ = self.emit(Event::Turn(running));
+                }
             }
             CONTROL_METHOD => {
                 if let Some(controller) = message

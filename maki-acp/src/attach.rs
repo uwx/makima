@@ -4,7 +4,10 @@
 //! one that can prompt, change options or rewind.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use flume::Sender;
 use serde_json::{Value, json};
@@ -21,6 +24,9 @@ pub const LIVE_METHOD: &str = "maki/live";
 pub const TAKE_CONTROL_METHOD: &str = "maki/take_control";
 /// Server to client: this connection gained or lost control.
 pub const CONTROL_METHOD: &str = "maki/ui/control";
+/// Server to client: the session started or finished a turn, so a watcher knows
+/// whether its Stop button would do anything.
+pub const TURN_METHOD: &str = "maki/ui/turn";
 /// Answers a session-scoped request from a connection that only watches.
 pub const READ_ONLY_CODE: i32 = -32010;
 pub const READ_ONLY_MESSAGE: &str = "this connection is read-only";
@@ -137,8 +143,16 @@ impl Taps {
             }
             _ => {}
         }
+        // A turn can end in a task of its own, whose last message is this one,
+        // so every message is a chance for the flag to have moved.
+        for tap in self.sessions.lock().unwrap().values() {
+            tap.refresh_busy();
+        }
     }
 }
+
+/// Whether the session is in a turn, as its own bookkeeping sees it.
+pub type BusyProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// A request from a watching connection that holds control, on its way to the
 /// loop that owns the session.
@@ -151,6 +165,12 @@ pub struct RemoteRequest {
 /// on it.
 pub struct SessionTap {
     state: Mutex<TapState>,
+    /// Whether the session is in a turn, for attaching watchers and for the
+    /// announcements below.
+    busy: AtomicBool,
+    /// Reads the session's own idea of that, so a turn that ends inside another
+    /// task still moves the flag.
+    busy_probe: Mutex<Option<BusyProbe>>,
     controller: Mutex<Option<Sender<Value>>>,
     /// The session's config options, so an attach can paint its status bar
     /// without asking the owning loop.
@@ -162,6 +182,8 @@ impl Default for SessionTap {
     fn default() -> Self {
         Self {
             state: Mutex::default(),
+            busy: AtomicBool::new(false),
+            busy_probe: Mutex::default(),
             controller: Mutex::default(),
             info: Mutex::default(),
             inbound: flume::unbounded(),
@@ -192,11 +214,41 @@ impl SessionTap {
         (replayed, truncated)
     }
 
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
+    }
+
+    /// Watches the session's turn state, so [`Self::refresh_busy`] can follow it.
+    pub fn watch_busy(&self, probe: BusyProbe) {
+        *self.busy_probe.lock().unwrap() = Some(probe);
+    }
+
+    /// Asks the session whether a turn is running, announcing any change.
+    pub fn refresh_busy(&self) {
+        let probe = self.busy_probe.lock().unwrap().clone();
+        if let Some(probe) = probe {
+            self.set_busy(probe());
+        }
+    }
+
+    /// Records whether a turn is running, and tells the watchers when that
+    /// changed.
+    pub fn set_busy(&self, busy: bool) {
+        if self.busy.swap(busy, Ordering::Relaxed) == busy {
+            return;
+        }
+        self.announce(json!({
+            "jsonrpc": "2.0",
+            "method": TURN_METHOD,
+            "params": { "running": busy },
+        }));
+    }
+
     pub fn watchers(&self) -> usize {
         self.state.lock().unwrap().subscribers.len()
     }
 
-        /// Where requests from controlling watchers arrive.
+    /// Where requests from controlling watchers arrive.
     pub fn inbox(&self) -> flume::Receiver<RemoteRequest> {
         self.inbound.1.clone()
     }
@@ -241,8 +293,7 @@ impl SessionTap {
     /// Sends {message} to the controller and every watcher, without recording
     /// it: control changes are not part of the transcript.
     pub fn announce(&self, message: Value) {
-        let mut targets: Vec<Sender<Value>> =
-            self.state.lock().unwrap().subscribers.to_vec();
+        let mut targets: Vec<Sender<Value>> = self.state.lock().unwrap().subscribers.to_vec();
         if let Some(controller) = self.controller() {
             targets.push(controller);
         }
@@ -306,11 +357,65 @@ mod tests {
         let (replayed, truncated) = taps.get("s1").unwrap().subscribe(tx);
         assert_eq!(replayed, 2);
         assert!(!truncated);
-        assert_eq!(rx.recv().unwrap()["params"]["update"]["content"]["text"], "one");
-        assert_eq!(rx.recv().unwrap()["params"]["update"]["content"]["text"], "two");
+        assert_eq!(
+            rx.recv().unwrap()["params"]["update"]["content"]["text"],
+            "one"
+        );
+        assert_eq!(
+            rx.recv().unwrap()["params"]["update"]["content"]["text"],
+            "two"
+        );
 
         taps.observe(&update("s1", "three"));
-        assert_eq!(rx.recv().unwrap()["params"]["update"]["content"]["text"], "three");
+        assert_eq!(
+            rx.recv().unwrap()["params"]["update"]["content"]["text"],
+            "three"
+        );
+    }
+
+    #[test]
+    fn a_message_carries_the_turn_state_its_probe_reports() {
+        let taps = Taps::default();
+        let tap = taps.ensure("s1");
+        let running = Arc::new(AtomicBool::new(false));
+        let probe = Arc::clone(&running);
+        tap.watch_busy(Arc::new(move || probe.load(Ordering::Relaxed)));
+        let (tx, rx) = flume::unbounded();
+        tap.subscribe(tx);
+
+        let next_turn = || loop {
+            let message = rx.recv().unwrap();
+            if message["method"] == TURN_METHOD {
+                return message["params"]["running"].clone();
+            }
+        };
+
+        running.store(true, Ordering::Relaxed);
+        taps.observe(&update("s1", "one"));
+        assert_eq!(next_turn(), json!(true));
+
+        running.store(false, Ordering::Relaxed);
+        taps.observe(&update("s1", "two"));
+        assert_eq!(next_turn(), json!(false));
+    }
+
+    #[test]
+    fn a_turn_is_announced_once_per_change() {
+        let taps = Taps::default();
+        let tap = taps.ensure("s1");
+        let (tx, rx) = flume::unbounded();
+        tap.subscribe(tx);
+
+        tap.set_busy(true);
+        tap.set_busy(true);
+        tap.set_busy(false);
+        tap.set_busy(false);
+
+        let running: Vec<Value> = rx
+            .drain()
+            .map(|message| message["params"]["running"].clone())
+            .collect();
+        assert_eq!(running, vec![json!(true), json!(false)]);
     }
 
     #[test]
@@ -354,7 +459,10 @@ mod tests {
         let (tx, rx) = flume::unbounded();
         let (replayed, _) = taps.get("s1").unwrap().subscribe(tx);
         assert_eq!(replayed, 1);
-        assert_eq!(rx.recv().unwrap()["params"]["update"]["content"]["text"], "two");
+        assert_eq!(
+            rx.recv().unwrap()["params"]["update"]["content"]["text"],
+            "two"
+        );
         assert!(rx.try_recv().is_err());
     }
 

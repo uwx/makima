@@ -3,8 +3,8 @@ use std::iter;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,6 +47,7 @@ use maki_lan::discovery::Advertisement;
 use maki_lan::{link, reachable, token as lan_token};
 use maki_lua::orchestration::{AgentOrchestration, ModelCatalog, TrustedTarget};
 use maki_lua::session_snapshot::HeadlessObserver;
+use maki_providers::login::is_configured;
 use maki_providers::model::Model;
 use maki_providers::{Message, ProviderRegistry, TokenUsage, add_cost, settle_session};
 use maki_storage::StateDir;
@@ -376,6 +377,21 @@ impl Server {
         send(self.reply(), Response::new(id, result));
     }
 
+    /// Tells the watchers whether a turn is running, when that changes.
+    fn sync_turn_state(&self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let Some(tap) = self.session_tap() else {
+            return;
+        };
+        let busy = {
+            let pending = session.pending.lock().unwrap();
+            pending.operation.is_some() || !pending.queued.is_empty()
+        };
+        tap.set_busy(busy);
+    }
+
     /// The tap of the session this connection owns.
     fn session_tap(&self) -> Option<Arc<SessionTap>> {
         let id = self.session.as_ref()?.handle.session_id.to_string();
@@ -474,7 +490,13 @@ pub async fn serve_shared(
     // goes away, and the listener only ends on an accept failure.
     executor
         .run(smol::future::or(
-            serve_connection(Rc::clone(&params), &taps, Local::clone(&executor), input, output),
+            serve_connection(
+                Rc::clone(&params),
+                &taps,
+                Local::clone(&executor),
+                input,
+                output,
+            ),
             accept_connections(
                 listener,
                 params,
@@ -497,13 +519,10 @@ async fn accept_connections(
     stop: Receiver<()>,
 ) -> color_eyre::Result<()> {
     loop {
-        let accepted = smol::future::or(
-            async { listener.accept().await.map(Some) },
-            async {
-                stop.recv_async().await.ok();
-                Ok(None)
-            },
-        )
+        let accepted = smol::future::or(async { listener.accept().await.map(Some) }, async {
+            stop.recv_async().await.ok();
+            Ok(None)
+        })
         .await?;
         let Some((stream, peer)) = accepted else {
             return Ok(());
@@ -549,13 +568,10 @@ async fn handshake(
     token: &str,
 ) -> std::io::Result<bool> {
     let mut line = String::new();
-    let read = smol::future::or(
-        async { reader.read_line(&mut line).await },
-        async {
-            smol::Timer::after(HANDSHAKE_TIMEOUT).await;
-            Ok(0)
-        },
-    )
+    let read = smol::future::or(async { reader.read_line(&mut line).await }, async {
+        smol::Timer::after(HANDSHAKE_TIMEOUT).await;
+        Ok(0)
+    })
     .await?;
     let request: Option<Value> = serde_json::from_str(line.trim()).ok();
     let wanted = request.as_ref().is_some_and(|request| {
@@ -563,9 +579,9 @@ async fn handshake(
     });
     let authorized = read > 0
         && wanted
-        && request
-            .as_ref()
-            .is_some_and(|request| token_matches(request["token"].as_str().unwrap_or_default(), token));
+        && request.as_ref().is_some_and(|request| {
+            token_matches(request["token"].as_str().unwrap_or_default(), token)
+        });
     let reply = json!({
         "maki": HANDSHAKE_KIND,
         "version": HANDSHAKE_VERSION,
@@ -684,10 +700,9 @@ async fn serve_connection(
     loop {
         let step = match server.dispatch.as_mut() {
             Some(dispatch) => {
-                smol::future::or(
-                    smol::future::or(next_line(), next_remote()),
-                    async { Step::Dispatched((&mut dispatch.future).await) },
-                )
+                smol::future::or(smol::future::or(next_line(), next_remote()), async {
+                    Step::Dispatched((&mut dispatch.future).await)
+                })
                 .await
             }
             None => smol::future::or(next_line(), next_remote()).await,
@@ -702,6 +717,9 @@ async fn serve_connection(
             Step::Dispatched(dispatched) => respond_dispatch(&mut server, dispatched).await,
             Step::InputClosed => break,
         }
+        // A step may have started or finished a turn; a queued prompt's own
+        // turn only becomes current once this runs.
+        server.sync_turn_state();
     }
 
     if let Some(session) = &server.session {
@@ -821,7 +839,8 @@ fn handled_locally(raw: &Value) -> bool {
 /// Passes {raw} to the owning loop when this connection holds control, which
 /// includes `maki/take_control` while it does not.
 fn forward_to_owner(srv: &Server, tap: &SessionTap, raw: &Value) -> bool {
-    let takes_control = raw.get("method").and_then(Value::as_str) == Some(attach::TAKE_CONTROL_METHOD);
+    let takes_control =
+        raw.get("method").and_then(Value::as_str) == Some(attach::TAKE_CONTROL_METHOD);
     if !takes_control && (handled_locally(raw) || !tap.controller_is(&srv.wire)) {
         return false;
     }
@@ -848,9 +867,9 @@ fn take_control(srv: &mut Server) -> Result<Value, AcpError> {
             attach::BUSY_CONTROL_MESSAGE,
         ));
     }
-    let tap = srv.session_tap().ok_or_else(|| {
-        AcpError::new(attach::BUSY_CONTROL_CODE, "no session to control")
-    })?;
+    let tap = srv
+        .session_tap()
+        .ok_or_else(|| AcpError::new(attach::BUSY_CONTROL_CODE, "no session to control"))?;
     let target = srv.reply().clone();
     let previous = tap.controller();
     tap.set_controller(target.clone());
@@ -960,12 +979,14 @@ fn attach_session(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
         previous.detach(&srv.wire);
     }
     let (replayed, truncated) = tap.subscribe(srv.wire.clone());
+    let busy = tap.busy();
     srv.attached = Some(tap);
     Ok(json!({
         "sessionId": id,
         "readOnly": true,
         "replayed": replayed,
         "truncated": truncated,
+        "busy": busy,
         "configOptions": config,
     }))
 }
@@ -1016,7 +1037,10 @@ async fn handle_request(
         }
         attach::LIVE_METHOD => {
             let result = json!({ "sessions": srv.taps.live() });
-            send(srv.reply(), Response::new(id, Ok::<Value, AcpError>(result)));
+            send(
+                srv.reply(),
+                Response::new(id, Ok::<Value, AcpError>(result)),
+            );
             return;
         }
         attach::TAKE_CONTROL_METHOD => {
@@ -1031,7 +1055,10 @@ async fn handle_request(
         }
         share::UNSHARE_METHOD => {
             let result = close_share(host);
-            send(srv.reply(), Response::new(id, Ok::<Value, AcpError>(result)));
+            send(
+                srv.reply(),
+                Response::new(id, Ok::<Value, AcpError>(result)),
+            );
             return;
         }
         "session/prompt" => match start_prompt(srv, raw, &id) {
@@ -1046,7 +1073,10 @@ async fn handle_request(
                 return;
             }
             let result = list_sessions(srv, params);
-            send(srv.reply(), Response::new(id, Ok::<Value, AcpError>(result)));
+            send(
+                srv.reply(),
+                Response::new(id, Ok::<Value, AcpError>(result)),
+            );
             return;
         }
         REWIND_METHOD => {
@@ -1079,7 +1109,10 @@ async fn handle_request(
                 return;
             }
             let result = complete_arguments(srv, raw).await;
-            send(srv.reply(), Response::new(id, Ok::<Value, AcpError>(result)));
+            send(
+                srv.reply(),
+                Response::new(id, Ok::<Value, AcpError>(result)),
+            );
             return;
         }
         _ => Err(AcpError::method_not_found()),
@@ -1251,8 +1284,15 @@ async fn load_session(
     srv.taps.register(&sid.0, Arc::clone(&srv.own_tap));
     srv.own_tap.set_controller(srv.wire.clone());
     let home = maki_storage::paths::home();
+    // A session imported from another tool can name a provider this machine
+    // never logged in to; it then resumes on the model the server runs.
     let recorded_model = match params.providers.model(&restored.model) {
-        Ok(model) if params.model_policy.allows(&model.spec()) => model,
+        Ok(model)
+            if params.model_policy.allows(&model.spec())
+                && is_configured(&params.providers, &params.storage, &model.provider).await =>
+        {
+            model
+        }
         _ => params.model.clone(),
     };
     let spec = recorded_model.spec();
@@ -1772,6 +1812,17 @@ async fn install_session_with_lock(
         ui_forward,
         lock: Some(lock),
     });
+    if let Some(tap) = srv.session_tap()
+        && let Some(pending) = srv
+            .session
+            .as_ref()
+            .map(|session| Arc::clone(&session.pending))
+    {
+        tap.watch_busy(Arc::new(move || {
+            let pending = pending.lock().unwrap();
+            pending.operation.is_some() || !pending.queued.is_empty()
+        }));
+    }
     Ok(option_snapshot)
 }
 
@@ -8307,6 +8358,54 @@ mod tests {
             let config = root.actor().unwrap().effective_config().unwrap();
             assert_eq!(config.mode, AgentMode::Plan(plan));
             assert_eq!(config.thinking, maki_agent::ThinkingConfig::Off);
+            close_session(&mut srv).await;
+        });
+    }
+
+    #[test]
+    fn load_falls_back_to_the_server_model_when_the_recorded_provider_has_no_credentials() {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+                Session::new(OFFLINE_SPEC, &tmp.path().to_string_lossy());
+            session.replace_messages(vec![Message::user("recorded history".into())]);
+            let storage = StateDir::from_path(tmp.path().to_path_buf());
+            session.save(&storage).unwrap();
+            let providers = spec_providers();
+            let mut params = test_params(
+                providers.model(FAST_SPEC).unwrap(),
+                tmp.path().to_path_buf(),
+            );
+            params.providers = providers;
+            let (out_tx, _out_rx) = flume::unbounded();
+            let mut srv = Server {
+                wire: out_tx.clone(),
+                out_tx,
+                taps: Arc::default(),
+                attached: None,
+                own_tap: Arc::default(),
+                origin: None,
+                catalog: ModelCatalog::default(),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: params.lua_event_handle.clone(),
+                ui: Default::default(),
+                dispatch: None,
+            };
+            let raw = serde_json::json!({
+                "params": {
+                    "sessionId": session.id.to_string(),
+                    "cwd": tmp.path(),
+                    "mcpServers": []
+                }
+            });
+
+            load_session(&mut srv, &raw, &params).await.unwrap();
+
+            let root = srv.session.as_ref().unwrap().handle.manager.root().unwrap();
+            let config = root.actor().unwrap().effective_config().unwrap();
+            assert_eq!(config.model.spec(), FAST_SPEC);
             close_session(&mut srv).await;
         });
     }
