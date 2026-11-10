@@ -44,6 +44,8 @@ pub fn theme_names() -> Vec<String> {
 pub fn select_theme(name: &str) -> Result<(), String> {
     theme::select(name)
 }
+mod shared_picker;
+pub use shared_picker::{SharedSession, pick_shared_session};
 pub(crate) mod terminal_image;
 mod trust_card;
 pub use trust_card::ask_trust;

@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
 use maki_acp_client::{
-    Connection, ContentBlock, Event, PermissionOption, PickOutcome, PickPrompt, PermissionPrompt,
+    Connection, ContentBlock, Event, PermissionOption, PermissionPrompt, PickOutcome, PickPrompt,
     SessionUpdate, StopReason, Target, ToolCallStatus,
 };
 use maki_lan::discovery::{Browser, Discovered, Found};
 use maki_storage::StateDir;
+use maki_ui::{SharedSession, pick_shared_session};
 
 use crate::cli::Cli;
 use crate::cmd::tui;
@@ -27,7 +28,8 @@ const HELP_COMMAND: &str = "help";
 const COMMAND_PREFIX: char = '/';
 const PROMPT_MARKER: &str = "> ";
 const ANSWER_MARKER: &str = "  ";
-const HELP: &str = "/take controls this session, /cancel stops a turn, /quit leaves, /help repeats this";
+const HELP: &str =
+    "/take controls this session, /cancel stops a turn, /quit leaves, /help repeats this";
 const WATCHING: &str = "watching read-only; /take to drive this session";
 const CONTROL_TAKEN: &str = "you control this session";
 const CONTROL_REFUSED: &str = "the session is busy; /take again when it is idle";
@@ -56,9 +58,10 @@ pub fn run(
     prompt: Option<String>,
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
+    let interactive = !plain && prompt.is_none() && io::stdout().is_terminal();
     let (link, token) = match link {
         Some(link) => (link, token),
-        None => match choose(&token)? {
+        None => match choose(&token, interactive)? {
             Some(chosen) => chosen,
             None => return Ok(()),
         },
@@ -66,14 +69,10 @@ pub fn run(
     let token = token_for(token, &storage)?;
     let target = Target::lan(&with_scheme(&link), Some(&token)).map_err(|error| eyre!(error))?;
     let connection = maki_acp_client::connect(&target).map_err(|error| eyre!(error))?;
-    if !plain && prompt.is_none() && io::stdout().is_terminal() {
+    if interactive {
         let label = target.label().to_owned();
         let cwd = std::env::current_dir().context(CWD_ERR)?;
-        return tui::run(
-            cli,
-            cwd,
-            Some(maki_ui::RemoteSession { connection, label }),
-        );
+        return tui::run(cli, cwd, Some(maki_ui::RemoteSession { connection, label }));
     }
     let mut session = Session::new(connection);
     match prompt {
@@ -87,12 +86,40 @@ pub fn run(
 
 /// Which announced session to attach to, and the token it expects. A terminal
 /// started without a link picks from what the local network offers.
-fn choose(given: &Option<String>) -> Result<Option<(String, Option<String>)>> {
+fn choose(given: &Option<String>, interactive: bool) -> Result<Option<(String, Option<String>)>> {
     let found = announced();
-    let mut printer = Printer::new();
     if found.is_empty() {
         bail!(NOTHING_ANNOUNCED);
     }
+    let Some(session) = pick(&found, interactive)? else {
+        return Ok(None);
+    };
+    let token = match given {
+        Some(token) => Some(token.clone()),
+        None => ask_token()?,
+    };
+    Ok(Some((maki_lan::link(session.address), token)))
+}
+
+/// The announced session the user names: a full-screen pick on a terminal that
+/// can draw one, a typed number when there is no screen to draw on.
+fn pick(found: &[Found], interactive: bool) -> Result<Option<&Found>> {
+    if interactive {
+        let addresses: Vec<String> = found
+            .iter()
+            .map(|session| session.address.to_string())
+            .collect();
+        let rows: Vec<SharedSession<'_>> = found
+            .iter()
+            .zip(&addresses)
+            .map(|(session, address)| SharedSession {
+                label: label(session),
+                address,
+            })
+            .collect();
+        return Ok(pick_shared_session(&rows).and_then(|index| found.get(index)));
+    }
+    let mut printer = Printer::new();
     printer.line(ANNOUNCED_HEADER);
     for (index, session) in found.iter().enumerate() {
         printer.line(&format!(
@@ -105,15 +132,11 @@ fn choose(given: &Option<String>) -> Result<Option<(String, Option<String>)>> {
     let Some(answer) = read_answer(&mut printer, CHOOSE_QUESTION)? else {
         return Ok(None);
     };
-    let Some(session) = picked(&answer, found.len()).and_then(|index| found.get(index)) else {
+    let chosen = picked(&answer, found.len()).and_then(|index| found.get(index));
+    if chosen.is_none() {
         printer.line(NOTHING_CHOSEN);
-        return Ok(None);
-    };
-    let token = match given {
-        Some(token) => Some(token.clone()),
-        None => ask_token()?,
-    };
-    Ok(Some((maki_lan::link(session.address), token)))
+    }
+    Ok(chosen)
 }
 
 /// What the local network announces, waiting long enough to hear back.
@@ -126,10 +149,7 @@ fn announced() -> Vec<Found> {
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match browser.next(left) {
             Some(Discovered::Found(session)) => {
-                if !found
-                    .iter()
-                    .any(|known| known.fullname == session.fullname)
-                {
+                if !found.iter().any(|known| known.fullname == session.fullname) {
                     found.push(session);
                 }
             }
@@ -298,7 +318,9 @@ impl Session {
                 self.printer.line(CONTROL_TAKEN);
             }
             Ok(false) => self.printer.line(CONTROL_REFUSED),
-            Err(error) => self.printer.line(&format!("could not take control: {error}")),
+            Err(error) => self
+                .printer
+                .line(&format!("could not take control: {error}")),
         }
     }
 
@@ -346,8 +368,11 @@ impl Session {
             Event::Flash(text) => self.printer.line(&text),
             Event::Control(controller) => {
                 self.read_only = !controller;
-                self.printer
-                    .line(if controller { CONTROL_TAKEN } else { CONTROL_LOST });
+                self.printer.line(if controller {
+                    CONTROL_TAKEN
+                } else {
+                    CONTROL_LOST
+                });
             }
             Event::Closed(reason) => bail!(reason),
             _ => {}
@@ -367,9 +392,7 @@ impl Session {
         let answer = read_choice(&mut self.printer, PERMISSION_QUESTION)?
             .and_then(|number| prompt.options.get(number))
             .map(|option| option.option_id.0.to_string());
-        self.connection
-            .client
-            .answer(prompt.id, answer.as_deref());
+        self.connection.client.answer(prompt.id, answer.as_deref());
         Ok(())
     }
 
@@ -556,7 +579,9 @@ mod tests {
 
     #[test]
     fn a_prompt_keeps_the_text_it_was_given() {
-        assert!(matches!(command("  fix the tests  "), Command::Prompt(text) if text == "fix the tests"));
+        assert!(
+            matches!(command("  fix the tests  "), Command::Prompt(text) if text == "fix the tests")
+        );
     }
 
     #[test_case("box:7331" => "lan://box:7331"; "a pasted address")]

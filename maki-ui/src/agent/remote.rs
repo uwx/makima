@@ -236,9 +236,7 @@ fn done_reason(stop: StopReason) -> DoneReason {
 
 fn blocks(input: &AgentInput) -> Vec<ContentBlock> {
     let mut blocks = Vec::with_capacity(1 + input.images.len());
-    blocks.push(ContentBlock::Text(TextContent::new(
-        input.message.clone(),
-    )));
+    blocks.push(ContentBlock::Text(TextContent::new(input.message.clone())));
     for image in &input.images {
         blocks.push(ContentBlock::Image(ImageContent::new(
             image.data.to_string(),
@@ -354,7 +352,8 @@ impl Translator {
         match update {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 if let ContentBlock::Text(text) = chunk.content {
-                    self.sender.try_send(AgentEvent::TextDelta { text: text.text });
+                    self.sender
+                        .try_send(AgentEvent::TextDelta { text: text.text });
                 }
             }
             SessionUpdate::AgentThoughtChunk(chunk) => {
@@ -394,31 +393,35 @@ impl Translator {
         match fields.status {
             Some(Status::Pending) => {
                 let summary = fields.title.unwrap_or_else(|| tool.to_string());
-                self.sender.try_send(AgentEvent::ToolStart(Box::new(ToolStartEvent {
-                    id,
-                    tool,
-                    summary,
-                    render_header: None,
-                    annotation: None,
-                    input: None,
-                    raw_input: fields.raw_input,
-                    output: None,
-                })));
+                self.sender
+                    .try_send(AgentEvent::ToolStart(Box::new(ToolStartEvent {
+                        id,
+                        tool,
+                        summary,
+                        render_header: None,
+                        annotation: None,
+                        input: None,
+                        raw_input: fields.raw_input,
+                        output: None,
+                    })));
             }
             Some(Status::InProgress) => match text {
-                Some(text) => self.sender.try_send(AgentEvent::ToolOutput { id, content: text }),
+                Some(text) => self
+                    .sender
+                    .try_send(AgentEvent::ToolOutput { id, content: text }),
                 None => self.sender.try_send(AgentEvent::ToolExecutionStart { id }),
             },
             Some(Status::Completed | Status::Failed) => {
                 let is_error = fields.status == Some(Status::Failed);
-                self.sender.try_send(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-                    id,
-                    tool,
-                    output: ToolOutput::Plain(text.unwrap_or_default().into()),
-                    is_error,
-                    annotation: None,
-                    written_path: None,
-                })));
+                self.sender
+                    .try_send(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+                        id,
+                        tool,
+                        output: ToolOutput::Plain(text.unwrap_or_default().into()),
+                        is_error,
+                        annotation: None,
+                        written_path: None,
+                    })));
             }
             _ => {}
         }
@@ -433,17 +436,16 @@ impl Translator {
             input: used,
             ..self.usage
         };
-        self.sender
-            .try_send(AgentEvent::TurnComplete(Box::new(
-                maki_agent::TurnCompleteEvent {
-                    message: Message::default(),
-                    usage: self.usage,
-                    model: self.model.clone(),
-                    cost: usage.cost.map(|cost| cost.amount),
-                    context_size: Some(used),
-                    context_window: self.context_window,
-                },
-            )));
+        self.sender.try_send(AgentEvent::TurnComplete(Box::new(
+            maki_agent::TurnCompleteEvent {
+                message: Message::default(),
+                usage: self.usage,
+                model: self.model.clone(),
+                cost: usage.cost.map(|cost| cost.amount),
+                context_size: Some(used),
+                context_window: self.context_window,
+            },
+        )));
     }
 }
 
@@ -507,7 +509,6 @@ fn option_for<'a>(answer: &PermissionAnswer, options: &'a [PermissionOption]) ->
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use agent_client_protocol_schema::{
@@ -558,7 +559,10 @@ mod tests {
         )));
 
         match drain(&rx).as_slice() {
-            [AgentEvent::TextDelta { text }, AgentEvent::ThinkingDelta { text: thought }] => {
+            [
+                AgentEvent::TextDelta { text },
+                AgentEvent::ThinkingDelta { text: thought },
+            ] => {
                 assert_eq!(text, "hello");
                 assert_eq!(thought, "thinking");
             }
@@ -601,14 +605,18 @@ mod tests {
         let (mut translator, rx) = translator();
         let output = ToolCallUpdateFields::new()
             .status(ToolCallStatus::InProgress)
-            .content(vec![ToolCallContent::Content(agent_client_protocol_schema::Content::new(
-                ContentBlock::Text(TextContent::new("line one")),
-            ))]);
+            .content(vec![ToolCallContent::Content(
+                agent_client_protocol_schema::Content::new(ContentBlock::Text(TextContent::new(
+                    "line one",
+                ))),
+            )]);
         let failed = ToolCallUpdateFields::new()
             .status(ToolCallStatus::Failed)
-            .content(vec![ToolCallContent::Content(agent_client_protocol_schema::Content::new(
-                ContentBlock::Text(TextContent::new("boom")),
-            ))]);
+            .content(vec![ToolCallContent::Content(
+                agent_client_protocol_schema::Content::new(ContentBlock::Text(TextContent::new(
+                    "boom",
+                ))),
+            )]);
 
         translator.update(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
             "t9", output,
@@ -618,7 +626,10 @@ mod tests {
         )));
 
         match drain(&rx).as_slice() {
-            [AgentEvent::ToolOutput { id, content }, AgentEvent::ToolDone(done)] => {
+            [
+                AgentEvent::ToolOutput { id, content },
+                AgentEvent::ToolDone(done),
+            ] => {
                 assert_eq!(id, "t9");
                 assert_eq!(content, "line one");
                 assert_eq!(done.id, "t9");
@@ -748,10 +759,7 @@ mod tests {
                 serde_json::json!({ "protocolVersion": 1, "agentCapabilities": {} }),
             );
             let new = self.recv();
-            self.respond(
-                &new["id"],
-                serde_json::json!({ "sessionId": SESSION_ID }),
-            );
+            self.respond(&new["id"], serde_json::json!({ "sessionId": SESSION_ID }));
         }
     }
 
@@ -776,7 +784,10 @@ mod tests {
                 "sessionUpdate": "agent_message_chunk",
                 "content": { "type": "text", "text": "hello" },
             }));
-            script.respond(&prompt["id"], serde_json::json!({ "stopReason": "end_turn" }));
+            script.respond(
+                &prompt["id"],
+                serde_json::json!({ "stopReason": "end_turn" }),
+            );
             prompt
         });
         let split = client.try_clone().expect("clone");
@@ -880,7 +891,10 @@ mod tests {
                 },
             }));
             let answer = script.recv();
-            script.respond(&prompt["id"], serde_json::json!({ "stopReason": "end_turn" }));
+            script.respond(
+                &prompt["id"],
+                serde_json::json!({ "stopReason": "end_turn" }),
+            );
             answer
         });
         let split = client.try_clone().expect("clone");
@@ -982,5 +996,4 @@ mod tests {
         );
         assert_eq!(option_for(&PermissionAnswer::Deny, &options), None);
     }
-
 }

@@ -167,7 +167,7 @@ Opens the full interface on a session another machine runs. Prompts, tool calls,
 
 The token comes from `--token`, then `$MAKIMA_LAN_TOKEN`, then the one stored on this machine. A bare `host:port` works where a full link does. `--plain` keeps the line renderer for a terminal that cannot take the full screen, and that is what a pipe gets. In line mode the session is watched read only until you type `/take`; `/cancel` stops a turn and `/quit` leaves. `--prompt` sends one prompt, answers what it asks, and exits, which is always line mode.
 
-Without a link it listens for a few seconds and lists the sessions the local network announces, then asks which one; the token question takes the one the sharing window shows, or nothing to use this machine's.
+Without a link it listens for a few seconds and lists the sessions the local network announces, then asks which one. A terminal that can draw gets a full screen list to move through with the arrow keys and pick with Enter; a pipe or `--plain` gets the numbered list. The token question takes the one the sharing window shows, or nothing to use this machine's.
 
 ### `makima index`
 

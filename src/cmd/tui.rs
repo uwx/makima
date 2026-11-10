@@ -331,11 +331,7 @@ fn exit_resume_hint(id: &str, colored: bool) -> String {
 
 const ATTACHED_RELOAD: &str = "this window is attached to another machine; restart it to reload";
 
-pub fn run(
-    mut cli: Cli,
-    cwd: PathBuf,
-    mut remote: Option<maki_ui::RemoteSession>,
-) -> Result<()> {
+pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession>) -> Result<()> {
     if cli.print && session_picker_requested(&cli) {
         bail!(PICKER_NEEDS_TUI_ERR);
     }

@@ -14,7 +14,6 @@ use maki_storage::StateDir;
 
 use crate::setup;
 
-
 /// The CLI theme store: the desktop switches themes through it, so the TUI and
 /// the next run agree.
 struct UiThemes;
