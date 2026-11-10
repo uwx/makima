@@ -7,6 +7,8 @@ use test_case::test_case;
 #[test_case("edit", include_str!("../../plugins/edit/tests/spec.lua") ; "edit_plugin_spec")]
 #[test_case("autosleep", include_str!("../../plugins/autosleep/tests/spec.lua") ; "autosleep_plugin_spec")]
 #[test_case("bash", include_str!("../../plugins/bash/tests/spec.lua") ; "bash_plugin_spec")]
+#[test_case("changes", include_str!("../../plugins/changes/tests/spec.lua") ; "changes_plugin_spec")]
+#[test_case("changes_loads", include_str!("../../plugins/changes/init.lua") ; "changes_plugin_loads")]
 #[test_case("index", include_str!("../../plugins/index/tests/spec.lua") ; "index_plugin_spec")]
 #[test_case("inherit", include_str!("../../plugins/inherit/init.lua") ; "inherit_plugin_loads")]
 #[test_case("inherit_spec", include_str!("../../plugins/inherit/tests/spec.lua") ; "inherit_plugin_spec")]

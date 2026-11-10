@@ -195,6 +195,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/inherit"),
     },
     BundledPlugin {
+        name: "changes",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/changes"),
+    },
+    BundledPlugin {
         name: "autosleep",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/autosleep"),
     },
