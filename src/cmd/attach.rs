@@ -1,0 +1,434 @@
+//! Driving an agent another machine serves, from a terminal. The session is
+//! watched read only until this terminal takes control of it.
+
+use std::collections::HashMap;
+use std::io::{self, Write};
+use std::sync::Arc;
+use std::thread;
+
+use color_eyre::Result;
+use color_eyre::eyre::{Context, bail, eyre};
+use maki_acp_client::{
+    Connection, ContentBlock, Event, PermissionOption, PickOutcome, PickPrompt, PermissionPrompt,
+    SessionUpdate, StopReason, Target, ToolCallStatus,
+};
+use maki_storage::StateDir;
+
+const TAKE_COMMAND: &str = "take";
+const CANCEL_COMMAND: &str = "cancel";
+const QUIT_COMMAND: &str = "quit";
+const HELP_COMMAND: &str = "help";
+const COMMAND_PREFIX: char = '/';
+const PROMPT_MARKER: &str = "> ";
+const ANSWER_MARKER: &str = "  ";
+const HELP: &str = "/take controls this session, /cancel stops a turn, /quit leaves, /help repeats this";
+const WATCHING: &str = "watching read-only; /take to drive this session";
+const CONTROL_TAKEN: &str = "you control this session";
+const CONTROL_REFUSED: &str = "the session is busy; /take again when it is idle";
+const CONTROL_LOST: &str = "another window took control of this session";
+const READ_ONLY_PROMPT: &str = "read-only; /take before prompting";
+const AGENT_GONE: &str = "the agent went away";
+const PERMISSION_QUESTION: &str = "Allow? Enter denies";
+const PICK_QUESTION: &str = "Choose? Enter closes";
+
+pub fn run(link: String, token: Option<String>, prompt: Option<String>) -> Result<()> {
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    let token = token_for(token, &storage)?;
+    let target = Target::lan(&with_scheme(&link), Some(&token)).map_err(|error| eyre!(error))?;
+    let connection = maki_acp_client::connect(&target).map_err(|error| eyre!(error))?;
+    let mut session = Session::new(connection);
+    match prompt {
+        Some(text) => {
+            session.take_control_if_watched();
+            session.turn(&text)
+        }
+        None => session.interactive(),
+    }
+}
+
+/// The token the agent expects: the flag, then the environment, then the one
+/// stored for this machine.
+fn token_for(flag: Option<String>, storage: &StateDir) -> Result<String> {
+    if let Some(token) = flag {
+        return Ok(token);
+    }
+    maki_lan::token(storage.path()).context("read the LAN token")
+}
+
+/// A pasted `host:port` reaches the same place as a full link.
+fn with_scheme(link: &str) -> String {
+    if link.starts_with(maki_lan::LINK_SCHEME) {
+        link.to_owned()
+    } else {
+        format!("{}{link}", maki_lan::LINK_SCHEME)
+    }
+}
+
+enum Command {
+    Empty,
+    Help,
+    Quit,
+    Take,
+    Cancel,
+    Prompt(String),
+}
+
+/// A line starting with a slash names what this terminal does; anything else is
+/// a prompt for the agent.
+fn command(line: &str) -> Command {
+    let text = line.trim();
+    if text.is_empty() {
+        return Command::Empty;
+    }
+    let Some(name) = text.strip_prefix(COMMAND_PREFIX) else {
+        return Command::Prompt(text.to_owned());
+    };
+    match name.trim() {
+        TAKE_COMMAND => Command::Take,
+        CANCEL_COMMAND => Command::Cancel,
+        QUIT_COMMAND => Command::Quit,
+        HELP_COMMAND => Command::Help,
+        _ => Command::Prompt(text.to_owned()),
+    }
+}
+
+struct Session {
+    connection: Connection,
+    printer: Printer,
+    read_only: bool,
+}
+
+impl Session {
+    fn new(connection: Connection) -> Self {
+        let mut printer = Printer::new();
+        let mut attached = format!(
+            "attached to session {}",
+            maki_acp_client::short_session(&connection.session)
+        );
+        if !connection.model.is_empty() {
+            attached.push_str(&format!(" on {}", connection.model));
+        }
+        printer.line(&attached);
+        if connection.read_only {
+            printer.line(WATCHING);
+        }
+        printer.line(HELP);
+        Self {
+            read_only: connection.read_only,
+            connection,
+            printer,
+        }
+    }
+
+    fn interactive(&mut self) -> Result<()> {
+        loop {
+            self.show_pending()?;
+            self.printer.prompt(PROMPT_MARKER);
+            let Some(line) = read_line()? else {
+                self.printer.end_line();
+                return Ok(());
+            };
+            match command(&line) {
+                Command::Empty => {}
+                Command::Help => self.help(),
+                Command::Quit => return Ok(()),
+                Command::Cancel => self.connection.client.cancel(),
+                Command::Take => self.take_control(),
+                Command::Prompt(text) => {
+                    if self.read_only {
+                        self.printer.line(READ_ONLY_PROMPT);
+                        continue;
+                    }
+                    self.turn(&text)?;
+                }
+            }
+        }
+    }
+
+    fn help(&mut self) {
+        self.printer.line(HELP);
+    }
+
+    /// Shows what the agent sent while this terminal was not running a turn,
+    /// which is the replay first and other windows' changes after it.
+    fn show_pending(&mut self) -> Result<()> {
+        while let Ok(event) = self.connection.events.try_recv() {
+            self.on_event(event)?;
+        }
+        Ok(())
+    }
+
+    /// Makes this terminal the one that may prompt, when a window elsewhere is
+    /// not driving the session.
+    fn take_control_if_watched(&mut self) {
+        if self.read_only {
+            self.take_control();
+        }
+    }
+
+    fn take_control(&mut self) {
+        match self.connection.client.take_control() {
+            Ok(true) => {
+                self.read_only = false;
+                self.printer.line(CONTROL_TAKEN);
+            }
+            Ok(false) => self.printer.line(CONTROL_REFUSED),
+            Err(error) => self.printer.line(&format!("could not take control: {error}")),
+        }
+    }
+
+    /// Runs one prompt to its end, answering what the agent asks meanwhile.
+    fn turn(&mut self, text: &str) -> Result<()> {
+        let client = Arc::clone(&self.connection.client);
+        let prompt = text.to_owned();
+        let (finished, finish) = flume::bounded(1);
+        thread::Builder::new()
+            .name("maki-attach-prompt".into())
+            .spawn(move || {
+                let _ = finished.send(client.prompt(&prompt));
+            })
+            .context("start the prompt")?;
+        let events = self.connection.events.clone();
+        loop {
+            let step = smol::block_on(smol::future::or(
+                async { Step::Event(events.recv_async().await) },
+                async { Step::Done(finish.recv_async().await) },
+            ));
+            match step {
+                Step::Event(Ok(event)) => self.on_event(event)?,
+                Step::Event(Err(_)) => bail!(AGENT_GONE),
+                Step::Done(Ok(Ok(reason))) => {
+                    self.printer.end_line();
+                    if reason != StopReason::EndTurn {
+                        self.printer.line(&format!("stopped: {reason:?}"));
+                    }
+                    return Ok(());
+                }
+                Step::Done(Ok(Err(error))) => {
+                    self.printer.line(&format!("prompt failed: {error}"));
+                    return Ok(());
+                }
+                Step::Done(Err(_)) => bail!(AGENT_GONE),
+            }
+        }
+    }
+
+    fn on_event(&mut self, event: Event) -> Result<()> {
+        match event {
+            Event::Update(update) => self.printer.update(&update),
+            Event::Permission(prompt) => self.answer_permission(prompt)?,
+            Event::Pick(prompt) => self.answer_pick(prompt)?,
+            Event::Flash(text) => self.printer.line(&text),
+            Event::Control(controller) => {
+                self.read_only = !controller;
+                self.printer
+                    .line(if controller { CONTROL_TAKEN } else { CONTROL_LOST });
+            }
+            Event::Closed(reason) => bail!(reason),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn answer_permission(&mut self, prompt: PermissionPrompt) -> Result<()> {
+        self.printer
+            .line(&format!("{} needs permission", prompt.title));
+        if let Some(diff) = prompt.diff {
+            for line in diff.lines() {
+                self.printer.line(&format!("{ANSWER_MARKER}{line}"));
+            }
+        }
+        self.printer.choices(&prompt.options);
+        let answer = read_choice(&mut self.printer, PERMISSION_QUESTION)?
+            .and_then(|number| prompt.options.get(number))
+            .map(|option| option.option_id.0.to_string());
+        self.connection
+            .client
+            .answer(prompt.id, answer.as_deref());
+        Ok(())
+    }
+
+    fn answer_pick(&mut self, prompt: PickPrompt) -> Result<()> {
+        self.printer.line(&prompt.title);
+        for (label, value) in &prompt.footer {
+            self.printer.line(&format!("  {label}: {value}"));
+        }
+        for (index, item) in prompt.items.iter().enumerate() {
+            let detail = item
+                .detail
+                .as_ref()
+                .map(|detail| format!(" · {detail}"))
+                .unwrap_or_default();
+            self.printer
+                .line(&format!("  {}. {}{detail}", index + 1, item.label));
+        }
+        let choice = read_choice(&mut self.printer, PICK_QUESTION)?;
+        self.connection.client.answer_pick(
+            prompt.id,
+            match choice {
+                Some(index) => PickOutcome::Choice(index),
+                None => PickOutcome::Close,
+            },
+        );
+        Ok(())
+    }
+}
+
+enum Step {
+    Event(Result<Event, flume::RecvError>),
+    Done(Result<Result<StopReason, String>, flume::RecvError>),
+}
+
+/// Reads one line of a prompt, or nothing when the input ended.
+fn read_line() -> Result<Option<String>> {
+    let mut line = String::new();
+    if io::stdin()
+        .read_line(&mut line)
+        .context("read the answer")?
+        == 0
+    {
+        return Ok(None);
+    }
+    Ok(Some(line))
+}
+
+/// Reads a numbered choice, where an empty answer or anything unparsable means
+/// none was made.
+fn read_choice(printer: &mut Printer, question: &str) -> Result<Option<usize>> {
+    printer.line(question);
+    printer.prompt(PROMPT_MARKER);
+    Ok(read_line()?
+        .and_then(|line| line.trim().parse::<usize>().ok())
+        .and_then(|number| number.checked_sub(1)))
+}
+
+struct Printer {
+    at_line_start: bool,
+    titles: HashMap<String, String>,
+}
+
+impl Printer {
+    fn new() -> Self {
+        Self {
+            at_line_start: true,
+            titles: HashMap::new(),
+        }
+    }
+
+    /// Writes streamed text, which shares a line with what follows it.
+    fn text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        print!("{text}");
+        self.at_line_start = text.ends_with('\n');
+        self.flush();
+    }
+
+    fn line(&mut self, text: &str) {
+        self.end_line();
+        println!("{text}");
+        self.flush();
+    }
+
+    fn end_line(&mut self) {
+        if !self.at_line_start {
+            println!();
+            self.at_line_start = true;
+        }
+    }
+
+    fn prompt(&mut self, marker: &str) {
+        self.end_line();
+        print!("{marker}");
+        self.at_line_start = false;
+        self.flush();
+    }
+
+    fn choices(&mut self, options: &[PermissionOption]) {
+        for (index, option) in options.iter().enumerate() {
+            self.line(&format!("  {}. {}", index + 1, option.name));
+        }
+    }
+
+    fn update(&mut self, update: &SessionUpdate) {
+        match update {
+            SessionUpdate::AgentMessageChunk(chunk) => self.chunk(&chunk.content),
+            SessionUpdate::UserMessageChunk(chunk) => {
+                if let ContentBlock::Text(block) = &chunk.content
+                    && !block.text.trim().is_empty()
+                {
+                    self.line(&format!("you> {}", block.text.trim()));
+                }
+            }
+            SessionUpdate::ToolCall(call) => {
+                self.titles
+                    .insert(call.tool_call_id.0.to_string(), call.title.clone());
+                self.line(&format!("→ {}", call.title));
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                let title = update.fields.title.clone().unwrap_or_else(|| {
+                    self.titles
+                        .get(update.tool_call_id.0.as_ref())
+                        .cloned()
+                        .unwrap_or_default()
+                });
+                match update.fields.status {
+                    Some(ToolCallStatus::Completed) => self.line(&format!("✓ {title}")),
+                    Some(ToolCallStatus::Failed) => self.line(&format!("✗ {title}")),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn chunk(&mut self, content: &ContentBlock) {
+        if let ContentBlock::Text(block) = content {
+            self.text(&block.text);
+        }
+    }
+
+    fn flush(&self) {
+        let _ = io::stdout().flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, command, with_scheme};
+    use test_case::test_case;
+
+    fn action(line: &str) -> &'static str {
+        match command(line) {
+            Command::Empty => "empty",
+            Command::Help => "help",
+            Command::Quit => "quit",
+            Command::Take => "take",
+            Command::Cancel => "cancel",
+            Command::Prompt(_) => "prompt",
+        }
+    }
+
+    #[test_case("/take" => "take"; "take control")]
+    #[test_case(" /quit " => "quit"; "surrounding space is ignored")]
+    #[test_case("/help" => "help"; "help")]
+    #[test_case("/cancel" => "cancel"; "cancel")]
+    #[test_case("" => "empty"; "nothing typed")]
+    #[test_case("hello" => "prompt"; "a line is a prompt")]
+    #[test_case("/unknown" => "prompt"; "an unknown command is sent on")]
+    fn a_line_names_what_the_terminal_does(line: &str) -> &'static str {
+        action(line)
+    }
+
+    #[test]
+    fn a_prompt_keeps_the_text_it_was_given() {
+        assert!(matches!(command("  fix the tests  "), Command::Prompt(text) if text == "fix the tests"));
+    }
+
+    #[test_case("box:7331" => "lan://box:7331"; "a pasted address")]
+    #[test_case("lan://box:7331:/srv/app" => "lan://box:7331:/srv/app"; "a full link is kept")]
+    fn a_link_gets_the_scheme_it_needs(link: &str) -> String {
+        with_scheme(link)
+    }
+}

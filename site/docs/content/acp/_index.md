@@ -124,6 +124,17 @@ Makima first replays what the session already emitted, as the same `session/upda
 
 A watching connection that does not hold control cannot write: `session/prompt`, `session/new`, `session/load`, `session/set_mode`, `session/set_config_option` and `maki/rewind` answer with error code `-32010`. It can still initialize, list sessions, switch themes and complete arguments.
 
+### Watching from a terminal
+
+`makima attach <link>` is a terminal client for a shared session:
+
+```bash
+makima attach 192.168.2.4:60667        # token from $MAKIMA_LAN_TOKEN or the state directory
+makima attach lan://192.168.2.4:60667 --token my-token
+```
+
+It replays the session, then follows it. Lines are prompts once you type `/take`; `/cancel` stops a turn, `/quit` leaves. Tool calls print as `→ title` and `✓ title`, permission requests print their options and take a number, and pickers take a number too.
+
 ### Taking control
 
 The connection that created or loaded the session controls it at first. To move control, any connection sends `maki/take_control`, and the reply says whether it now holds it:

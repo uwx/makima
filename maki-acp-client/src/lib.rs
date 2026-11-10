@@ -14,14 +14,14 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
-use agent_client_protocol_schema::{
+pub use agent_client_protocol_schema::{
     CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
     InitializeRequest, JsonRpcMessage, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
     NewSessionResponse, Notification, PermissionOption, PromptRequest, PromptResponse,
     ProtocolVersion, Request, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionId, SessionNotification, SessionUpdate, StopReason,
-    TextContent, ToolCallContent,
+    TextContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolCallContent,
 };
 use flume::{Receiver, Sender};
 use serde::de::DeserializeOwned;

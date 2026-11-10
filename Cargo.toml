@@ -21,6 +21,7 @@ maki-ui = { workspace = true }
 maki-agent = { workspace = true }
 maki-acp = { workspace = true }
 maki-lan = { workspace = true }
+maki-acp-client = { workspace = true }
 maki-config = { workspace = true }
 maki-commands = { workspace = true }
 maki-providers = { workspace = true }

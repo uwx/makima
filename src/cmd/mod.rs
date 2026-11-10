@@ -1,4 +1,5 @@
 mod acp;
+mod attach;
 mod subcmd;
 mod tui;
 
@@ -133,6 +134,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 token,
             )?;
         }
+        Some(Command::Attach {
+            link,
+            token,
+            prompt,
+        }) => attach::run(link, token, prompt)?,
         Some(Command::Trust { action }) => {
             let storage = StateDir::resolve().context("resolve state directory")?;
             match action {

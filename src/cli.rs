@@ -280,6 +280,17 @@ pub enum Command {
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
     },
+    /// Attach to the agent another machine shares, from this terminal
+    Attach {
+        /// Where the agent is: host:port, or lan://host:port:/directory to start a session there
+        link: String,
+        /// Token the agent expects. Defaults to $MAKIMA_LAN_TOKEN, then the stored token
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
+        /// Send this prompt, answer what it needs, and exit
+        #[arg(short, long, value_name = "TEXT")]
+        prompt: Option<String>,
+    },
     /// Show the rendered system prompt or tool definitions
     Prompt {
         /// Prompt variant: system (default), research, general
