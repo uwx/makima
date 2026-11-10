@@ -60,6 +60,7 @@ Rust workspace, key crates in root dir:
 - maki-match: shared fuzzy matching (nucleo): `fuzzy_match`/`fuzzy_resolve` used by command-argument resolution and the `maki.match` Lua API
 - maki-acp: ACP ndjson stdio server
 - claude-agent-bridge: TypeScript bridge that serves the `claude-agent` provider through the Claude Agent SDK over a Unix socket (`just bridge-check`)
+- maki-mobile: The phone app, a GPUI window built as a `cdylib` for Android (one NativeActivity, no Java) and iOS later. `just android-apk` builds it with the SDK's own `aapt2`/`zipalign`/`apksigner`, no Gradle; `just android-run` installs it on the attached device or emulator. `vendor/gpui-mobile` is a fork of longbridge/gpui-mobile: its `gpui-pre` pins are raised to the `=0.3.12` snapshot gpui-kit pins and the `offscreen` feature (which needs a patched `gpui-pre-wgpu`) is gone. It is excluded from the workspace because it only builds for mobile targets. On an emulator use `-gpu host`; `swiftshader_indirect` starves the guest and adb stops answering.
 
 Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch, todo_write, read, write, edit, task, code_execution (python sandbox), batch, splash (the home-screen renderer; it owns the version UI via `maki.version()`), providers (every built-in provider, the models.dev catalog providers, and custom and executable providers from `providers.toml` and `providers/`).
 

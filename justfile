@@ -56,5 +56,14 @@ bridge-check:
 bench *ARGS:
     cargo bench -p maki-lua {{ARGS}}
 
+# Build the phone app's APK (arm64 + x86_64). Needs ANDROID_HOME with NDK and
+# build-tools; a JDK for apksigner. Output: target/android/makima.apk
+android-apk *ARGS:
+    python maki-mobile/android/build_apk.py {{ARGS}}
+
+# Install the debug APK on the attached device or emulator and start it.
+android-run *ARGS:
+    python maki-mobile/android/build_apk.py --debug --install {{ARGS}}
+
 # Full CI check
 ci: fmt-check lint pylint test gen-docs-check machete
