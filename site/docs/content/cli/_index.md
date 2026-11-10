@@ -163,7 +163,9 @@ makima attach lan://192.168.2.4:60667 --token my-token
 makima attach lan://192.168.2.4:60667:/srv/app --prompt "what does main.rs do?"
 ```
 
-Drives an agent another machine shares, from this terminal. The session is watched read only until you type `/take`; then lines are prompts. `/cancel` stops a turn and `/quit` leaves. Tool calls, permissions and pickers print as they come, and the token comes from `--token`, then `$MAKIMA_LAN_TOKEN`, then the one stored on this machine. A bare `host:port` works where a full link does. `--prompt` sends one prompt, answers what it asks, and exits.
+Opens the full interface on a session another machine runs. Prompts, tool calls, permissions and token counts work exactly like a local session, because the window's agent executes each turn on the other machine over ACP. Typing a prompt in a session you only watch takes control of it first, and says so when another window is busy with it.
+
+The token comes from `--token`, then `$MAKIMA_LAN_TOKEN`, then the one stored on this machine. A bare `host:port` works where a full link does. `--plain` keeps the line renderer for a terminal that cannot take the full screen, and that is what a pipe gets. In line mode the session is watched read only until you type `/take`; `/cancel` stops a turn and `/quit` leaves. `--prompt` sends one prompt, answers what it asks, and exits, which is always line mode.
 
 Without a link it listens for a few seconds and lists the sessions the local network announces, then asks which one; the token question takes the one the sharing window shows, or nothing to use this machine's.
 

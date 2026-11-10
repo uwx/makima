@@ -183,6 +183,15 @@ pub struct EventLoopParams {
     pub startup_notice: Option<String>,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
+    /// An agent another machine runs, whose turns this window executes over
+    /// ACP. Every session started from it renders exactly like a local one.
+    pub remote: Option<RemoteSession>,
+}
+
+/// A connection to an agent somewhere else, and what to call it.
+pub struct RemoteSession {
+    pub connection: maki_acp_client::Connection,
+    pub label: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1226,6 +1235,7 @@ struct SpawnCtx {
     command_runtime: Arc<CommandRuntime>,
     model_capabilities: Arc<ModelCapabilityCache>,
     trust_question: Option<TrustQuestion>,
+    remote: Option<RemoteSession>,
 }
 
 struct CoordinatorDeps {
@@ -1450,6 +1460,7 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
             Arc::clone(&self.providers),
             self.system_prompt.clone(),
+            self.remote.as_ref().map(|remote| &remote.connection),
         );
         let deps = self.coordinator_deps();
         let coordinator = prepare_coordinator(
@@ -1775,6 +1786,7 @@ impl<'t> EventLoop<'t> {
             startup_notice,
             system_prompt_override,
             append_system_prompt,
+            remote,
         } = params;
 
         lua_event_handle.set_clock_format(crate::clock::resolved(ui_config.clock_format));
@@ -1869,6 +1881,7 @@ impl<'t> EventLoop<'t> {
             command_runtime,
             model_capabilities,
             trust_question,
+            remote,
         };
 
         let mut runtimes = Vec::with_capacity(sessions.len());
@@ -5934,6 +5947,7 @@ mod tests {
             Arc::new(ModelPolicy::default()),
             Arc::default(),
             SystemPromptOverride::default(),
+            None,
         );
         handles.apply_to_app(&mut app);
         let coordinator = test_coordinator(app.state.session.id);
@@ -6383,6 +6397,7 @@ mod tests {
                 command_runtime,
                 model_capabilities: ModelCapabilityCache::new(|_| ModelCapabilities::NONE, || {}),
                 trust_question: None,
+                remote: None,
             };
             Self {
                 _temp_dir: temp_dir,

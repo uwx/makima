@@ -5307,6 +5307,7 @@ dependencies = [
 name = "maki-ui"
 version = "0.5.5-makima"
 dependencies = [
+ "agent-client-protocol-schema",
  "arboard",
  "arc-swap",
  "async-lock",
@@ -5321,6 +5322,7 @@ dependencies = [
  "image",
  "jiff",
  "libc",
+ "maki-acp-client",
  "maki-agent",
  "maki-commands",
  "maki-config",

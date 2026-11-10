@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+test-util = []
+
 [dependencies]
 agent-client-protocol-schema = { workspace = true }
 maki-lan = { workspace = true }

@@ -329,10 +329,17 @@ fn exit_resume_hint(id: &str, colored: bool) -> String {
     )
 }
 
-pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
+const ATTACHED_RELOAD: &str = "this window is attached to another machine; restart it to reload";
+
+pub fn run(
+    mut cli: Cli,
+    cwd: PathBuf,
+    mut remote: Option<maki_ui::RemoteSession>,
+) -> Result<()> {
     if cli.print && session_picker_requested(&cli) {
         bail!(PICKER_NEEDS_TUI_ERR);
     }
+    let attached = remote.is_some();
     let explicit_model = cli.model.is_some();
     let mut apply_explicit_model = explicit_model;
     let storage = StateDir::resolve().context("resolve data directory")?;
@@ -359,7 +366,9 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
 
     let can_ask =
         !cli.print && !cli.is_sdk_mode() && io::stdin().is_terminal() && io::stderr().is_terminal();
-    let mut notice = None;
+    let mut notice = remote
+        .as_ref()
+        .map(|remote| format!("attached to {}", remote.label));
     let answer = trust.state.unanswered().and_then(|question| {
         policy_grant(question, &stack.config.trust)
             .map(|pattern| {
@@ -451,14 +460,17 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
 
     let cwd_str = cwd.to_string_lossy().into_owned();
     let session_id = cli.continue_session.as_ref().and_then(|o| o.as_deref());
-    let mut session_picker = session_picker_requested(&cli);
-    let mut tabs = vec![resolve_session(
-        cli.last_session && !session_picker,
-        session_id,
-        &stack.model.spec(),
-        &cwd_str,
-        &storage,
-    )?];
+    let mut session_picker = !attached && session_picker_requested(&cli);
+    let mut tabs = vec![match &remote {
+        Some(remote) => AppSession::new(&remote.connection.model, &cwd_str),
+        None => resolve_session(
+            cli.last_session && !session_picker,
+            session_id,
+            &stack.model.spec(),
+            &cwd_str,
+            &storage,
+        )?,
+    }];
     let mut focused = 0;
     let mut warnings = startup_warnings;
     let mut teardown = Teardown::default();
@@ -476,7 +488,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
             maki_ui::EventLoopParams {
                 cwd: cwd.clone(),
                 model,
-                needs_login: stack.needs_login,
+                needs_login: stack.needs_login && !attached,
                 explicit_model: apply_explicit_model,
                 commands: std::mem::take(&mut stack.commands),
                 sessions: std::mem::take(&mut tabs),
@@ -509,6 +521,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
                 project_config: trust.project_config.clone(),
                 trust_question: trust.state.question().cloned(),
                 startup_notice: notice.take(),
+                remote: remote.take(),
             },
             initial_prompt.take(),
         )
@@ -538,6 +551,9 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
                 tabs: reloaded,
                 focused: f,
             } => {
+                if attached {
+                    bail!(ATTACHED_RELOAD);
+                }
                 // The picker is a one-shot startup request; a later
                 // `/reload` must reopen a fresh tab instead of re-prompting.
                 session_picker = false;
@@ -796,6 +812,7 @@ mod tests {
         let err = run(
             Cli::parse_from(["makima", "--print", "-c"]),
             PathBuf::from(THIS_CWD),
+            None,
         )
         .expect_err("bare -c under --print fails before any stack work");
         assert!(err.to_string().contains(PICKER_NEEDS_TUI_ERR));

@@ -53,11 +53,11 @@ fn unmatched_permission_rules(permissions: &PermissionsConfig) -> Vec<String> {
         .collect()
 }
 
-pub fn dispatch(cli: Cli) -> Result<()> {
+pub fn dispatch(mut cli: Cli) -> Result<()> {
     // `--trust` and `--no-project` hold for this process, so every entry
     // point under them reads the same shared project config the TUI would.
     let trust_mode = cli.trust_mode();
-    match cli.command {
+    match cli.command.take() {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             maki_providers::model_registry::load_from_storage(&storage);
@@ -137,8 +137,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Attach {
             link,
             token,
+            plain,
             prompt,
-        }) => attach::run(link, token, prompt)?,
+        }) => attach::run(cli, link, token, plain, prompt)?,
         Some(Command::Trust { action }) => {
             let storage = StateDir::resolve().context("resolve state directory")?;
             match action {
@@ -171,7 +172,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             )?;
         }
         None => {
-            tui::run(cli, startup_cwd()?)?;
+            tui::run(cli, startup_cwd()?, None)?;
         }
     }
     Ok(())

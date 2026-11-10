@@ -68,7 +68,7 @@ use maki_storage::id::MakiId;
 pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
 
 pub(crate) use agent::AgentCommand;
-pub use event_loop::EventLoopParams;
+pub use event_loop::{EventLoopParams, RemoteSession};
 
 /// How a UI generation ended. On `Reload`, each tab carries its in-memory
 /// session so the caller reopens everything without re-reading from disk.

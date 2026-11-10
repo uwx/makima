@@ -288,7 +288,10 @@ pub enum Command {
         /// Token the agent expects. Defaults to $MAKIMA_LAN_TOKEN, then the stored token
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
-        /// Send this prompt, answer what it needs, and exit
+        /// Stay line based instead of opening the full interface
+        #[arg(long)]
+        plain: bool,
+        /// Send this prompt, answer what it needs, and exit (line mode)
         #[arg(short, long, value_name = "TEXT")]
         prompt: Option<String>,
     },

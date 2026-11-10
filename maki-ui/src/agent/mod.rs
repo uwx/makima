@@ -1,6 +1,7 @@
 mod agent_loop;
 mod command_router;
 pub(crate) mod pending;
+pub(crate) mod remote;
 pub(crate) mod shared_queue;
 
 use std::path::PathBuf;
@@ -331,6 +332,7 @@ impl AgentHandles {
         model_policy: Arc<ModelPolicy>,
         providers: Arc<ProviderRegistry>,
         system_prompt: SystemPromptOverride,
+        remote: Option<&maki_acp_client::Connection>,
     ) -> Self {
         let selected = model_slot.load();
         let initial_config = maki_agent::EffectiveAgentConfig::new(
@@ -360,6 +362,7 @@ impl AgentHandles {
             model_policy,
             providers,
             system_prompt,
+            remote,
         )
         .activate();
         handles.release_runner();
@@ -383,6 +386,7 @@ impl AgentHandles {
         model_policy: Arc<ModelPolicy>,
         providers: Arc<ProviderRegistry>,
         system_prompt: SystemPromptOverride,
+        remote: Option<&maki_acp_client::Connection>,
     ) -> PreparedAgentHandles {
         spawn_agent_internal(
             model_slot,
@@ -400,6 +404,7 @@ impl AgentHandles {
             model_policy,
             providers,
             system_prompt,
+            remote,
         )
     }
 
@@ -525,6 +530,7 @@ fn spawn_agent_internal(
     model_policy: Arc<ModelPolicy>,
     providers: Arc<ProviderRegistry>,
     system_prompt: SystemPromptOverride,
+    remote: Option<&maki_acp_client::Connection>,
 ) -> PreparedAgentHandles {
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
@@ -563,6 +569,7 @@ fn spawn_agent_internal(
             initial_history.clone(),
             Some(Arc::clone(&shared_history)),
             |agent_id| {
+                let answers = answer_rx.clone();
                 let backend = new_backend(
                     agent_id,
                     Arc::clone(model_slot),
@@ -588,7 +595,15 @@ fn spawn_agent_internal(
                     init_cancel,
                 );
                 orchestration_template = Some(backend.orchestration_template());
-                Ok::<Box<dyn maki_agent::ActorBackend>, String>(Box::new(backend))
+                let backend: Box<dyn maki_agent::ActorBackend> = match remote {
+                    Some(connection) => Box::new(remote::AcpBackend::new(
+                        connection,
+                        agent_tx.clone(),
+                        answers,
+                    )),
+                    None => Box::new(backend),
+                };
+                Ok::<_, String>(backend)
             },
             start_rx,
         )
@@ -733,6 +748,7 @@ mod tests {
             Arc::new(ModelPolicy::default()),
             Arc::default(),
             SystemPromptOverride::default(),
+            None,
         )
     }
 

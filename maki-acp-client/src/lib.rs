@@ -507,7 +507,34 @@ pub struct Connection {
 
 pub fn connect(target: &Target) -> Result<Connection, String> {
     let (reader, writer, child) = target.open()?;
+    let (client, events) = spawn_agent(reader, writer, child)?;
+    open_session(
+        client,
+        events,
+        target.session_cwd(),
+        target.shares_a_session(),
+        target.attach_only(),
+        target.label(),
+    )
+}
 
+/// Talks to an agent that is already reachable, without spawning one: the
+/// caller owns both ends, so tests can script the agent side of a pipe.
+#[cfg(feature = "test-util")]
+pub fn connect_streams(
+    reader: impl Read + Send + 'static,
+    writer: impl Write + Send + 'static,
+    cwd: &Path,
+) -> Result<Connection, String> {
+    let (client, events) = spawn_agent(reader, writer, None)?;
+    open_session(client, events, cwd, false, false, "streams")
+}
+
+fn spawn_agent(
+    reader: impl Read + Send + 'static,
+    writer: impl Write + Send + 'static,
+    child: Option<Child>,
+) -> Result<(Arc<Client>, Receiver<Event>), String> {
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let (events_tx, events_rx) = flume::unbounded::<Event>();
     let client = Arc::new(Client {
@@ -529,8 +556,19 @@ pub fn connect(target: &Target) -> Result<Connection, String> {
             .map_err(|error| format!("start agent waiter: {error}"))?;
     }
 
+    Ok((client, events_rx))
+}
+
+fn open_session(
+    client: Arc<Client>,
+    events: Receiver<Event>,
+    cwd: &Path,
+    shares_a_session: bool,
+    attach_only: bool,
+    label: &str,
+) -> Result<Connection, String> {
     let themes = client.initialize()?;
-    let live = if target.shares_a_session() {
+    let live = if shares_a_session {
         client.live_sessions()?.into_iter().next()
     } else {
         None
@@ -547,20 +585,19 @@ pub fn connect(target: &Target) -> Result<Connection, String> {
             let model = view.model.clone().unwrap_or_default();
             (session, model, view, true)
         }
-        None if target.attach_only() => {
+        None if attach_only => {
             return Err(format!(
-                "{} shares no session right now; add a directory to start one there",
-                target.label()
+                "{label} shares no session right now; add a directory to start one there"
             ));
         }
         None => {
-            let (session, model, options) = client.new_session(target.session_cwd())?;
+            let (session, model, options) = client.new_session(cwd)?;
             (session, model, options, false)
         }
     };
     Ok(Connection {
         client,
-        events: events_rx,
+        events,
         session,
         model,
         options,
@@ -794,16 +831,17 @@ impl Client {
     }
 
     pub fn prompt(&self, text: &str) -> Result<StopReason, String> {
+        self.prompt_blocks(vec![ContentBlock::Text(TextContent::new(text.to_owned()))])
+    }
+
+    pub fn prompt_blocks(&self, blocks: Vec<ContentBlock>) -> Result<StopReason, String> {
         let session = self
             .session
             .lock()
             .unwrap()
             .clone()
             .ok_or_else(|| "no active session".to_owned())?;
-        let request = PromptRequest::new(
-            session,
-            vec![ContentBlock::Text(TextContent::new(text.to_owned()))],
-        );
+        let request = PromptRequest::new(session, blocks);
         let response: PromptResponse = self.request(SESSION_PROMPT_METHOD, request, None)?;
         Ok(response.stop_reason)
     }

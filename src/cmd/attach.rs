@@ -1,8 +1,9 @@
-//! Driving an agent another machine serves, from a terminal. The session is
-//! watched read only until this terminal takes control of it.
+//! Driving an agent another machine serves, from a terminal. The full
+//! interface attaches to it like any other session; `--plain` keeps the line
+//! renderer, which is also what a pipe gets.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,6 +16,9 @@ use maki_acp_client::{
 };
 use maki_lan::discovery::{Browser, Discovered, Found};
 use maki_storage::StateDir;
+
+use crate::cli::Cli;
+use crate::cmd::tui;
 
 const TAKE_COMMAND: &str = "take";
 const CANCEL_COMMAND: &str = "cancel";
@@ -38,10 +42,19 @@ const ANNOUNCED_HEADER: &str = "shared sessions on the local network:";
 const NOTHING_ANNOUNCED: &str =
     "no shared session was announced; pass a link, like `makima attach 192.168.2.4:60667`";
 const NOTHING_CHOSEN: &str = "nothing chosen";
+const CWD_ERR: &str = "cannot read the current directory (was it deleted?)";
 /// How long a terminal listens for announcements before showing what it has.
 const ANNOUNCE_WAIT: Duration = Duration::from_secs(3);
 
-pub fn run(link: Option<String>, token: Option<String>, prompt: Option<String>) -> Result<()> {
+/// A line renderer answers a prompt and exits, and a pipe has no screen to
+/// draw: both stay on the terminal path, everything else gets the full UI.
+pub fn run(
+    cli: Cli,
+    link: Option<String>,
+    token: Option<String>,
+    plain: bool,
+    prompt: Option<String>,
+) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     let (link, token) = match link {
         Some(link) => (link, token),
@@ -53,6 +66,15 @@ pub fn run(link: Option<String>, token: Option<String>, prompt: Option<String>) 
     let token = token_for(token, &storage)?;
     let target = Target::lan(&with_scheme(&link), Some(&token)).map_err(|error| eyre!(error))?;
     let connection = maki_acp_client::connect(&target).map_err(|error| eyre!(error))?;
+    if !plain && prompt.is_none() && io::stdout().is_terminal() {
+        let label = target.label().to_owned();
+        let cwd = std::env::current_dir().context(CWD_ERR)?;
+        return tui::run(
+            cli,
+            cwd,
+            Some(maki_ui::RemoteSession { connection, label }),
+        );
+    }
     let mut session = Session::new(connection);
     match prompt {
         Some(text) => {

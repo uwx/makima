@@ -126,15 +126,18 @@ A watching connection that does not hold control cannot write: `session/prompt`,
 
 ### Watching from a terminal
 
-`makima attach <link>` is a terminal client for a shared session:
+`makima attach <link>` opens a shared session in the full interface:
 
 ```bash
 makima attach                           # pick from what the network announces
 makima attach 192.168.2.4:60667         # token from $MAKIMA_LAN_TOKEN or the state directory
 makima attach lan://192.168.2.4:60667 --token my-token
+makima attach 192.168.2.4:60667 --plain # line rendering instead
 ```
 
-With no link it waits a few seconds and lists the announced sessions to choose from. It replays the chosen session, then follows it. Lines are prompts once you type `/take`; `/cancel` stops a turn, `/quit` leaves. Tool calls print as `→ title` and `✓ title`, permission requests print their options and take a number, and pickers take a number too.
+With no link it waits a few seconds and lists the announced sessions to choose from. The window replays the chosen session and then follows it: the chat renders the streamed text, thinking and tool calls, and permissions get the usual prompt. Each turn is a `session/prompt` sent to the machine that runs the agent, so the model, the tools and the files all stay there. Prompting a session you only watch takes control of it.
+
+`--plain` keeps the line renderer for a terminal that cannot take the full screen, which is also what a pipe gets. There the session is watched read only until you type `/take`; `/cancel` stops a turn, `/quit` leaves, tool calls print as `→ title` and `✓ title`, and permissions and pickers take a number.
 
 ### Taking control
 
