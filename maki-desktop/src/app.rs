@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol_schema::{
@@ -22,6 +24,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
+use maki_lan::discovery::{Browser, Discovered, Found};
+use maki_lan::link;
 use serde_json::Value;
 
 use crate::acp::{
@@ -74,6 +78,11 @@ const SHARED_NOTICE: &str = "Sharing this session";
 const SHARE_STOPPED: &str = "This session is no longer shared";
 const LINK_COPIED: &str = "Link copied";
 const TOKEN_COPIED: &str = "Token copied";
+const CONNECT_COMMAND: &str = "connect";
+const CONNECT_USAGE: &str = "Usage: /connect lan://host:port <token>";
+const REMOTE_GROUP: &str = "Remote";
+const REMOTE_TOKEN_HINT: &str = "Type the token the sharing window shows, then press Enter";
+const DISCOVERY_WAIT: Duration = Duration::from_secs(2);
 const WATCHING_NOTICE: &str = "Watching a shared session; take control to type";
 const READ_ONLY_NOTICE: &str = "This shared session is read-only; take control to type";
 const CONTROL_TAKEN: &str = "You control this shared session";
@@ -213,6 +222,15 @@ impl ArgumentMenu {
     }
 }
 
+/// What a panel asks of the window, which alone can open a tab for another
+/// agent.
+pub enum PanelEvent {
+    /// Attach to the agent at this link, with the token it expects.
+    Connect { link: String, token: String },
+}
+
+impl EventEmitter<PanelEvent> for SessionPanel {}
+
 /// One agent session: its connection, transcript, composer, and overlays.
 pub struct SessionPanel {
     backend: Option<Backend>,
@@ -245,6 +263,11 @@ pub struct SessionPanel {
 pub struct ChatApp {
     panels: Vec<Entity<SessionPanel>>,
     active: usize,
+    /// Sessions other machines announce on the local network.
+    remotes: Vec<Found>,
+    /// The token each link expects, once a window has been given one.
+    tokens: HashMap<String, String>,
+    _discovery: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -374,7 +397,7 @@ impl SessionPanel {
         if text.is_empty() {
             return;
         }
-        if self.run_local_command(&text) {
+        if self.run_local_command(&text, cx) {
             self.input.update(cx, |state, cx| state.clean(window, cx));
             self.slash = None;
             self.arguments = None;
@@ -416,14 +439,47 @@ impl SessionPanel {
         cx.notify();
     }
 
-    fn run_local_command(&mut self, text: &str) -> bool {
+    fn run_local_command(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         match local_command(text) {
             Some(LocalCommand::ThemePicker) => self.open_theme_picker(),
             Some(LocalCommand::Theme(name)) => self.switch_theme(name),
             Some(LocalCommand::Sessions(query)) => self.open_sessions(query),
+            Some(LocalCommand::Connect {
+                link,
+                token: Some(token),
+            }) => self.connect(link, token, cx),
+            Some(LocalCommand::Connect { token: None, .. }) => {
+                self.notice(CONNECT_USAGE.to_owned())
+            }
             None => return false,
         }
         true
+    }
+
+    /// Asks the window for a tab on the agent at {link}.
+    fn connect(&mut self, link: String, token: String, cx: &mut Context<Self>) {
+        if let Err(error) = Target::lan(&link, Some(&token)) {
+            self.notice(error);
+            cx.notify();
+            return;
+        }
+        cx.emit(PanelEvent::Connect { link, token });
+    }
+
+    /// Puts the start of a connect command in the composer for a window that
+    /// still has to type the token.
+    fn prefill(
+        &mut self,
+        text: String,
+        notice: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input
+            .update(cx, |state, cx| state.set_value(text, window, cx));
+        self.notice(notice);
+        self.focus(window, cx);
+        cx.notify();
     }
 
     fn take_control(&mut self, cx: &mut Context<Self>) {
@@ -1839,6 +1895,14 @@ impl ChatApp {
         let this = cx.entity().downgrade();
         let subscriptions = vec![
             cx.observe(&panel, |_, _, cx| cx.notify()),
+            cx.subscribe_in(
+                &panel,
+                window,
+                |app: &mut ChatApp, _, event, window, cx| {
+                    let PanelEvent::Connect { link, token } = event;
+                    app.connect(link.clone(), token.clone(), window, cx);
+                },
+            ),
             cx.intercept_keystrokes(move |event, window, cx| {
                 _ = this.update(cx, |this, cx| {
                     if this.on_key(&event.keystroke, window, cx) {
@@ -1851,6 +1915,9 @@ impl ChatApp {
         Self {
             panels: vec![panel],
             active: 0,
+            remotes: Vec::new(),
+            tokens: HashMap::new(),
+            _discovery: watch_remote_sessions(cx),
             _subscriptions: subscriptions,
         }
     }
@@ -1871,6 +1938,20 @@ impl ChatApp {
     }
 
     fn open_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.open_panel(Target::from_env, window, cx)
+    }
+
+    /// Opens a tab whose agent is {target}.
+    fn open_target(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.open_panel(move || Ok(target), window, cx)
+    }
+
+    fn open_panel(
+        &mut self,
+        target: impl FnOnce() -> Result<Target, String> + Send + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let panel = cx.new(|cx| SessionPanel::new(window, cx));
         let target_panel = panel.clone();
         let theme = self
@@ -1879,13 +1960,21 @@ impl ChatApp {
             .and_then(|panel| panel.read(cx).theme_name());
         self._subscriptions
             .push(cx.observe(&panel, |_, _, cx| cx.notify()));
+        self._subscriptions.push(cx.subscribe_in(
+            &panel,
+            window,
+            |app: &mut ChatApp, _, event, window, cx| {
+                let PanelEvent::Connect { link, token } = event;
+                app.connect(link.clone(), token.clone(), window, cx);
+            },
+        ));
         self.panels.push(panel);
         self.active = self.panels.len() - 1;
         self.focus_active(window, cx);
         cx.spawn(async move |this, cx| {
             let started = cx
                 .background_executor()
-                .spawn(async { Target::from_env().and_then(Backend::start) })
+                .spawn(async move { target().and_then(Backend::start) })
                 .await;
             _ = this.update(cx, |app, cx| {
                 if app.panels.contains(&target_panel) {
@@ -1901,6 +1990,58 @@ impl ChatApp {
         .detach();
         cx.notify();
         true
+    }
+
+    /// Remembers the token for {link} and opens a tab that watches it.
+    fn connect(&mut self, link: String, token: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.tokens.insert(link.clone(), token.clone());
+        if let Ok(target) = Target::lan(&link, Some(&token)) {
+            self.open_target(target, window, cx);
+        }
+    }
+
+    /// Opens a tab on an announced session, asking for its token when this
+    /// window has not been given one yet.
+    fn open_remote(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(found) = self.remotes.get(index).cloned() else {
+            return;
+        };
+        let link = link(found.address);
+        match self.tokens.get(&link).cloned() {
+            Some(token) => self.connect(link, token, window, cx),
+            None => self.ask_for_token(&link, window, cx),
+        }
+    }
+
+    fn ask_for_token(&mut self, link: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.panels.get(self.active).cloned() else {
+            return;
+        };
+        panel.update(cx, |panel, cx| {
+            panel.prefill(
+                format!("{SLASH_PREFIX}{CONNECT_COMMAND} {link} "),
+                REMOTE_TOKEN_HINT.to_owned(),
+                window,
+                cx,
+            );
+        });
+        self.focus_active(window, cx);
+    }
+
+    fn on_discovered(&mut self, discovered: Discovered, cx: &mut Context<Self>) {
+        match discovered {
+            Discovered::Found(found) => {
+                match self.remotes.iter_mut().find(|remote| remote.fullname == found.fullname) {
+                    Some(remote) => *remote = found,
+                    None => self.remotes.push(found),
+                }
+                self.remotes.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+            Discovered::Gone(fullname) => {
+                self.remotes.retain(|remote| remote.fullname != fullname);
+            }
+        }
+        cx.notify();
     }
 
     fn close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -1941,6 +2082,31 @@ impl ChatApp {
                     .active(index == self.active)
                     .on_click(move |_, window, cx| {
                         this.update(cx, |app, cx| app.switch_tab(index, window, cx));
+                    })
+            })
+            .collect::<Vec<_>>();
+        let remote_rows = self
+            .remotes
+            .iter()
+            .enumerate()
+            .map(|(index, found)| {
+                let this = cx.entity();
+                let label = if found.project.is_empty() {
+                    found.name.clone()
+                } else {
+                    found.project.clone()
+                };
+                let address = found.address.to_string();
+                SidebarMenuItem::new(label)
+                    .icon(IconName::Network)
+                    .suffix(move |_, cx| {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(address.clone())
+                    })
+                    .on_click(move |_, window, cx| {
+                        this.update(cx, |app, cx| app.open_remote(index, window, cx));
                     })
             })
             .collect::<Vec<_>>();
@@ -1995,6 +2161,12 @@ impl ChatApp {
                 SidebarGroup::new(SESSIONS_GROUP)
                     .child(SidebarMenu::new().children(rows).child(new_row)),
             )
+            .when(!remote_rows.is_empty(), |this| {
+                this.child(
+                    SidebarGroup::new(REMOTE_GROUP)
+                        .child(SidebarMenu::new().children(remote_rows)),
+                )
+            })
             .footer(
                 SidebarFooter::new().child(
                     v_flex()
@@ -2032,6 +2204,33 @@ impl ChatApp {
     }
 }
 
+/// Lists the sessions other machines announce, for as long as the window lives.
+fn watch_remote_sessions(cx: &mut Context<ChatApp>) -> Task<()> {
+    let (found_tx, found_rx) = flume::unbounded();
+    _ = thread::Builder::new()
+        .name("maki-discovery".into())
+        .spawn(move || {
+            let Some(browser) = Browser::start() else {
+                return;
+            };
+            while let Some(discovered) = browser.next(DISCOVERY_WAIT) {
+                if found_tx.send(discovered).is_err() {
+                    return;
+                }
+            }
+        });
+    cx.spawn(async move |this, cx| {
+        while let Ok(discovered) = found_rx.recv_async().await {
+            if this
+                .update(cx, |app, cx| app.on_discovered(discovered, cx))
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
 fn slash_query(value: &str) -> Option<String> {
     let rest = value.strip_prefix(SLASH_PREFIX)?;
     rest.chars()
@@ -2044,6 +2243,11 @@ enum LocalCommand {
     ThemePicker,
     Theme(String),
     Sessions(String),
+    /// A LAN agent to attach to, and the token it expects when it was given.
+    Connect {
+        link: String,
+        token: Option<String>,
+    },
 }
 
 fn local_command(text: &str) -> Option<LocalCommand> {
@@ -2052,6 +2256,13 @@ fn local_command(text: &str) -> Option<LocalCommand> {
         return Some(match name.trim() {
             "" => LocalCommand::ThemePicker,
             name => LocalCommand::Theme(name.to_owned()),
+        });
+    }
+    if let Some(arguments) = rest.strip_prefix(CONNECT_COMMAND) {
+        let mut arguments = arguments.split_whitespace();
+        return Some(LocalCommand::Connect {
+            link: arguments.next().unwrap_or_default().to_owned(),
+            token: arguments.next().map(str::to_owned),
         });
     }
     Some(LocalCommand::Sessions(
@@ -2411,6 +2622,24 @@ mod tests {
     #[test_case("/theming", None ; "other command")]
     #[test_case("/sessions", Some(LocalCommand::Sessions(String::new())) ; "bare sessions opens the picker")]
     #[test_case("/sessions auth", Some(LocalCommand::Sessions("auth".to_owned())) ; "session query")]
+    #[test_case(
+        "/connect lan://box:7331",
+        Some(LocalCommand::Connect { link: "lan://box:7331".to_owned(), token: None })
+        ; "a link still waiting for its token"
+    )]
+    #[test_case(
+        "/connect lan://box:7331 abc123",
+        Some(LocalCommand::Connect {
+            link: "lan://box:7331".to_owned(),
+            token: Some("abc123".to_owned()),
+        })
+        ; "a link with the token it expects"
+    )]
+    #[test_case(
+        "/connect",
+        Some(LocalCommand::Connect { link: String::new(), token: None })
+        ; "bare connect asks how to use it"
+    )]
     #[test_case("hello", None ; "plain text")]
     fn local_command_recognizes_local_commands(text: &str, expected: Option<LocalCommand>) {
         assert_eq!(local_command(text), expected);

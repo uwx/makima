@@ -83,7 +83,7 @@ A connection that owns a session can open a listener for it later, without a res
 
 Only the connection that owns the session can share it: a watching connection gets `-32014`, even while it holds control. A share that cannot bind answers `-32013`.
 
-The desktop window has the same thing as a status bar toggle. `Share` opens the listener and shows the address with buttons for the link and the token, `Stop sharing` closes it. Another window reaches it with `MAKI_DESKTOP_REMOTE=lan://192.168.2.4:60667` and `MAKI_DESKTOP_LAN_TOKEN=...`. The link names no directory: that window watches the session the other machine serves instead of starting one.
+The desktop window has the same thing as a status bar toggle. `Share` opens the listener and shows the address with buttons for the link and the token, `Stop sharing` closes it. Another window reaches it with `MAKI_DESKTOP_REMOTE=lan://192.168.2.4:60667` and `MAKI_DESKTOP_LAN_TOKEN=...`, or by choosing the session under `Remote` in its sidebar, which asks for the token. The same link works in the composer as `/connect lan://192.168.2.4:60667 <token>`. The link names no directory: that window watches the session the other machine serves instead of starting one.
 
 ### Finding a session on the local network
 

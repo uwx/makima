@@ -17,6 +17,7 @@ gpui-kit = { workspace = true }
 agent-client-protocol-schema = { workspace = true }
 jiff = { workspace = true }
 maki-storage = { workspace = true }
+maki-lan = { workspace = true }
 color-eyre = { workspace = true }
 flume = { workspace = true }
 serde = { workspace = true }

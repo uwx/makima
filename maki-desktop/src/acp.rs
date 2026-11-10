@@ -306,6 +306,8 @@ pub struct Target {
     process_cwd: Option<PathBuf>,
     session_cwd: PathBuf,
     lan: Option<Lan>,
+    /// Whether the session must already exist there, as a copied link implies.
+    attach_only: bool,
 }
 
 struct Lan {
@@ -341,6 +343,12 @@ impl Target {
         self.lan.is_some()
     }
 
+    /// Whether the session must already exist where the agent runs, which is
+    /// what a link without a directory says.
+    pub fn attach_only(&self) -> bool {
+        self.attach_only
+    }
+
     /// Whether this window runs the agent itself, so it can share it.
     pub fn is_local(&self) -> bool {
         self.lan.is_none() && self.process_cwd.is_some()
@@ -360,22 +368,26 @@ impl Target {
             process_cwd: Some(cwd.clone()),
             session_cwd: cwd,
             lan: None,
+            attach_only: false,
         }
     }
 
     /// `lan://host:port:/absolute/path`: the session runs on the machine that
     /// shares it, so the path is that machine's. A bare `lan://host:port`
     /// watches the session that machine already serves.
-    fn lan(spec: &str, token: Option<&str>) -> Result<Self, String> {
+    pub fn lan(spec: &str, token: Option<&str>) -> Result<Self, String> {
         let rest = spec
             .strip_prefix(LAN_SCHEME)
             .ok_or_else(|| format!("{LAN_SCHEME} expected, got {spec:?}"))?;
-        let (address, path) = match rest.split_once(":/") {
-            Some((address, path)) if !address.is_empty() && !path.is_empty() => {
-                (address, PathBuf::from(format!("/{path}")))
-            }
-            _ if !rest.is_empty() && !rest.contains(":/") => (rest, PathBuf::from("/")),
-            _ => {
+        let directory = rest
+            .split_once(":/")
+            .filter(|(address, path)| !address.is_empty() && !path.is_empty())
+            .map(|(address, path)| (address, PathBuf::from(format!("/{path}"))));
+        let attach_only = directory.is_none();
+        let (address, path) = match directory {
+            Some((address, path)) => (address, path),
+            None if !rest.is_empty() && !rest.contains(":/") => (rest, PathBuf::from("/")),
+            None => {
                 return Err(format!(
                     "{REMOTE_ENV} must be {LAN_SCHEME}host:port:/absolute/path, got {spec:?}"
                 ));
@@ -390,6 +402,7 @@ impl Target {
             program: String::new(),
             args: Vec::new(),
             process_cwd: None,
+            attach_only,
             session_cwd: path,
             lan: Some(Lan {
                 address: address.to_owned(),
@@ -422,6 +435,7 @@ impl Target {
             process_cwd: None,
             session_cwd: path,
             lan: None,
+            attach_only: false,
         })
     }
 
@@ -528,6 +542,12 @@ pub fn connect(target: &Target) -> Result<Connection, String> {
             let view = session_view(&options);
             let model = view.model.clone().unwrap_or_default();
             (session, model, view, true)
+        }
+        None if target.attach_only() => {
+            return Err(format!(
+                "{} shares no session right now; add a directory to start one there",
+                target.label()
+            ));
         }
         None => {
             let (session, model, options) = client.new_session(target.session_cwd())?;
@@ -1239,7 +1259,14 @@ old
         let target = Target::lan("lan://buildbox:7331", Some("token")).unwrap();
         assert_eq!(target.label(), "lan://buildbox:7331");
         assert_eq!(target.session_cwd(), Path::new("/"));
+        assert!(target.attach_only());
         assert!(!target.is_local());
+    }
+
+    #[test]
+    fn a_lan_link_with_a_directory_may_start_a_session_there() {
+        let target = Target::lan("lan://buildbox:7331:/srv/app", Some("token")).unwrap();
+        assert!(!target.attach_only());
     }
 
     #[test_case("lan://:/srv/app" ; "missing address")]
@@ -1371,6 +1398,21 @@ old
             server.join().unwrap(),
             ["initialize", "maki/live", "maki/attach"]
         );
+    }
+
+    #[test]
+    fn a_copied_link_without_a_session_does_not_start_one_there() {
+        let (address, server) = fake_agent(2, |method, _| match method {
+            "initialize" => initialized(method),
+            "maki/live" => Some(serde_json::json!({ "sessions": [] })),
+            _ => None,
+        });
+        let target = Target::lan(&format!("lan://{address}"), Some("token")).unwrap();
+        let error = super::connect(&target)
+            .err()
+            .expect("a link without a session has nowhere to attach");
+        assert!(error.contains("shares no session"), "{error}");
+        assert_eq!(server.join().unwrap(), ["initialize", "maki/live"]);
     }
 
     #[test]
