@@ -1,12 +1,16 @@
 use std::sync::Arc;
 
 use maki_providers::provider::Provider;
-use maki_providers::{ImageSource, Message, Model, ProviderEvent, RequestOptions};
+use maki_providers::{
+    ConversationEnd, ConversationLink, ImageSource, Invocation, InvocationPurpose, Message, Model,
+    ProviderEvent, RequestDeliveryTracker, RequestOptions,
+};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 
 use crate::cancel::CancelToken;
 
+use super::streaming::{end_conversation_detached, fresh_id};
 use super::{UNAVAILABLE_RESULT, close_dangling_tool_calls};
 
 const BTW_REMINDER: &str = "<system-reminder>\nThis is a side question. Answer it directly in a \
@@ -28,6 +32,8 @@ pub struct IsolatedTurnRequest {
     pub provider: Arc<dyn Provider>,
     pub model: Model,
     pub history: Vec<Message>,
+    /// The link of the conversation `history` was copied from.
+    pub previous: Option<ConversationLink>,
     pub system: String,
     pub question: String,
     pub images: Vec<ImageSource>,
@@ -43,6 +49,7 @@ pub async fn run_isolated_turn(
         provider,
         model,
         mut history,
+        previous,
         mut system,
         question,
         images,
@@ -75,6 +82,15 @@ pub async fn run_isolated_turn(
             }
         }
     });
+    let invocation = Invocation {
+        conversation_id: fresh_id(),
+        operation_id: fresh_id(),
+        attempt: 0,
+        purpose: InvocationPurpose::Isolated,
+        agent_id: None,
+        previous,
+    };
+    let delivery = RequestDeliveryTracker::new();
     let result = futures_lite::future::race(
         provider.stream_message(
             &model,
@@ -84,6 +100,8 @@ pub async fn run_isolated_turn(
             &provider_tx,
             RequestOptions::default(),
             session_id.as_ref(),
+            &invocation,
+            delivery.attempt(invocation.attempt),
         ),
         async {
             cancel.cancelled().await;
@@ -91,8 +109,16 @@ pub async fn run_isolated_turn(
         },
     )
     .await;
+    delivery.end_attempt(result.is_ok());
     drop(provider_tx);
     forwarder.await;
+    if delivery.is_delivered() {
+        end_conversation_detached(
+            &provider,
+            invocation.conversation_id,
+            ConversationEnd::Closed,
+        );
+    }
     let terminal = match result {
         Ok(_) => IsolatedTurnEvent::Done,
         Err(crate::AgentError::Cancelled) => IsolatedTurnEvent::Cancelled,
@@ -107,27 +133,35 @@ mod tests {
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
+        ContentBlock, ConversationRelation, ProviderEvent, RequestDelivery, Role, StopReason,
+        StreamResponse, TokenUsage,
     };
+    use test_case::test_case;
 
     use super::*;
+
+    const SOURCE_CONVERSATION: &str = "source";
+    const SOURCE_SHARED: usize = 4;
 
     #[derive(Default)]
     struct Captured {
         messages: Vec<Message>,
         tools: Value,
         system: String,
+        invocation: Option<Invocation>,
     }
 
     enum ProviderOutcome {
         Success,
         Failure,
         Pending,
+        DeliveredThenPending,
     }
 
     struct CapturingProvider {
         captured: Arc<Mutex<Captured>>,
         outcome: ProviderOutcome,
+        ended: Option<flume::Sender<(Arc<str>, ConversationEnd)>>,
     }
 
     impl Provider for CapturingProvider {
@@ -140,8 +174,11 @@ mod tests {
             events: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            invocation: &'a Invocation,
+            delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             let mut captured = self.captured.lock().unwrap();
+            captured.invocation = Some(invocation.clone());
             captured.messages = messages.to_vec();
             captured.tools = tools.clone();
             captured.system = system.to_owned();
@@ -171,13 +208,22 @@ mod tests {
                     })
                 }),
                 ProviderOutcome::Pending => Box::pin(std::future::pending()),
+                ProviderOutcome::DeliveredThenPending => {
+                    assert!(delivery.mark());
+                    Box::pin(std::future::pending())
+                }
             }
         }
 
-        fn list_models(
+        fn end_conversation(
             &self,
-        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
-            Box::pin(async { unimplemented!() })
+            conversation_id: &str,
+            reason: ConversationEnd,
+        ) -> BoxFuture<'_, ()> {
+            if let Some(ended) = &self.ended {
+                let _ = ended.send((conversation_id.into(), reason));
+            }
+            Box::pin(async {})
         }
     }
 
@@ -193,6 +239,7 @@ mod tests {
         let provider = Arc::new(CapturingProvider {
             captured: Arc::new(Mutex::new(Captured::default())),
             outcome,
+            ended: None,
         });
         let (tx, rx) = flume::unbounded();
         run_isolated_turn(
@@ -200,6 +247,7 @@ mod tests {
                 provider,
                 model: Model::from_spec("openai/gpt-4o").unwrap(),
                 history: original.clone(),
+                previous: None,
                 system: "system".into(),
                 question: "why?".into(),
                 images: Vec::new(),
@@ -210,6 +258,65 @@ mod tests {
         )
         .await;
         rx.iter().collect()
+    }
+
+    fn link() -> ConversationLink {
+        ConversationLink {
+            id: SOURCE_CONVERSATION.into(),
+            relation: ConversationRelation::Branches,
+            shared: SOURCE_SHARED,
+        }
+    }
+
+    #[test_case(ProviderOutcome::Success, false, true ; "finished")]
+    #[test_case(ProviderOutcome::DeliveredThenPending, true, true ; "cancelled_after_delivery")]
+    #[test_case(ProviderOutcome::Pending, true, false ; "cancelled_before_delivery")]
+    #[test_case(ProviderOutcome::Failure, false, false ; "failed_before_delivery")]
+    fn isolated_turn_ends_only_a_delivered_conversation(
+        outcome: ProviderOutcome,
+        cancelled: bool,
+        ends: bool,
+    ) {
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            if cancelled {
+                trigger.cancel();
+            }
+            let captured = Arc::new(Mutex::new(Captured::default()));
+            let (ended_tx, ended_rx) = flume::unbounded();
+            let provider = Arc::new(CapturingProvider {
+                captured: Arc::clone(&captured),
+                outcome,
+                ended: Some(ended_tx),
+            });
+            let (tx, _rx) = flume::unbounded();
+            run_isolated_turn(
+                IsolatedTurnRequest {
+                    provider,
+                    model: Model::from_spec("openai/gpt-4o").unwrap(),
+                    history: Vec::new(),
+                    previous: Some(link()),
+                    system: "system".into(),
+                    question: "why?".into(),
+                    images: Vec::new(),
+                    session_id: None,
+                    cancel,
+                },
+                tx,
+            )
+            .await;
+
+            let invocation = captured.lock().unwrap().invocation.clone().unwrap();
+            assert_eq!(invocation.purpose, InvocationPurpose::Isolated);
+            assert_eq!(invocation.attempt, 0);
+            assert_eq!(invocation.previous, Some(link()));
+            // The provider, and with it the sender, outlives the turn only
+            // inside a detached end call.
+            assert_eq!(
+                ended_rx.recv_async().await.ok(),
+                ends.then_some((invocation.conversation_id, ConversationEnd::Closed))
+            );
+        });
     }
 
     #[test]
@@ -251,6 +358,7 @@ mod tests {
             let provider = Arc::new(CapturingProvider {
                 captured: Arc::clone(&captured),
                 outcome: ProviderOutcome::Success,
+                ended: None,
             });
             let (tx, _rx) = flume::unbounded();
             run_isolated_turn(
@@ -258,6 +366,7 @@ mod tests {
                     provider,
                     model: Model::from_spec("openai/gpt-4o").unwrap(),
                     history: original.clone(),
+                    previous: None,
                     system: "system".into(),
                     question: "why?".into(),
                     images: Vec::new(),
@@ -295,6 +404,7 @@ mod tests {
             let provider = Arc::new(CapturingProvider {
                 captured: Arc::clone(&captured),
                 outcome: ProviderOutcome::Success,
+                ended: None,
             });
             let (tx, rx) = flume::unbounded();
             run_isolated_turn(
@@ -302,6 +412,7 @@ mod tests {
                     provider,
                     model: Model::from_spec("openai/gpt-4o").unwrap(),
                     history: original.clone(),
+                    previous: None,
                     system: "system".into(),
                     question: "why?".into(),
                     images: Vec::new(),

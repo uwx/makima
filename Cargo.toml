@@ -44,6 +44,7 @@ event-listener = { workspace = true }
 open = { workspace = true }
 
 [dev-dependencies]
+maki-providers = { workspace = true, features = ["test-util"] }
 maki-storage = { workspace = true, features = ["test-util"] }
 maki-config = { workspace = true, features = ["test-util"] }
 maki-lua = { workspace = true, features = ["test-support"] }
@@ -99,7 +100,7 @@ maki-markdown = { path = "maki-markdown" }
 maki-match = { path = "maki-match" }
 gpui-kit = "0.9"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 bs58 = "0.5"
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
@@ -120,7 +121,6 @@ getrandom = "0.3"
 fastrand = "2"
 test-case = "3"
 ignore = "0.4"
-memchr = "2"
 strum = { version = "0.27", features = ["derive"] }
 htmd = "0.5"
 tempfile = "3"
@@ -208,13 +208,12 @@ shell-words = "1"
 agent-client-protocol-schema = { version = "0.13", features = ["unstable_boolean_config", "unstable_elicitation"] }
 
 wait-timeout = "0.2"
-inventory = "0.3"
-
 # Incremental compilation costs ~600MB per session for a workspace member: rustc
 # keeps 256 CGU object files with full debug info plus the dep graph and query
 # cache, and never prunes sessions from build configurations you no longer use.
 # maki-lua alone had 29 sessions (11GB), the workspace 37GB. A full non-incremental
 # maki-lua rebuild is ~30s against ~5s incremental, which is a fair trade.
+
 [profile.dev]
 incremental = false
 

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use maki_providers::{ContentBlock, Message, MessageKind, Role};
+use maki_providers::{ContentBlock, ConversationEnd, Message, MessageKind, Role};
 use maki_storage::sessions::HistorySnapshot;
 
 use super::prepared::{CancelPublication, PreparedOperation};
@@ -9,7 +9,7 @@ use super::{
     ActorError, ActorIdleGuard, ActorLifecycle, AgentActorHandle, PreparedCommit,
     PreparedOperationTicket, PreparedTransaction,
 };
-use crate::{AgentId, History};
+use crate::{AgentId, History, end_conversation_detached};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryBoundary {
@@ -233,6 +233,17 @@ impl HistoryEditWork {
                 let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
                 let change = replacement.map(|snapshot| {
                     history.replace_snapshot(snapshot.clone());
+                    // Nothing kept is a fresh start, not a rewind to build on.
+                    let (ended, reason) = if history.is_empty() {
+                        (history.restart_conversation(), ConversationEnd::Closed)
+                    } else {
+                        (history.continue_conversation(), ConversationEnd::Rewound)
+                    };
+                    if let Some(policy) = &state.policy
+                        && let Some(ended) = ended
+                    {
+                        end_conversation_detached(&policy.settings.provider, ended, reason);
+                    }
                     HistoryChange {
                         agent_id: actor.agent_id(),
                         epoch: snapshot.epoch,
@@ -336,10 +347,18 @@ mod tests {
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
 
+    use arc_swap::ArcSwap;
     use futures_lite::future;
-    use maki_providers::{ContentBlock, Message, Role, TokenUsage};
+    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::{
+        AgentError, ContentBlock, ConversationEnd, Invocation, Message, Model, ProviderEvent,
+        RequestDelivery, RequestOptions, Role, StreamResponse, TokenUsage,
+    };
     use maki_storage::checkpoint::CheckpointPublication;
+    use maki_storage::conversation::ConversationState;
+    use maki_storage::id::SessionRef;
     use maki_storage::sessions::HistorySnapshot;
+    use serde_json::Value;
     use test_case::test_case;
 
     use super::{HistoryBoundary, HistoryChange, valid_boundary};
@@ -1307,6 +1326,77 @@ mod tests {
             assert!(matches!(stale, Err(ActorError::StaleHistoryBoundary)));
             actor.close();
             runner.await;
+        });
+    }
+
+    struct EndRecorder(flume::Sender<(Arc<str>, ConversationEnd)>);
+
+    impl Provider for EndRecorder {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            _: &'a Invocation,
+            _delivery: RequestDelivery,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async { unreachable!() })
+        }
+
+        fn end_conversation(
+            &self,
+            conversation_id: &str,
+            reason: ConversationEnd,
+        ) -> BoxFuture<'_, ()> {
+            let _ = self.0.send((conversation_id.into(), reason));
+            Box::pin(async {})
+        }
+    }
+
+    #[test_case(1, Some(ConversationEnd::Rewound) ; "keeping_messages_rewinds")]
+    #[test_case(0, Some(ConversationEnd::Closed) ; "keeping_nothing_closes")]
+    #[test_case(1, None ; "undelivered_is_not_ended")]
+    fn rewind_ends_the_outgoing_conversation_and_close_keeps_the_new_one(
+        boundary: usize,
+        expected: Option<ConversationEnd>,
+    ) {
+        smol::block_on(async {
+            let (ended_tx, ended_rx) = flume::unbounded();
+            let messages = vec![Message::user("first".into()), Message::user("draft".into())];
+            let mut seed = HistorySnapshot::new(messages.clone());
+            seed.conversation = Some(ConversationState {
+                sent: expected.map(|_| messages.len()),
+                ..ConversationState::fresh(None)
+            });
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
+                messages,
+                Some(Arc::new(ArcSwap::from_pointee(seed))),
+                Box::new(IdleBackend),
+            );
+            let settings = crate::RunSettings {
+                provider: Arc::new(EndRecorder(ended_tx)),
+                ..policy(false)
+            };
+            actor
+                .initialize_config(EffectiveAgentConfig::new(settings, AgentMode::Build))
+                .unwrap();
+            let boundary = actor.history_boundaries().unwrap().remove(boundary);
+            rewind(&actor, &boundary, published()).await.unwrap();
+            actor.close();
+            runner.await;
+            drop(actor);
+            // Once the actor is gone only a detached end call still holds the
+            // provider, and with it the sender.
+            let mut reasons = Vec::new();
+            while let Ok((_, reason)) = ended_rx.recv_async().await {
+                reasons.push(reason);
+            }
+            assert_eq!(reasons, Vec::from_iter(expected));
         });
     }
 

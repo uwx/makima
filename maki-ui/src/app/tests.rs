@@ -6,7 +6,7 @@ use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::EMPTY_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
-use crate::components::{Action, ExitRequest, buffer_text, key, test_model};
+use crate::components::{Action, ExitRequest, TEST_MODEL_PROVIDER, buffer_text, key, test_model};
 use crate::model_capabilities::test_support::seeded;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
@@ -29,6 +29,7 @@ use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
 use maki_providers::model::FastSupport;
+use maki_providers::test_util::offline_ids;
 use maki_providers::{
     ContentBlock, Effort, Message, ModelCapabilities, Role, ThinkingConfig, ThinkingSupport,
     TokenUsage,
@@ -49,8 +50,8 @@ const SETTLE_POLL: Duration = Duration::from_millis(1);
 const TASK_ID: &str = "task1";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
-const LATE_MODEL_SPEC: &str = "zai/glm-5";
-const MODEL_SPEC_GLM4: &str = "zai/glm-4";
+const LATE_MODEL_SPEC: &str = "ollama/glm-5";
+const MODEL_SPEC_GLM4: &str = "ollama/glm-4";
 const MODEL_SPEC_GPT9: &str = "openai/gpt-9";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
@@ -702,7 +703,16 @@ fn install_model_slot(app: &mut App) -> Arc<ArcSwapOption<Vec<String>>> {
         LATE_MODEL_SPEC,
     ]
     .map(|spec| (spec, options));
-    app.model_picker = ModelPicker::new(Arc::clone(&models), seeded(&resolved, &[]));
+    app.model_picker = ModelPicker::new(
+        Arc::clone(&models),
+        Arc::new(offline_ids(&[
+            TEST_MODEL_PROVIDER,
+            "ollama",
+            "openai",
+            "zai",
+        ])),
+        seeded(&resolved, &[]),
+    );
     app.available_models = Arc::clone(&models);
     models
 }
@@ -1232,11 +1242,18 @@ fn submit_during_streaming_queues_message() {
     assert_eq!(app.queue.len(), 1);
 }
 
-#[test]
-fn typed_completion_notices_render_once_and_skip_withdrawn() {
+#[test_case(COMPLETION_PREVIEW_CHARS - 1, false, false; "short")]
+#[test_case(COMPLETION_PREVIEW_CHARS, false, false; "at_limit")]
+#[test_case(COMPLETION_PREVIEW_CHARS + 1, false, true; "ui_truncated")]
+#[test_case(10, true, true; "delivery_truncated")]
+fn typed_completion_notices_render_once_and_skip_withdrawn(
+    chars: usize,
+    delivery_truncated: bool,
+    truncated: bool,
+) {
     use maki_agent::actor::{ActorEvent, ChildDelivery, DeliveryEvent, DeliveryStatus, TurnResult};
     const LABEL: &str = "research child";
-    const TEXT: &str = "bounded child result";
+    const TEXT: &str = "界";
     let mut app = test_app();
     let delivery = Arc::new(ChildDelivery {
         label: Some(LABEL.into()),
@@ -1248,8 +1265,15 @@ fn typed_completion_notices_render_once_and_skip_withdrawn() {
                 1,
                 DoneReason::EndTurn,
             ),
-            text: TEXT.repeat(COMPLETION_PREVIEW_CHARS),
-            output: Vec::new(),
+            text: TEXT.repeat(chars),
+            output: if delivery_truncated {
+                vec![serde_json::json!({
+                    "truncated": true,
+                    "full_result": {"lookup": "retained turn result"},
+                })]
+            } else {
+                Vec::new()
+            },
             provenance: Default::default(),
             duration_ms: 0,
         },
@@ -1259,6 +1283,7 @@ fn typed_completion_notices_render_once_and_skip_withdrawn() {
         status: DeliveryStatus::Discarded(maki_agent::TurnCancellationReason::User),
     }));
     assert_eq!(app.main_chat().message_count(), 0);
+    let agent_id = delivery.result.outcome.agent_id();
     app.handle_actor_event(ActorEvent::Delivery(DeliveryEvent {
         delivery,
         status: DeliveryStatus::Executed {
@@ -1270,7 +1295,419 @@ fn typed_completion_notices_render_once_and_skip_withdrawn() {
     let notice = chat.message_at(0).unwrap();
     assert_eq!(notice.role, DisplayRole::Done);
     assert!(notice.text.contains(LABEL));
-    assert!(notice.text.chars().count() <= COMPLETION_LABEL_CHARS + COMPLETION_PREVIEW_CHARS + 20);
+    let marker = if truncated { COMPLETION_TRUNCATED } else { "" };
+    let preview = TEXT.repeat(chars.min(COMPLETION_PREVIEW_CHARS));
+    assert_eq!(notice.result_agent, Some(agent_id));
+    assert!(
+        notice
+            .result_preview
+            .as_ref()
+            .unwrap()
+            .starts_with(&format!("[Result from {LABEL}] {preview}{marker}"))
+    );
+    assert_eq!(
+        notice.text.contains("Full result lookup:"),
+        delivery_truncated
+    );
+}
+
+#[test_case(0, false, false, false; "first_child")]
+#[test_case(1, false, false, false; "second_child_same_label")]
+#[test_case(0, true, false, false; "drag_selects_without_navigation")]
+#[test_case(0, false, true, false; "child_unavailable_after_delivery")]
+#[test_case(0, false, false, true; "delivery_preview_opens_full_transcript")]
+fn completion_notice_navigates_to_child(
+    target: usize,
+    drag: bool,
+    unavailable: bool,
+    delivery_preview: bool,
+) {
+    use maki_agent::actor::{ActorEvent, ChildDelivery, DeliveryEvent, DeliveryStatus, TurnResult};
+    const LABEL: &str = "research child";
+    const TAIL: &str = "full result tail";
+    let mut app = app_without_splash();
+    let mut children = Vec::new();
+    for _ in 0..2 {
+        let agent_id = AgentId::generate();
+        let info = subagent_info_for_agent(agent_id, TASK_ID, LABEL, None, None);
+        let index = app.resolve_or_create_chat(&info);
+        let text = format!("{}{TAIL}", "界".repeat(COMPLETION_PREVIEW_CHARS + 1));
+        app.chats[index].push(DisplayMessage::new(DisplayRole::Assistant, text.clone()));
+        app.handle_actor_event(ActorEvent::Delivery(DeliveryEvent {
+            delivery: Arc::new(ChildDelivery {
+                label: Some(LABEL.into()),
+                result: TurnResult {
+                    outcome: TurnOutcome::completed(
+                        agent_id,
+                        TurnId::generate(),
+                        Default::default(),
+                        1,
+                        DoneReason::EndTurn,
+                    ),
+                    text: if delivery_preview { LABEL.into() } else { text },
+                    output: if delivery_preview {
+                        vec![serde_json::json!({
+                            "truncated": true,
+                            "full_result": {"agent_id": agent_id},
+                            "offload": {"path": IMAGE_PATH_PASTE, "complete": true},
+                        })]
+                    } else {
+                        Vec::new()
+                    },
+                    provenance: Default::default(),
+                    duration_ms: 0,
+                },
+            }),
+            status: DeliveryStatus::Executed {
+                parent_turn_id: TurnId::generate(),
+            },
+        }));
+        children.push((agent_id, index));
+    }
+    render_app(&mut app, 80, 60);
+    let (agent_id, index) = children[target];
+    let notice = (0..app.chats[0].message_count())
+        .filter_map(|index| app.chats[0].message_at(index))
+        .find(|message| message.result_agent == Some(agent_id))
+        .unwrap();
+    assert!(
+        notice
+            .result_preview
+            .as_ref()
+            .unwrap()
+            .contains(COMPLETION_TRUNCATED)
+    );
+    assert!(notice.text.contains("[View child transcript]"));
+    if delivery_preview {
+        assert!(notice.text.contains(IMAGE_PATH_PASTE));
+    }
+    let area = app.msg_area();
+    let row = (area.y..area.bottom())
+        .find(|&row| {
+            app.chats[0]
+                .message_at_row(row, area)
+                .is_some_and(|message| message.result_agent == Some(agent_id))
+        })
+        .unwrap();
+    if !drag {
+        for expanded in [true, false] {
+            app.update(mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x,
+                row,
+            ));
+            app.update(mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                area.x,
+                row,
+            ));
+            let notice = (0..app.chats[0].message_count())
+                .filter_map(|index| app.chats[0].message_at(index))
+                .find(|message| message.result_agent == Some(agent_id))
+                .unwrap();
+            assert_eq!(notice.result_expanded, expanded);
+            assert_eq!(app.active_chat, 0);
+            render_app(&mut app, 80, 60);
+        }
+    }
+    if unavailable {
+        app.live_chat_index.remove(&agent_id);
+    }
+    if !drag {
+        let action_row = (area.y..area.bottom())
+            .find(|&row| app.chats[0].result_navigation_at(row, area) == Some(agent_id))
+            .unwrap();
+        app.update(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            action_row,
+        ));
+        app.update(mouse_event(
+            MouseEventKind::Up(MouseButton::Left),
+            area.x,
+            action_row,
+        ));
+    } else {
+        app.update(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            row,
+        ));
+        if drag {
+            app.update(mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                area.x + 3,
+                row,
+            ));
+        }
+        app.update(mouse_event(
+            MouseEventKind::Up(MouseButton::Left),
+            area.x + if drag { 3 } else { 0 },
+            row,
+        ));
+    }
+    if drag || unavailable {
+        assert_eq!(app.active_chat, 0);
+    } else {
+        assert_eq!(app.active_chat, index);
+        assert!(app.chats[index].last_message_text().ends_with(TAIL));
+    }
+    if drag {
+        assert!(matches!(
+            app.selection_state,
+            Some(SelectionState::PendingCopy { .. })
+        ));
+    }
+    if unavailable {
+        assert_eq!(
+            app.status_bar.flash_text(),
+            Some(format!("Child transcript unavailable for {agent_id}").as_str())
+        );
+    }
+}
+
+#[test_case("valid", true; "unique_mapping")]
+#[test_case("ambiguous", false; "marked_ambiguous")]
+#[test_case("duplicate_id", false; "duplicate_agent_id")]
+#[test_case("duplicate_key", false; "duplicate_transcript_key")]
+#[test_case("missing_transcript", false; "missing_transcript")]
+#[test_case("duplicate_chat", false; "duplicate_chat")]
+#[test_case("live_chat", false; "live_chat")]
+fn historical_result_lookup_fails_closed(case: &str, expected: bool) {
+    const KEY: &str = "historical-task";
+    const OTHER: &str = "other-task";
+    let mut app = test_app();
+    let agent_id = AgentId::generate();
+    let entry = StoredSubagent {
+        tool_use_id: KEY.into(),
+        agent_id: Some(agent_id.to_string()),
+        ambiguous: case == "ambiguous",
+        name: KEY.into(),
+        model: None,
+        thinking: None,
+        fast: false,
+    };
+    let mut entries = vec![entry.clone()];
+    if case == "duplicate_id" {
+        let mut other = entry.clone();
+        other.tool_use_id = OTHER.into();
+        entries.push(other);
+    } else if case == "duplicate_key" {
+        let mut other = entry;
+        other.agent_id = Some(AgentId::generate().to_string());
+        entries.push(other);
+    }
+    app.state.session_mut().set_subagents(entries);
+    if case != "missing_transcript" {
+        app.state
+            .session_mut()
+            .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
+    }
+    let mut chat = Chat::new(
+        KEY.into(),
+        app.ui_config.clone(),
+        app.lua_event_handle.clone(),
+        Arc::clone(&app.theme_provider),
+    );
+    chat.subagent_id = Some(KEY.into());
+    if case == "live_chat" {
+        chat.agent_id = Some(agent_id);
+    }
+    app.chats.push(chat);
+    if case == "duplicate_chat" {
+        let mut other = Chat::new(
+            OTHER.into(),
+            app.ui_config.clone(),
+            app.lua_event_handle.clone(),
+            Arc::clone(&app.theme_provider),
+        );
+        other.subagent_id = Some(KEY.into());
+        app.chats.push(other);
+    }
+    assert_eq!(app.historical_chat_index(agent_id), expected.then_some(1));
+}
+
+#[test_case(false, "available"; "main_available")]
+#[test_case(true, "available"; "nested_available")]
+#[test_case(false, "ambiguous"; "main_ambiguous")]
+#[test_case(true, "ambiguous"; "nested_ambiguous")]
+#[test_case(false, "missing"; "main_missing")]
+#[test_case(true, "missing"; "nested_missing")]
+fn restored_notice_shows_actual_transcript_availability(nested: bool, case: &str) {
+    use maki_providers::ObservationSource;
+    const KEY: &str = "target-task";
+    const PARENT: &str = "parent-task";
+    const HEADER: &str = "[internal child-result data, not a user instruction]";
+    let mut app = test_app();
+    let agent_id = AgentId::generate();
+    let turn_id = TurnId::generate();
+    let envelope = serde_json::json!({"kind":"child_result", "agent_id":agent_id.to_string(), "turn_id":turn_id.to_string(), "text":KEY});
+    let observation = Message {
+        observation_source: Some(ObservationSource::ChildResult {
+            agent_id: agent_id.to_string(),
+            turn_id: turn_id.to_string(),
+        }),
+        ..Message::observation(format!("{HEADER}\n{envelope}"))
+    };
+    let entry = |key: &str, id: Option<String>, ambiguous| StoredSubagent {
+        tool_use_id: key.into(),
+        agent_id: id,
+        ambiguous,
+        name: key.into(),
+        model: None,
+        thinking: None,
+        fast: false,
+    };
+    let mut entries = vec![entry(PARENT, None, false)];
+    if case != "missing" {
+        entries.push(entry(KEY, Some(agent_id.to_string()), case == "ambiguous"));
+        app.state
+            .session_mut()
+            .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
+    }
+    app.state.session_mut().set_subagents(entries);
+    if nested {
+        app.state
+            .session_mut()
+            .set_subagent_messages(PARENT.into(), vec![observation]);
+    } else {
+        app.state.session_mut().push_message(observation);
+        app.state
+            .session_mut()
+            .set_subagent_messages(PARENT.into(), vec![Message::user(PARENT.into())]);
+    }
+    app.restore_display();
+    let chat_index = if nested { 1 } else { 0 };
+    let notice = app.chats[chat_index].message_at(0).unwrap();
+    let available = case == "available";
+    assert_eq!(notice.result_agent, available.then_some(agent_id));
+    assert_eq!(notice.text.contains("[View child transcript]"), available);
+    assert_eq!(
+        notice.text.contains("[Child transcript unavailable;"),
+        !available
+    );
+    assert_eq!(
+        notice
+            .result_preview
+            .as_ref()
+            .unwrap()
+            .contains("[View child transcript]"),
+        available
+    );
+}
+
+#[test_case(false; "duplicate_key")]
+#[test_case(true; "duplicate_agent_id")]
+fn restore_preserves_duplicate_identity_ambiguity(duplicate_id: bool) {
+    const KEY: &str = "duplicate-task";
+    const OTHER: &str = "other-task";
+    let mut app = test_app();
+    let agent_id = AgentId::generate();
+    let entry = StoredSubagent {
+        tool_use_id: KEY.into(),
+        agent_id: Some(agent_id.to_string()),
+        ambiguous: false,
+        name: KEY.into(),
+        model: None,
+        thinking: None,
+        fast: false,
+    };
+    let mut other = entry.clone();
+    if duplicate_id {
+        other.tool_use_id = OTHER.into();
+    } else {
+        other.agent_id = Some(AgentId::generate().to_string());
+    }
+    app.state.session_mut().set_subagents(vec![entry, other]);
+    app.state
+        .session_mut()
+        .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
+    app.restore_display();
+    assert!(app.historical_chat_index(agent_id).is_none());
+    assert!(
+        app.state
+            .session
+            .subagents()
+            .iter()
+            .all(|entry| entry.ambiguous)
+    );
+}
+
+#[test_case(false; "legacy_without_history")]
+#[test_case(true; "legacy_with_unidentified_history")]
+fn sync_subagents_legacy_identity_depends_on_history(has_history: bool) {
+    const KEY: &str = "legacy-task";
+    let mut app = test_app();
+    let agent_id = AgentId::generate();
+    app.state.session_mut().set_subagents(vec![StoredSubagent {
+        tool_use_id: KEY.into(),
+        agent_id: None,
+        ambiguous: false,
+        name: KEY.into(),
+        model: None,
+        thinking: None,
+        fast: false,
+    }]);
+    if has_history {
+        app.state
+            .session_mut()
+            .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
+    }
+    app.resolve_or_create_chat(&subagent_info_for_agent(agent_id, KEY, KEY, None, None));
+    let entry = &app.state.session.subagents()[0];
+    assert_eq!(entry.ambiguous, has_history);
+    assert_eq!(entry.agent_id, (!has_history).then(|| agent_id.to_string()));
+}
+
+#[test_case(false; "historical_transcript")]
+#[test_case(true; "historical_id_does_not_select_live_actor")]
+fn historical_result_click_resolves_only_restored_chat(live_only: bool) {
+    const KEY: &str = "historical-task";
+    let mut app = app_without_splash();
+    let agent_id = AgentId::generate();
+    let mut notice = crate::chat::format_child_result_notice(KEY, KEY, &[], Some(agent_id));
+    notice.result_historical = true;
+    app.chats[0].push(notice);
+    let index =
+        app.resolve_or_create_chat(&subagent_info_for_agent(agent_id, KEY, KEY, None, None));
+    if !live_only {
+        app.live_chat_index.remove(&agent_id);
+        app.chats[index].agent_id = None;
+        app.state.session_mut().set_subagents(vec![StoredSubagent {
+            tool_use_id: KEY.into(),
+            agent_id: Some(agent_id.to_string()),
+            ambiguous: false,
+            name: KEY.into(),
+            model: None,
+            thinking: None,
+            fast: false,
+        }]);
+        app.state
+            .session_mut()
+            .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
+    }
+    render_app(&mut app, 80, 60);
+    let area = app.msg_area();
+    let row = (area.y..area.bottom())
+        .find(|&row| app.chats[0].result_navigation_at(row, area) == Some(agent_id))
+        .unwrap();
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x,
+        row,
+    ));
+    assert_eq!(app.active_chat, if live_only { 0 } else { index });
+    if live_only {
+        assert_eq!(
+            app.status_bar.flash_text(),
+            Some(format!("Child transcript unavailable for {agent_id}").as_str())
+        );
+    }
 }
 
 #[test_case(false; "deferred_input_drawn_on_consumption")]
@@ -2732,12 +3169,139 @@ fn task_picker_preview_tracks_selected_chat_across_concurrent_reorder() {
 }
 
 #[test]
-fn ago_formats_relative_start_time() {
+fn task_age_uses_monotonic_start() {
     let now = Instant::now();
-    assert_eq!(ago(now), "just now");
-    assert_eq!(ago(now - Duration::from_secs(5 * 60)), "5min ago");
-    assert_eq!(ago(now - Duration::from_secs(2 * 60 * 60)), "2h ago");
-    assert_eq!(ago(now - Duration::from_secs(3 * 24 * 60 * 60)), "3d ago");
+    let clock = ClockSample {
+        monotonic: now,
+        unix: Duration::ZERO,
+    };
+    let entry = |started_at| TaskEntry {
+        name: "task".into(),
+        finished: Some(true),
+        chat_index: 1,
+        identity: TaskIdentity::Unidentified(1),
+        parent_chat_index: None,
+        depth: 0,
+        snippet: String::new(),
+        context: String::new(),
+        started_at,
+    };
+
+    assert_eq!(
+        entry(Some(now)).age(&clock).map(maki_lua::format_ago),
+        Some("0s".into())
+    );
+    assert_eq!(
+        entry(Some(now - Duration::from_secs(5 * 60)))
+            .age(&clock)
+            .map(maki_lua::format_ago),
+        Some("5m 0s".into())
+    );
+    assert_eq!(
+        entry(Some(now - Duration::from_secs(2 * 60 * 60)))
+            .age(&clock)
+            .map(maki_lua::format_ago),
+        Some("2h 0s".into())
+    );
+    assert_eq!(
+        entry(Some(now - Duration::from_secs(3 * 24 * 60 * 60)))
+            .age(&clock)
+            .map(maki_lua::format_ago),
+        Some("3d 0s".into())
+    );
+    assert_eq!(entry(None).age(&clock), None);
+}
+
+fn picker_rows(picker: &mut ListPicker<TaskEntry>, now: &ClockSample) -> Vec<String> {
+    let area = Rect::new(0, 0, 80, 24);
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            picker.view_at(frame, area, now);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| {
+                    buf.cell(ratatui::layout::Position::new(x, y))
+                        .map(|c| c.symbol())
+                        .unwrap_or(" ")
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn task_picker_finished_ages_advance_without_row_refresh() {
+    let mut app = app_with_subagent();
+    finish_subagent_task(&mut app, false);
+    app.open_tasks();
+    let started = app.chats[1].started_at().unwrap();
+    let first = ClockSample {
+        monotonic: started + Duration::from_secs(5),
+        unix: Duration::ZERO,
+    };
+    let second = ClockSample {
+        monotonic: first.monotonic + crate::repaint::AGE_FRAME,
+        unix: Duration::ZERO,
+    };
+
+    let rows = picker_rows(&mut app.task_picker, &first);
+    assert!(rows.iter().any(|row| row.contains("5s")));
+    let selected = app.task_picker.selected_index();
+    let count = app.task_picker.items().unwrap().len();
+    let selected_chat = app
+        .task_picker
+        .selected_item()
+        .map(|entry| entry.chat_index);
+
+    let rows = picker_rows(&mut app.task_picker, &second);
+    assert!(rows.iter().any(|row| row.contains("6s")));
+    assert_eq!(app.task_picker.selected_index(), selected);
+    assert_eq!(app.task_picker.items().unwrap().len(), count);
+    assert_eq!(
+        app.task_picker
+            .selected_item()
+            .map(|entry| entry.chat_index),
+        selected_chat
+    );
+
+    let cadence = app.task_picker.cadence();
+    assert_eq!(cadence.frame(), Some(crate::repaint::AGE_FRAME));
+    assert!(
+        cadence.moves(),
+        "a finished-only task list still owes age frames"
+    );
+    app.task_picker.close();
+    assert_eq!(app.task_picker.cadence(), Cadence::IDLE);
+}
+
+#[test]
+fn task_picker_preserves_missing_and_completed_age_semantics() {
+    let mut app = app_with_subagent();
+    finish_subagent_task(&mut app, false);
+    let started = app.chats[1].started_at().unwrap();
+    let clock = ClockSample {
+        monotonic: started + Duration::from_secs(5),
+        unix: Duration::ZERO,
+    };
+    let entries = app.task_entries();
+    let sub = entries.iter().find(|entry| entry.chat_index == 1).unwrap();
+    assert_eq!(sub.age(&clock), Some(Duration::from_secs(5)));
+    assert!(entries[0].age(&clock).is_none(), "the main chat has no age");
+    let later = ClockSample {
+        monotonic: clock.monotonic + Duration::from_secs(1),
+        unix: Duration::ZERO,
+    };
+    assert_eq!(
+        sub.age(&later),
+        Some(Duration::from_secs(6)),
+        "completed tasks keep aging instead of freezing their runtime"
+    );
 }
 
 #[test]
@@ -2787,18 +3351,22 @@ fn task_entries_sort_alive_then_most_recent() {
 }
 
 #[test]
-fn task_entry_shows_context_and_ago() {
+fn task_entry_shows_context_and_age() {
     let mut app = app_with_subagent();
     app.chats[1].context_size = 5000;
     let entries = app.task_entries();
 
+    let clock = ClockSample {
+        monotonic: Instant::now(),
+        unix: Duration::ZERO,
+    };
     let sub = entries.iter().find(|e| e.chat_index == 1).unwrap();
     assert_eq!(sub.context_str(), Some("5.0k"));
-    assert!(sub.ago().is_some_and(|s| !s.is_empty()));
+    assert!(sub.age(&clock).is_some());
 
     let main = &entries[0];
     assert_eq!(main.context_str(), None);
-    assert_eq!(main.ago(), None);
+    assert_eq!(main.age(&clock), None);
 }
 
 #[test]
@@ -3656,6 +4224,8 @@ fn restored_task_keyboard_submission_never_reaches_main(missing_identity: bool) 
     let mut app = test_app();
     app.state.session_mut().set_subagents(vec![StoredSubagent {
         tool_use_id: TASK.into(),
+        agent_id: None,
+        ambiguous: false,
         name: "old task".into(),
         model: None,
         thinking: None,
@@ -3703,6 +4273,8 @@ fn restored_subagents_have_no_ago_and_are_finished() {
     let id = "restored-sub".to_string();
     app.state.session_mut().set_subagents(vec![StoredSubagent {
         tool_use_id: id.clone(),
+        agent_id: None,
+        ambiguous: false,
         name: "old task".into(),
         model: None,
         thinking: None,
@@ -3721,7 +4293,34 @@ fn restored_subagents_have_no_ago_and_are_finished() {
     let entries = app.task_entries();
     let sub = entries.iter().find(|e| e.chat_index == 1).unwrap();
     assert!(sub.is_finished());
-    assert_eq!(sub.ago(), None);
+    assert_eq!(
+        sub.age(&ClockSample {
+            monotonic: Instant::now(),
+            unix: Duration::ZERO,
+        }),
+        None
+    );
+    assert_eq!(sub.depth(), 0);
+    assert_eq!(sub.parent_chat_index, None);
+
+    let root = AgentId::generate();
+    let child = AgentId::generate();
+    app.chats[0].agent_id = Some(root);
+    add_picker_agent(&mut app, child, root, "child");
+    add_picker_agent(&mut app, AgentId::generate(), child, "grandchild");
+    let entries = app.task_entries();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.depth()))
+            .collect::<Vec<_>>(),
+        [
+            ("Main", 0),
+            ("child", 1),
+            ("grandchild", 2),
+            ("old task", 0)
+        ]
+    );
 }
 
 fn streaming_app() -> App {
@@ -3743,6 +4342,147 @@ fn with_subagent(mut app: App, id: &str) -> App {
 
 fn app_with_subagent() -> App {
     app_with_subagent_id(TASK_ID)
+}
+
+fn add_picker_agent(app: &mut App, agent_id: AgentId, parent_id: AgentId, name: &str) {
+    let mut info = subagent_info_for_agent(agent_id, name, name, None, None);
+    info.parent_agent_id = Some(parent_id);
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "x".into() },
+        subagent: Some(info),
+        identity: Some(work_identity(1)),
+    })));
+}
+
+#[test_case(false, false; "parent_first")]
+#[test_case(true, false; "parent_arrives_late")]
+#[test_case(true, true; "parent_arrives_late_filtered")]
+fn task_entries_preserve_hierarchy_with_unknown_ancestry(
+    parent_arrives_late: bool,
+    filtered: bool,
+) {
+    let mut app = app_with_subagent_id("unknown");
+    let root = app.chats[0].agent_id.unwrap();
+    let child = AgentId::generate();
+    let grandchild = AgentId::generate();
+    if parent_arrives_late {
+        add_picker_agent(&mut app, grandchild, child, "grandchild");
+        let entries = app.task_entries();
+        let orphan = entries
+            .iter()
+            .find(|entry| entry.name == "grandchild")
+            .unwrap();
+        assert_eq!(orphan.depth(), 0);
+        app.open_tasks();
+        if filtered {
+            app.task_picker.handle_paste("grandchild");
+        }
+        app.task_picker
+            .select_item_by(|entry| entry.name == "grandchild");
+    }
+    add_picker_agent(&mut app, child, root, "child");
+    if !parent_arrives_late {
+        add_picker_agent(&mut app, grandchild, child, "grandchild");
+    }
+    let child_index = app.live_chat_index[&child];
+    app.chats[child_index].mark_finished(DisplayRole::Assistant, DONE_TEXT);
+    add_picker_agent(&mut app, AgentId::generate(), root, "sibling");
+
+    let entries = app.task_entries();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.depth()))
+            .collect::<Vec<_>>(),
+        [
+            ("Main", 0),
+            ("sibling", 1),
+            ("child", 1),
+            ("grandchild", 2),
+            ("research", 0)
+        ]
+    );
+    assert_eq!(app.chats[child_index].parent_agent_id, Some(root));
+    if parent_arrives_late {
+        let selected = app.task_picker.selected_item().unwrap();
+        assert_eq!(selected.name, "grandchild");
+        assert_eq!(selected.depth(), 2);
+    }
+}
+
+#[test_case(false; "unfiltered")]
+#[test_case(true; "filtered")]
+fn task_picker_inserts_descendants_in_subtree_preserving_selection(filtered: bool) {
+    let mut app = streaming_app();
+    let root = app.chats[0].agent_id.unwrap();
+    let child = AgentId::generate();
+    let grandchild = AgentId::generate();
+    add_picker_agent(&mut app, child, root, "branch");
+    add_picker_agent(&mut app, AgentId::generate(), root, "branch sibling");
+    app.open_tasks();
+    if filtered {
+        app.update(Msg::Key(key(KeyCode::Char('b'))));
+    }
+    app.task_picker
+        .select_item_by(|entry| entry.name == "branch");
+    add_picker_agent(&mut app, grandchild, child, "branch leaf");
+
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "branch");
+    app.update(Msg::Key(key(KeyCode::Down)));
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "branch leaf");
+    assert_eq!(app.task_picker.selected_item().unwrap().depth(), 2);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.active_chat, app.live_chat_index[&grandchild]);
+}
+
+#[test]
+fn task_picker_nested_siblings_sort_on_open_and_stay_stable_during_refresh() {
+    let mut app = streaming_app();
+    let root = app.chats[0].agent_id.unwrap();
+    let parent = AgentId::generate();
+    let older = AgentId::generate();
+    let newer = AgentId::generate();
+    add_picker_agent(&mut app, parent, root, "parent");
+    add_picker_agent(&mut app, older, parent, "older");
+    add_picker_agent(&mut app, newer, parent, "newer");
+    app.chats[app.live_chat_index[&newer]].mark_finished(DisplayRole::Assistant, DONE_TEXT);
+    app.open_tasks();
+    assert_eq!(app.task_picker.item(2).unwrap().name, "older");
+    app.task_picker
+        .select_item_by(|entry| entry.name == "newer");
+    add_picker_agent(&mut app, AgentId::generate(), older, "new leaf");
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "newer");
+    assert_eq!(app.task_picker.item(3).unwrap().name, "new leaf");
+
+    app.chats[app.live_chat_index[&older]].mark_finished(DisplayRole::Assistant, DONE_TEXT);
+    app.sync_task_picker();
+    assert_eq!(app.task_picker.item(2).unwrap().name, "older");
+    app.task_picker.close();
+    app.open_tasks();
+    assert_eq!(app.task_picker.item(2).unwrap().name, "newer");
+    assert_eq!(app.task_picker.item(3).unwrap().name, "older");
+}
+
+#[test]
+fn filtered_task_picker_keeps_ancestors_in_tree_order() {
+    let mut app = streaming_app();
+    let root = app.chats[0].agent_id.unwrap();
+    let child = AgentId::generate();
+    add_picker_agent(&mut app, child, root, "branch");
+    add_picker_agent(&mut app, AgentId::generate(), child, "leaf");
+    add_picker_agent(&mut app, AgentId::generate(), root, "leaf sibling");
+    app.open_tasks();
+    app.task_picker.handle_paste("leaf");
+    assert_eq!(
+        app.task_picker.selected_item().unwrap().name,
+        "leaf sibling"
+    );
+    app.task_picker.select_item_by(|entry| entry.name == "Main");
+
+    for name in ["Main", "leaf sibling", "branch", "leaf"] {
+        assert_eq!(app.task_picker.selected_item().unwrap().name, name);
+        app.update(Msg::Key(key(KeyCode::Down)));
+    }
 }
 
 #[test]
@@ -3918,12 +4658,35 @@ fn open_task_picker_refreshes_after_subagent_history() {
 
     app.update(agent_msg(AgentEvent::SubagentHistory {
         history_epoch: 0,
+        conversation_id: None,
         tool_use_id: "session-abc".into(),
         messages: vec![],
     }));
 
     assert!(app.task_picker.is_open());
     assert_eq!(app.task_picker.item(1).unwrap().finished, Some(true));
+}
+
+#[test]
+fn subagent_history_stores_the_child_conversation_id() {
+    const CHILD_KEY: &str = "session-abc";
+    const CHILD_CONVERSATION: &str = "child-conversation";
+    let mut app = app_with_subagent_id(CHILD_KEY);
+    app.update(agent_msg(AgentEvent::SubagentHistory {
+        history_epoch: 0,
+        conversation_id: Some(CHILD_CONVERSATION.into()),
+        tool_use_id: CHILD_KEY.into(),
+        messages: vec![Message::user("child".into())],
+    }));
+
+    let stored = app.state.session.subagent_history_snapshot(CHILD_KEY);
+    assert_eq!(
+        stored
+            .and_then(|history| history.conversation)
+            .map(|conversation| conversation.id)
+            .as_deref(),
+        Some(CHILD_CONVERSATION)
+    );
 }
 
 #[test]
@@ -4342,7 +5105,10 @@ fn malformed_model_arg_flashes_invalid_model() {
     assert_eq!(app.root_config().model.spec(), before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        "command failed: model must be in 'provider/model' format (e.g. anthropic/claude-sonnet-4-20250514)"
+        format!(
+            "command failed: {}",
+            maki_providers::ModelError::InvalidFormat
+        )
     );
 }
 
@@ -6579,6 +7345,53 @@ fn build_rewind_app() -> App {
     app
 }
 
+#[test]
+fn history_replacement_preserves_live_child_navigation() {
+    use maki_providers::ObservationSource;
+    const KEY: &str = "live-task";
+    const HEADER: &str = "[internal child-result data, not a user instruction]";
+    let mut app = app_without_splash();
+    let root = bind_history_actor(&mut app, Vec::new());
+    let agent_id = AgentId::generate();
+    let index =
+        app.resolve_or_create_chat(&subagent_info_for_agent(agent_id, KEY, KEY, None, None));
+    let turn_id = TurnId::generate();
+    let envelope = serde_json::json!({"kind":"child_result", "agent_id":agent_id.to_string(), "turn_id":turn_id.to_string(), "text":KEY});
+    let observation = Message {
+        observation_source: Some(ObservationSource::ChildResult {
+            agent_id: agent_id.to_string(),
+            turn_id: turn_id.to_string(),
+        }),
+        ..Message::observation(format!("{HEADER}\n{envelope}"))
+    };
+    let snapshot = HistorySnapshot::new(vec![observation]);
+    app.apply_history_change(HistoryChange {
+        agent_id: root.id(),
+        epoch: snapshot.epoch,
+        messages: snapshot.messages,
+        draft: Message::user(String::new()),
+    });
+    let notice = app.chats[0].message_at(0).unwrap();
+    assert_eq!(notice.result_agent, Some(agent_id));
+    assert!(!notice.result_historical);
+    render_app(&mut app, 80, 60);
+    let area = app.msg_area();
+    let row = (area.y..area.bottom())
+        .find(|&row| app.chats[0].result_navigation_at(row, area) == Some(agent_id))
+        .unwrap();
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x,
+        row,
+    ));
+    assert_eq!(app.active_chat, index);
+}
+
 #[test_case(false; "main")]
 #[test_case(true; "child")]
 fn history_replacement_prunes_only_selected_chat_posts_and_restores_display(child: bool) {
@@ -7435,6 +8248,7 @@ fn standalone_compaction_preserves_error_recovery_text_in_checkpoint(failed: boo
     for event in [
         AgentEvent::ModelSwitched {
             spec: test_model().spec(),
+            context_window: test_model().context_window,
         },
         AgentEvent::TextDelta {
             text: SUMMARY.into(),
@@ -7509,12 +8323,12 @@ fn configure_model_options(
     supported: bool,
 ) {
     let mut model = Model::from_spec(spec).unwrap();
-    model.thinking_override = Some(if supported {
+    model.thinking_support = Some(if supported {
         ThinkingSupport::Yes
     } else {
         ThinkingSupport::No
     });
-    model.supports_fast_override = Some(if supported {
+    model.fast_support = Some(if supported {
         FastSupport::Supported
     } else {
         FastSupport::Unsupported
@@ -8235,7 +9049,7 @@ fn plan_model_picker_stages_without_switching(row: bool) {
     // process, which rewrite the model, recents and prefs this test pins.
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
     let models = install_model_slot(&mut app);
-    const MODEL: &str = "zai/glm-5";
+    const MODEL: &str = "ollama/glm-5";
     models.store(Some(Arc::new(vec![MODEL.into()])));
     set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
@@ -8949,16 +9763,15 @@ fn model_switch_updates_active_run_status() {
     app.status = Status::Streaming;
     app.run_context_window = Some(INITIAL_CONTEXT_WINDOW);
 
+    let expected_context_window = crate::components::TEST_CONTEXT_WINDOW;
     app.update(agent_msg_with_run_id(
         AgentEvent::ModelSwitched {
             spec: SWITCHED_MODEL_SPEC.into(),
+            context_window: expected_context_window,
         },
         app.run_id,
     ));
 
-    let expected_context_window = maki_providers::Model::from_spec(SWITCHED_MODEL_SPEC)
-        .unwrap()
-        .context_window;
     let status = rendered_rows(&mut app, 120, 24).pop().expect("status row");
 
     assert!(status.contains(SWITCHED_MODEL_SPEC));
@@ -8982,6 +9795,7 @@ fn subagent_history_finishes_workflow_chat() {
     app.update(agent_msg_with_run_id(
         AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: "session-abc".into(),
             messages: vec![],
         },
@@ -9117,6 +9931,7 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: TASK_ID.into(),
             messages: vec![Message {
                 role: Role::Assistant,
@@ -9169,6 +9984,7 @@ fn stamped_child_failure_wins_over_prior_history_snapshot() {
     app.update(subagent_msg_with_run_id(
         AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: TASK_ID.into(),
             messages: vec![],
         },
@@ -11222,10 +12038,10 @@ fn seed_models(backend: &maki_lua::TestCompletionBackend, models: &[&str]) {
 fn at_m_prefix_lists_models() {
     let (_tmp, mut app, backend) = completion_app();
     app.available_models.store(Some(Arc::new(vec![
-        "zai/glm-5".into(),
+        "ollama/glm-5".into(),
         "anthropic/claude".into(),
     ])));
-    seed_models(&backend, &["zai/glm-5", "anthropic/claude"]);
+    seed_models(&backend, &["ollama/glm-5", "anthropic/claude"]);
     for c in "@m:".chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
@@ -11242,7 +12058,7 @@ fn at_m_prefix_lists_models() {
         .collect();
     assert_eq!(
         specs,
-        vec!["zai/glm-5".to_string(), "anthropic/claude".to_string()]
+        vec!["ollama/glm-5".to_string(), "anthropic/claude".to_string()]
     );
 }
 
@@ -11264,8 +12080,8 @@ fn mixed_list_includes_skills_subagents_and_models() {
     seed_skill(&backend, "review");
     seed_subagents(&backend, "build");
     app.available_models
-        .store(Some(Arc::new(vec!["zai/glm-5".into()])));
-    seed_models(&backend, &["zai/glm-5"]);
+        .store(Some(Arc::new(vec!["ollama/glm-5".into()])));
+    seed_models(&backend, &["ollama/glm-5"]);
     app.update(Msg::Key(key(KeyCode::Char('@'))));
     let deadline = Instant::now() + Duration::from_secs(5);
     let items = loop {
@@ -11323,13 +12139,13 @@ fn submit_expands_subagent_model_and_skill_in_place() {
 fn submit_standalone_model_expands_in_place_no_action() {
     let (_tmp, mut app, backend) = completion_app();
     bind_root(&mut app, parked_root());
-    seed_models(&backend, &["zai/glm-5"]);
+    seed_models(&backend, &["ollama/glm-5"]);
     // No ChangeModel: the `@model` path no longer switches the session model.
     assert!(matches!(
-        app.submit_prompt(queued_msg("@model:zai/glm-5 fix the bug")),
+        app.submit_prompt(queued_msg("@model:ollama/glm-5 fix the bug")),
         SubmitOutcome::Started(actions) if actions.is_empty()
     ));
-    assert_eq!(root_submissions(&app), ["<model:zai/glm-5> fix the bug"]);
+    assert_eq!(root_submissions(&app), ["<model:ollama/glm-5> fix the bug"]);
 }
 
 #[test]
@@ -11877,6 +12693,7 @@ fn final_history_after_subagent_closed_only_persists_messages() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: TASK_ID.into(),
             messages: messages.clone(),
         },
@@ -12005,6 +12822,7 @@ fn reconstructed_subagent_history_cannot_resurrect_rewound_history(closed: bool)
         event: AgentEvent::SubagentHistory {
             tool_use_id: TASK_ID.into(),
             history_epoch: earlier.epoch,
+            conversation_id: None,
             messages: earlier.messages.as_ref().clone(),
         },
         subagent: Some(info),
@@ -12147,6 +12965,7 @@ fn subagent_history_updates_storage_without_queuing_parent_work() {
         subagent_msg(
             AgentEvent::SubagentHistory {
                 history_epoch: 0,
+                conversation_id: None,
                 tool_use_id: TASK_ID.to_string(),
                 messages,
             },
@@ -12192,6 +13011,7 @@ fn grandchild_history_is_visible_but_not_promoted_to_root() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: "grandchild-task".into(),
             messages: vec![Message {
                 role: Role::Assistant,
@@ -12660,7 +13480,11 @@ fn app_with_tall_model_picker() -> App {
         .iter()
         .map(|spec| (spec.as_str(), ModelCapabilities::NONE))
         .collect();
-    app.model_picker = ModelPicker::new(Arc::clone(&models), seeded(&resolved, &[]));
+    app.model_picker = ModelPicker::new(
+        Arc::clone(&models),
+        Arc::new(offline_ids(&[TEST_MODEL_PROVIDER])),
+        seeded(&resolved, &[]),
+    );
     models.store(Some(Arc::new(names)));
     app.run_builtin(BuiltinAction::ModelPicker);
     assert!(app.model_picker.is_open());

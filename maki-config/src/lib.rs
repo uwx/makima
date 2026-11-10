@@ -117,6 +117,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "options",
     "perf",
     "plan_submit_tool",
+    "providers",
     "question",
     "read",
     "sessions",
@@ -259,7 +260,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         ty: "bool",
         default: ConfigValue::Bool(false),
         min: None,
-        description: "Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere)",
+        description: "Start every session with fast mode on models that offer it, ignored elsewhere",
     },
     ConfigField {
         name: "always_workflow",
@@ -1665,10 +1666,7 @@ impl AgentConfig {
 #[derive(Debug, Clone, ConfigSection)]
 #[config(section = "provider", fields_only)]
 pub struct ProviderConfig {
-    #[config(
-        ty = "String",
-        desc = "Default model identifier (e.g. `anthropic/claude-sonnet-4-6`)"
-    )]
+    #[config(ty = "String", desc = "Default model identifier, as `provider/model`")]
     pub default_model: Option<String>,
 
     #[config(

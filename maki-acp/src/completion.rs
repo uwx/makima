@@ -13,9 +13,7 @@ use maki_commands::{
     CancellationToken, CommandCompletion, CommandFuture, CompletionContext, CompletionError,
     CompletionItem, MAX_COMPLETION_CANDIDATES,
 };
-use maki_providers::provider::adjust_model;
-use maki_providers::{Model, ModelCapabilities, Timeouts};
-use tracing::debug;
+use maki_providers::{ModelCapabilities, ProviderRegistry};
 
 /// Completes `/model`: the catalog's specs, then the `key=value` fields the
 /// named model accepts. With no model named the host cannot tell which model
@@ -24,15 +22,15 @@ use tracing::debug;
 pub struct ModelArgSource {
     specs: Arc<ArcSwapOption<Vec<String>>>,
     capabilities: Arc<Mutex<HashMap<String, ModelCapabilities>>>,
-    timeouts: Timeouts,
+    providers: Arc<ProviderRegistry>,
 }
 
 impl ModelArgSource {
-    pub fn new(specs: Arc<ArcSwapOption<Vec<String>>>, timeouts: Timeouts) -> Self {
+    pub fn new(specs: Arc<ArcSwapOption<Vec<String>>>, providers: Arc<ProviderRegistry>) -> Self {
         Self {
             specs,
             capabilities: Arc::default(),
-            timeouts,
+            providers,
         }
     }
 }
@@ -64,13 +62,13 @@ impl CommandCompletion for ModelArgSource {
                 .copied()
         });
         let cache = Arc::clone(&self.capabilities);
-        let timeouts = self.timeouts;
+        let providers = Arc::clone(&self.providers);
         Box::pin(async move {
             let resolved = match (named, cached) {
                 (Some(_), Some(capabilities)) => Some(capabilities),
                 (Some(spec), None) => {
                     let argument = Arc::clone(&spec);
-                    let capabilities = smol::unblock(move || resolve(&argument, timeouts)).await;
+                    let capabilities = smol::unblock(move || resolve(&argument, &providers)).await;
                     cache
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
@@ -84,16 +82,14 @@ impl CommandCompletion for ModelArgSource {
     }
 }
 
-/// Falls back to the static capabilities when the provider cannot be built,
-/// so a broken provider shows what the model table knows.
-fn resolve(spec: &str, timeouts: Timeouts) -> ModelCapabilities {
-    let Ok(mut model) = Model::from_spec(spec) else {
-        return ModelCapabilities::NONE;
-    };
-    if let Err(error) = adjust_model(&mut model, timeouts) {
-        debug!(spec, %error, "model capabilities fall back to static metadata");
-    }
-    ModelCapabilities::from(&model)
+/// Falls back to no capabilities when the provider cannot resolve the spec,
+/// so a broken provider offers the presets the model table knows.
+fn resolve(spec: &str, providers: &ProviderRegistry) -> ModelCapabilities {
+    providers
+        .model(spec)
+        .map_or(ModelCapabilities::NONE, |model| {
+            ModelCapabilities::from(&model)
+        })
 }
 
 /// Lists one directory: its entries that start with the typed leaf.

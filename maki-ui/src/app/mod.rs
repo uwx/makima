@@ -41,7 +41,7 @@ use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
-use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::list_picker::{ClockSample, ListPicker, PickerAction, PickerItem};
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::lua_picker::{LuaPicker, LuaPickerAction};
@@ -90,10 +90,11 @@ use maki_lua::{
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
 };
 use maki_providers::{
-    ContentBlock, Message, Model, ModelCapabilities, ModelSelection, ThinkingConfig, add_cost,
-    format_tokens,
+    ContentBlock, Message, Model, ModelCapabilities, ModelSelection, ProviderRegistry,
+    ThinkingConfig, add_cost, format_tokens,
 };
 use maki_storage::StateDir;
+use maki_storage::conversation::ConversationState;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
 use maki_storage::sessions::StoredPost;
@@ -106,8 +107,8 @@ const COMMAND_TRANSCRIPT_MESSAGES: usize = 1000;
 const COMMAND_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
 const SUBAGENT_IDLE_STATUS: Status = Status::Idle;
-const COMPLETION_LABEL_CHARS: usize = 80;
-const COMPLETION_PREVIEW_CHARS: usize = 512;
+#[cfg(test)]
+use crate::chat::{COMPLETION_PREVIEW_CHARS, COMPLETION_TRUNCATED};
 
 #[cfg(test)]
 pub(crate) use crate::agent::QueuedMessage;
@@ -156,20 +157,13 @@ impl maki_providers::provider::Provider for DetachedProvider {
         _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
         _opts: maki_providers::RequestOptions,
         _session_id: Option<&'a maki_storage::id::SessionRef>,
+        _invocation: &'a maki_providers::Invocation,
+        _delivery: maki_providers::RequestDelivery,
     ) -> maki_providers::provider::BoxFuture<
         'a,
         Result<maki_providers::StreamResponse, maki_agent::AgentError>,
     > {
         Box::pin(async { std::future::pending().await })
-    }
-
-    fn list_models(
-        &self,
-    ) -> maki_providers::provider::BoxFuture<
-        '_,
-        Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
-    > {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
@@ -274,6 +268,8 @@ pub(super) struct TaskEntry {
     finished: Option<bool>,
     chat_index: usize,
     identity: TaskIdentity,
+    parent_chat_index: Option<usize>,
+    depth: usize,
     /// First `SNIPPET_CHARS` of the subagent chat's last message, shown dimly.
     snippet: String,
     context: String,
@@ -283,6 +279,9 @@ pub(super) struct TaskEntry {
 impl PickerItem for TaskEntry {
     fn label(&self) -> &str {
         &self.name
+    }
+    fn depth(&self) -> usize {
+        self.depth
     }
     fn detail(&self) -> Option<&str> {
         matches!(self.finished, Some(true)).then_some(TASK_DONE_DETAIL)
@@ -296,8 +295,9 @@ impl PickerItem for TaskEntry {
     fn context_str(&self) -> Option<&str> {
         (!self.context.is_empty()).then_some(self.context.as_str())
     }
-    fn ago(&self) -> Option<String> {
-        self.started_at.map(ago)
+    fn age(&self, now: &ClockSample) -> Option<Duration> {
+        self.started_at
+            .map(|started| now.monotonic.saturating_duration_since(started))
     }
     fn is_finished(&self) -> bool {
         matches!(self.finished, Some(true))
@@ -319,10 +319,6 @@ fn truncate_snippet(text: &str) -> String {
     } else {
         truncated
     }
-}
-
-fn ago(since: Instant) -> String {
-    maki_lua::format_ago(since.elapsed().as_secs())
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -528,17 +524,13 @@ impl App {
             || delivery.result.outcome.agent_id().to_string(),
             str::to_owned,
         );
-        let source: String = source.chars().take(COMPLETION_LABEL_CHARS).collect();
-        let text: String = delivery
-            .result
-            .text
-            .chars()
-            .take(COMPLETION_PREVIEW_CHARS)
-            .collect();
-        self.chats[0].push(DisplayMessage::new(
-            DisplayRole::Done,
-            format!("[Result from {source}] {text}"),
-        ));
+        let notice = crate::chat::format_child_result_notice(
+            &source,
+            &delivery.result.text,
+            &delivery.result.output,
+            Some(delivery.result.outcome.agent_id()),
+        );
+        self.chats[0].push(notice);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -559,11 +551,13 @@ impl App {
         permissions: Arc<PermissionManager>,
         lua_event_handle: EventHandle,
         model_policy: Arc<ModelPolicy>,
+        providers: Arc<ProviderRegistry>,
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
         model_capabilities: Arc<ModelCapabilityCache>,
     ) -> PreparedApp {
-        let mut state = SessionState::from_session(session, &config.model, &model_policy);
+        let mut state =
+            SessionState::from_session(session, &config.model, &model_policy, &providers);
         state.adopt(&config);
         permissions.load_session_rules(session_state::stored_to_rules(
             &state.session.meta.session_rules,
@@ -577,6 +571,11 @@ impl App {
         let model_picker_models = Arc::new(ArcSwapOption::from(Some(Arc::new(Vec::new()))));
         let prepared_command_target = command_runtime.prepare_target();
         let command_target = prepared_command_target.handle().clone();
+        let login_picker = LoginPicker::new(
+            Arc::clone(&providers),
+            storage.clone(),
+            Arc::clone(&model_policy),
+        );
         let mut app = Self {
             chats: vec![Chat::new(
                 "Main".into(),
@@ -602,11 +601,15 @@ impl App {
             task_picker_original: None,
             lua_picker: LuaPicker::new(lua_event_handle.clone()),
             theme_picker: ThemePicker::new(Arc::clone(&theme_provider)),
-            model_picker: ModelPicker::new(Arc::clone(&model_picker_models), model_capabilities),
+            model_picker: ModelPicker::new(
+                Arc::clone(&model_picker_models),
+                providers,
+                model_capabilities,
+            ),
             model_picker_purpose: ModelPickerPurpose::Session,
             model_picker_target: None,
             plan_approval_pending: false,
-            login_picker: LoginPicker::new(),
+            login_picker,
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
@@ -711,16 +714,20 @@ impl App {
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
     ) -> Self {
-        let config =
-            session_state::SessionState::from_session(session.clone(), model, &model_policy)
-                .starting_config(
-                    Arc::new(DetachedProvider),
-                    model,
-                    PathBuf::from(&session.cwd),
-                    &lua_event_handle.mode_registry(),
-                    &storage,
-                    maki_config::SessionDefaults::default(),
-                );
+        let config = session_state::SessionState::from_session(
+            session.clone(),
+            model,
+            &model_policy,
+            &ProviderRegistry::default(),
+        )
+        .starting_config(
+            Arc::new(DetachedProvider),
+            model,
+            PathBuf::from(&session.cwd),
+            &lua_event_handle.mode_registry(),
+            &storage,
+            maki_config::SessionDefaults::default(),
+        );
         Self::prepare(
             config,
             &AgentConfig::default(),
@@ -738,6 +745,7 @@ impl App {
             permissions,
             lua_event_handle,
             model_policy,
+            Arc::default(),
             theme_provider,
             command_runtime,
             ModelCapabilityCache::new(|_| ModelCapabilities::NONE, || {}),
@@ -1013,11 +1021,10 @@ impl App {
         Dirty::YES
     }
 
-    pub fn poll_login_picker(&mut self) -> Vec<Action> {
-        match self.login_picker.poll_codex() {
-            Some(action) => self.login_picker_actions(action),
-            None => Vec::new(),
-        }
+    pub fn poll_login_picker(&mut self) -> (Dirty, Vec<Action>) {
+        let (dirty, action) = self.login_picker.poll();
+        let actions = action.map_or_else(Vec::new, |action| self.login_picker_actions(action));
+        (dirty, actions)
     }
 
     fn login_picker_actions(&self, action: LoginPickerAction) -> Vec<Action> {
@@ -1632,6 +1639,12 @@ impl App {
                 } else {
                     TaskIdentity::Unidentified(chat_index)
                 },
+                parent_chat_index: chat.parent_agent_id.and_then(|parent_id| {
+                    self.chats
+                        .iter()
+                        .position(|parent| parent.agent_id == Some(parent_id))
+                }),
+                depth: 0,
                 snippet: if chat_index == 0 {
                     String::new()
                 } else {
@@ -1650,7 +1663,38 @@ impl App {
                 .cmp(&b.is_finished())
                 .then_with(|| b.started_at.cmp(&a.started_at))
         });
-        entries
+        Self::order_task_hierarchy(entries)
+    }
+
+    fn order_task_hierarchy(mut entries: Vec<TaskEntry>) -> Vec<TaskEntry> {
+        fn append_subtree(
+            mut entry: TaskEntry,
+            depth: usize,
+            remaining: &mut Vec<TaskEntry>,
+            ordered: &mut Vec<TaskEntry>,
+        ) {
+            entry.depth = depth;
+            let parent = entry.chat_index;
+            ordered.push(entry);
+            while let Some(index) = remaining
+                .iter()
+                .position(|entry| entry.parent_chat_index == Some(parent))
+            {
+                let child = remaining.remove(index);
+                append_subtree(child, depth + 1, remaining, ordered);
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(entries.len());
+        while !entries.is_empty() {
+            let index = entries
+                .iter()
+                .position(|entry| entry.parent_chat_index.is_none())
+                .unwrap_or(0);
+            let root = entries.remove(index);
+            append_subtree(root, 0, &mut entries, &mut ordered);
+        }
+        ordered
     }
 
     fn open_tasks(&mut self) {
@@ -1696,7 +1740,7 @@ impl App {
             }
         }
         ordered.extend(current);
-        ordered
+        Self::order_task_hierarchy(ordered)
     }
 
     fn sync_command_arguments(&mut self, input: &str, cursor: usize) {
@@ -2642,13 +2686,14 @@ impl App {
         // The run reached its next request and picked the model up; the bar
         // can stop marking the switch as queued.
         if envelope.subagent.is_none()
-            && let AgentEvent::ModelSwitched { spec } = &envelope.event
+            && let AgentEvent::ModelSwitched {
+                spec,
+                context_window,
+            } = &envelope.event
         {
             self.chats[0].retry_info = None;
             self.run_model = Some(spec.clone());
-            if let Ok(model) = Model::from_spec(spec) {
-                self.run_context_window = Some(model.context_window);
-            }
+            self.run_context_window = Some(*context_window);
             return vec![];
         }
 
@@ -2658,6 +2703,7 @@ impl App {
                     AgentEvent::SubagentHistory {
                         tool_use_id,
                         history_epoch,
+                        conversation_id,
                         messages,
                     } => {
                         self.state.session_mut().adopt_subagent_history(
@@ -2665,6 +2711,7 @@ impl App {
                             &HistorySnapshot {
                                 epoch: history_epoch,
                                 compacted: false,
+                                conversation: conversation_id.map(ConversationState::new),
                                 messages: Arc::new(messages),
                             },
                         );
@@ -2739,6 +2786,7 @@ impl App {
         if let AgentEvent::SubagentHistory {
             tool_use_id,
             history_epoch,
+            conversation_id,
             messages,
         } = envelope.event
         {
@@ -2761,6 +2809,7 @@ impl App {
                 &HistorySnapshot {
                     epoch: history_epoch,
                     compacted: false,
+                    conversation: conversation_id.map(ConversationState::new),
                     messages: Arc::new(messages),
                 },
             );
@@ -3046,6 +3095,38 @@ impl App {
         });
     }
 
+    fn historical_chat_index(&self, agent_id: maki_agent::AgentId) -> Option<usize> {
+        let session = &self.state.session;
+        let id = agent_id.to_string();
+        let mut matching = session
+            .subagents()
+            .iter()
+            .filter(|entry| entry.agent_id.as_deref() == Some(&id));
+        let entry = matching.next()?;
+        if entry.ambiguous
+            || matching.next().is_some()
+            || session
+                .subagents()
+                .iter()
+                .filter(|other| other.tool_use_id == entry.tool_use_id)
+                .count()
+                != 1
+            || !session.subagent_messages().contains_key(&entry.tool_use_id)
+        {
+            return None;
+        }
+        let mut chats = self
+            .chats
+            .iter()
+            .enumerate()
+            .filter(|(_, chat)| chat.subagent_id.as_deref() == Some(&entry.tool_use_id));
+        let (index, chat) = chats.next()?;
+        if chat.agent_id.is_some() || chats.next().is_some() {
+            return None;
+        }
+        Some(index)
+    }
+
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
         let id = &subagent.parent_tool_use_id;
         if let Some(&idx) = self.live_chat_index.get(&subagent.agent_id) {
@@ -3076,6 +3157,7 @@ impl App {
         chat.opts = subagent.opts;
         chat.subagent_id = Some(id.clone());
         chat.agent_id = Some(subagent.agent_id);
+        chat.parent_agent_id = subagent.parent_agent_id;
         chat.set_started_at_now();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
@@ -3296,7 +3378,7 @@ impl App {
                 vec![]
             }
             BuiltinOperation::OpenLoginPicker => {
-                self.login_picker.open(self.storage.clone());
+                self.login_picker.open();
                 vec![]
             }
             BuiltinOperation::QuickQuestion {
@@ -3383,6 +3465,7 @@ impl App {
             provider: Arc::clone(&admission.template.provider),
             model: (*admission.template.model).clone(),
             history,
+            previous: None,
             system,
             question: turn.content.text.to_string(),
             images,

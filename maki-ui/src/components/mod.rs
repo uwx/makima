@@ -348,6 +348,10 @@ pub struct DisplayMessage {
     pub live_output: Option<String>,
     pub annotation: Option<String>,
     pub plan_path: Option<String>,
+    pub result_agent: Option<AgentId>,
+    pub result_historical: bool,
+    pub result_preview: Option<String>,
+    pub result_expanded: bool,
     pub post_agent: Option<String>,
     pub timestamp: Option<String>,
     pub turn_usage: Option<String>,
@@ -370,6 +374,10 @@ impl DisplayMessage {
             live_output: None,
             annotation: None,
             plan_path: None,
+            result_agent: None,
+            result_historical: false,
+            result_preview: None,
+            result_expanded: false,
             post_agent: None,
             timestamp: None,
             turn_usage: None,
@@ -404,6 +412,10 @@ impl DisplayMessage {
             live_output: None,
             annotation: None,
             plan_path: Some(plan_path),
+            result_agent: None,
+            result_historical: false,
+            result_preview: None,
+            result_expanded: false,
             post_agent: None,
             timestamp: None,
             turn_usage: None,
@@ -456,6 +468,9 @@ use maki_providers::ModelPricing;
 pub(crate) const TEST_CONTEXT_WINDOW: u32 = 200_000;
 
 #[cfg(test)]
+pub(crate) const TEST_MODEL_PROVIDER: &str = "anthropic";
+
+#[cfg(test)]
 pub(crate) fn test_pricing() -> ModelPricing {
     ModelPricing {
         input: 3.0,
@@ -470,18 +485,17 @@ pub(crate) fn test_pricing() -> ModelPricing {
 pub(crate) fn test_model() -> maki_providers::Model {
     maki_providers::Model {
         id: "test-model".into(),
-        provider: std::sync::Arc::<str>::from("anthropic"),
+        provider: std::sync::Arc::<str>::from(TEST_MODEL_PROVIDER),
         tier: maki_providers::ModelTier::Medium,
-        family: maki_providers::ModelFamily::Claude,
-        supports_tool_examples_override: None,
-        thinking_override: None,
-        supports_vision_override: Some(true),
-        supports_fast_override: None,
+        tool_examples: None,
+        thinking_support: Some(maki_providers::ThinkingSupport::Yes),
+        vision: Some(true),
+        fast_support: None,
         pricing: test_pricing(),
+        pricing_schedule: None,
         max_output_tokens: Some(8192),
-        turn_output_tokens: None,
         context_window: TEST_CONTEXT_WINDOW,
-        thinking_fields: None,
+        free: false,
     }
 }
 

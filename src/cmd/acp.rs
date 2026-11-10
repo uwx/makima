@@ -101,29 +101,35 @@ pub fn run(
     config.validate()?;
 
     let timeouts = maki_providers::Timeouts::from(&config.provider);
-    let catalog = maki_lua::orchestration::ModelCatalog::offline(&config.provider.model_policy);
+
+    plugin_host
+        .load_builtins(&config.plugins)
+        .context("load builtin plugins")?;
+
+    let providers = plugin_host
+        .provider_registry(timeouts)
+        .context("build provider registry")?;
+    let catalog = maki_lua::orchestration::ModelCatalog::offline(
+        Arc::clone(&providers),
+        &config.provider.model_policy,
+    );
     let standard_commands = command::StandardCommands::register(
         &command_registry,
         &command::discover_commands(&cwd, &trust.project_config),
         command::StandardCompletions {
             model: Some(Arc::new(maki_acp::completion::ModelArgSource::new(
                 catalog.specs(),
-                timeouts,
+                Arc::clone(&providers),
             ))),
             theme: None,
         },
     )
     .context("register standard commands")?;
 
-    plugin_host
-        .load_builtins(&config.plugins)
-        .context("load builtin plugins")?;
-
-    let model = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
+    let model = setup::resolve_model(&providers, model_arg.as_deref(), &config.provider, &storage)?;
 
     setup::init_logging(&config.storage);
     setup::install_panic_log_hook();
-    setup::warn_ignored_provider_fields();
     for warning in super::unmatched_permission_rules(&config.permissions) {
         eprintln!("warning: {warning}");
     }
@@ -144,6 +150,7 @@ pub fn run(
         system_prompt_override,
         append_system_prompt,
         model_policy: Arc::new(config.provider.model_policy.clone()),
+        providers,
         plugin_rules: plugin_host.plugin_rules(),
         lua_event_handle,
         command_registry,

@@ -16,7 +16,6 @@ use maki_agent::{AgentConfig, PermissionsConfig};
 use maki_commands::CommandRegistry;
 use maki_config::{ModelPolicy, SessionDefaults, TrustConfig, project::TrustMode};
 use maki_lua::orchestration::ModelCatalog;
-use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use serde_json::{Map, Value, json};
 
@@ -74,6 +73,7 @@ pub const THEME_METHOD: &str = "maki/theme";
 pub(crate) struct ThemeParams {
     pub(crate) name: String,
 }
+use maki_providers::{ProviderRegistry, Timeouts};
 
 pub struct AcpParams {
     pub model: Model,
@@ -88,6 +88,7 @@ pub struct AcpParams {
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
     pub model_policy: Arc<ModelPolicy>,
+    pub providers: Arc<ProviderRegistry>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub lua_event_handle: maki_lua::EventHandle,
     pub command_registry: CommandRegistry,

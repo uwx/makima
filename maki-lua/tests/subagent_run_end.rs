@@ -21,7 +21,8 @@ use maki_lua::orchestration::{OrchestrationServices, TrustedTarget};
 use maki_lua::test_support::run_command;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role, StreamResponse,
+    AgentError, Invocation, Message, Model, ProviderEvent, RequestDelivery, RequestOptions, Role,
+    StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -214,6 +215,8 @@ impl Provider for GatedProvider {
         _event_tx: &'a flume::Sender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let request = messages
@@ -240,10 +243,6 @@ impl Provider for GatedProvider {
             Ok(common::canned_reply(reply))
         })
     }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
-    }
 }
 
 struct CancelThenRecoverProvider {
@@ -261,6 +260,8 @@ impl Provider for CancelThenRecoverProvider {
         event_tx: &'a flume::Sender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -278,10 +279,6 @@ impl Provider for CancelThenRecoverProvider {
             }
         })
     }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
-    }
 }
 
 impl Provider for FailOnceProvider {
@@ -294,6 +291,8 @@ impl Provider for FailOnceProvider {
         _event_tx: &'a flume::Sender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -304,10 +303,6 @@ impl Provider for FailOnceProvider {
                 Ok(common::canned_reply(RECOVERED_REPLY))
             }
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
     }
 }
 
@@ -321,16 +316,14 @@ impl Provider for PendingProvider {
         _event_tx: &'a flume::Sender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let _signal = DropSignal(self.dropped_tx.clone());
             std::future::pending::<()>().await;
             unreachable!()
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
     }
 }
 
