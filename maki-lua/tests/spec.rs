@@ -22,6 +22,7 @@ use test_case::test_case;
 #[test_case("providers_aperture", include_str!("../../plugins/providers/tests/aperture.lua") ; "providers_aperture_spec")]
 #[test_case("providers_catalog", include_str!("../../plugins/providers/tests/catalog.lua") ; "providers_catalog_spec")]
 #[test_case("providers_chat_completions", include_str!("../../plugins/providers/tests/chat_completions.lua") ; "providers_chat_completions_spec")]
+#[test_case("providers_cliproxyapi", include_str!("../../plugins/providers/tests/cliproxyapi.lua") ; "providers_cliproxyapi_spec")]
 #[test_case("providers_claude_agent", include_str!("../../plugins/providers/tests/claude_agent.lua") ; "providers_claude_agent_spec")]
 #[test_case("providers_clock", include_str!("../../plugins/providers/tests/clock.lua") ; "providers_clock_spec")]
 #[test_case("providers_codec", include_str!("../../plugins/providers/tests/codec.lua") ; "providers_codec_spec")]

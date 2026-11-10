@@ -375,6 +375,20 @@ No curated models. The provider lists them once it is configured.
 
 Talks to the server at the `base_url` saved by `makima auth login llama-cpp`, else at `LLAMA_CPP_HOST`. Models come from the server: a router lists many, a single-model server one. The key is optional.
 
+### CLIProxyAPI
+
+- **Id**: `cliproxyapi`
+- **Env vars**: `CLIPROXYAPI_API_KEY`, `CLIPROXYAPI_BASE_URL`
+- **API**: `http://127.0.0.1:8317/v1`
+- **Login**: `makima auth login cliproxyapi` (API key)
+- **`base_url`** in `providers.toml`: CLIProxyAPI URL
+
+No curated models. The provider lists them once it is configured.
+
+CLIProxyAPI is a local gateway in front of subscriptions you already have. Makima looks for it on its default port, so all you need is `makima auth login cliproxyapi`. Answer the URL prompt when the gateway listens elsewhere, or set `CLIPROXYAPI_BASE_URL` instead.
+
+A key is only needed when the gateway asks for one: set `CLIPROXYAPI_API_KEY`, or leave the login prompt empty. Models, context windows, image support and reasoning levels all come from the gateway's own listing.
+
 ### Claude Agent
 
 - **Id**: `claude-agent`

@@ -25,7 +25,7 @@ use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::session_coordinator::{
-    ModelPreparer, SessionCoordinatorError, SessionCoordinatorHandle, publication_claim,
+    SessionCoordinatorError, SessionCoordinatorHandle, publication_claim,
 };
 use maki_agent::session_defaults;
 use maki_agent::session_options::SessionOptionError;
@@ -1115,7 +1115,6 @@ async fn install_session_with_lock(
         &coordinator,
         &trusted_root,
         &orchestration,
-        headless::default_model_preparer(Arc::clone(&params.providers)),
         Arc::clone(&params.providers),
         srv.ui.enabled(),
     );
@@ -1173,7 +1172,6 @@ fn session_command_target(
     coordinator: &SessionCoordinatorHandle,
     root: &TrustedTarget,
     orchestration: &Arc<AgentOrchestration>,
-    prepare_model: ModelPreparer,
     providers: Arc<ProviderRegistry>,
     ui: bool,
 ) -> TargetHandle {
@@ -1185,12 +1183,12 @@ fn session_command_target(
             maki_agent::command::SessionCommandHost::new(
                 handle.control_tx.clone(),
                 coordinator.clone(),
-                providers,
+                Arc::clone(&providers),
             )
             .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
             root.clone(),
             orchestration,
-            prepare_model,
+            headless::default_model_preparer(providers),
         )),
     )
 }
@@ -3255,7 +3253,6 @@ mod tests {
             &coordinator,
             &root,
             &services,
-            headless::default_model_preparer(Arc::default()),
             Arc::default(),
             ui,
         );

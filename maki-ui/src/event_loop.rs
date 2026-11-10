@@ -1317,7 +1317,7 @@ impl SpawnCtx {
             // one imported from another tool) resumes on the current model
             // instead of refusing to open. Startup already behaves this way for
             // the same reason: a session's model is a detail, not a precondition.
-            || Model::from_spec(model_spec).is_err()
+            || self.providers.model(model_spec).is_err()
         {
             return None;
         }

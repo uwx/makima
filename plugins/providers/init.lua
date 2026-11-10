@@ -1,5 +1,6 @@
 local aperture = require("providers.aperture")
 local catalog = require("providers.catalog")
+local cliproxyapi = require("providers.cliproxyapi")
 local compat = require("providers.openai_compat")
 local custom = require("providers.custom")
 local executable = require("providers.executable")
@@ -55,6 +56,7 @@ register_compat({ "mistral", "openrouter", "requesty", "tensorx" })
 for _, name in ipairs({ "ollama", "llama_cpp" }) do
   register(local_server.provider(require("providers." .. name).def))
 end
+register(cliproxyapi.provider())
 local claude_agent = require("providers.claude_agent")
 register(claude_agent.provider(claude_agent.cache_path()))
 
