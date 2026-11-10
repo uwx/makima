@@ -1,3 +1,7 @@
+//! The ACP side of a frontend: where an agent lives, the JSON-RPC client that
+//! talks to it, and the shapes it answers with. A frontend renders what this
+//! hands it and never speaks the protocol itself.
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
@@ -29,7 +33,7 @@ const AGENT_ENV: &str = "MAKI_DESKTOP_AGENT";
 const REMOTE_ENV: &str = "MAKI_DESKTOP_REMOTE";
 const MODEL_ENV: &str = "MAKI_DESKTOP_MODEL";
 const DEFAULT_AGENT: &str = "makima";
-const LAN_SCHEME: &str = "lan://";
+const LINK_SCHEME: &str = maki_lan::LINK_SCHEME;
 const LAN_TOKEN_ENV: &str = "MAKI_DESKTOP_LAN_TOKEN";
 const LAN_KIND: &str = "lan";
 const LAN_VERSION: u64 = 1;
@@ -322,7 +326,7 @@ impl Target {
         let agent = std::env::var(AGENT_ENV).unwrap_or_else(|_| DEFAULT_AGENT.to_owned());
         let model = std::env::var(MODEL_ENV).ok();
         match std::env::var(REMOTE_ENV) {
-            Ok(remote) if remote.trim().starts_with(LAN_SCHEME) => {
+            Ok(remote) if remote.trim().starts_with(LINK_SCHEME) => {
                 let token = std::env::var(LAN_TOKEN_ENV).ok();
                 Self::lan(remote.trim(), token.as_deref())
             }
@@ -377,8 +381,8 @@ impl Target {
     /// watches the session that machine already serves.
     pub fn lan(spec: &str, token: Option<&str>) -> Result<Self, String> {
         let rest = spec
-            .strip_prefix(LAN_SCHEME)
-            .ok_or_else(|| format!("{LAN_SCHEME} expected, got {spec:?}"))?;
+            .strip_prefix(LINK_SCHEME)
+            .ok_or_else(|| format!("{LINK_SCHEME} expected, got {spec:?}"))?;
         let directory = rest
             .split_once(":/")
             .filter(|(address, path)| !address.is_empty() && !path.is_empty())
@@ -389,7 +393,7 @@ impl Target {
             None if !rest.is_empty() && !rest.contains(":/") => (rest, PathBuf::from("/")),
             None => {
                 return Err(format!(
-                    "{REMOTE_ENV} must be {LAN_SCHEME}host:port:/absolute/path, got {spec:?}"
+                    "{REMOTE_ENV} must be {LINK_SCHEME}host:port:/absolute/path, got {spec:?}"
                 ));
             }
         };

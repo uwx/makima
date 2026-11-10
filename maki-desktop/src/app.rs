@@ -28,8 +28,9 @@ use maki_lan::discovery::{Browser, Discovered, Found};
 use maki_lan::link;
 use serde_json::Value;
 
-use crate::acp::{
-    self, ArgItem, Event, PickItem, PickOutcome, RewindTurn, SessionEntry, ShareInfo, Target,
+use maki_acp_client as acp;
+use maki_acp_client::{
+    ArgItem, Event, PickItem, PickOutcome, RewindTurn, SessionEntry, ShareInfo, Target,
 };
 use crate::backend::{Backend, Command, Started};
 
@@ -2572,7 +2573,7 @@ mod tests {
         ArgumentMenu, FIELD_CLOSE, LocalCommand, SLASH_PREFIX, accent_text, argument_insertion,
         argument_slot, compact_tokens, local_command, quote_argument, rewind_rows, slash_query,
     };
-    use crate::acp::{ArgItem, RewindTurn};
+    use maki_acp_client::{ArgItem, RewindTurn};
     use gpui_kit::{Hsla, rgb};
     use test_case::test_case;
 

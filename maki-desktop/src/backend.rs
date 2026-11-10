@@ -5,7 +5,7 @@ use std::thread;
 use flume::{Receiver, Sender};
 use serde_json::Value;
 
-use crate::acp::{self, Client, Event, PickOutcome, SessionView, Target, ThemeCatalog};
+use maki_acp_client::{self as acp, Client, Event, PickOutcome, SessionView, Target, ThemeCatalog};
 
 const CONTROL_REFUSED: &str = "Control was not granted";
 

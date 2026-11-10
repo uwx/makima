@@ -56,6 +56,7 @@ tree-sitter-rust = { workspace = true }
 [workspace]
 members = [
   "maki-acp",
+  "maki-acp-client",
   "maki-domain",
   "maki-agent",
   "maki-config",
@@ -88,6 +89,7 @@ rust-version = "1.88"
 maki-agent = { path = "maki-agent" }
 maki-domain = { path = "maki-domain" }
 maki-acp = { path = "maki-acp" }
+maki-acp-client = { path = "maki-acp-client" }
 maki-config = { path = "maki-config" }
 maki-commands = { path = "maki-commands" }
 maki-interpreter = { path = "maki-interpreter" }

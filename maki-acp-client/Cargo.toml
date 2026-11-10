@@ -1,0 +1,20 @@
+[package]
+name = "maki-acp-client"
+description = "The ACP side of a Makima frontend: reaching an agent and following its session"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-client-protocol-schema = { workspace = true }
+maki-lan = { workspace = true }
+flume = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+similar = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }

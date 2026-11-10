@@ -18,11 +18,10 @@ agent-client-protocol-schema = { workspace = true }
 jiff = { workspace = true }
 maki-storage = { workspace = true }
 maki-lan = { workspace = true }
+maki-acp-client = { workspace = true }
 color-eyre = { workspace = true }
 flume = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-similar = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
