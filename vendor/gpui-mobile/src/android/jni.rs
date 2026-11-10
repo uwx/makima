@@ -982,10 +982,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                         // Trigger GPUI resize so layout adapts to new dimensions.
                         existing.handle_resize();
 
-                        let cr = app.content_rect();
-                        existing.update_safe_area_from_content_rect(
-                            cr.left, cr.top, cr.right, cr.bottom,
-                        );
+                        refresh_safe_area(&existing, app);
 
                         INIT_WINDOW_DONE.store(true, Ordering::Relaxed);
                     } else {
@@ -997,10 +994,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                                     scale_factor
                                 );
 
-                                let cr = app.content_rect();
-                                win.update_safe_area_from_content_rect(
-                                    cr.left, cr.top, cr.right, cr.bottom,
-                                );
+                                refresh_safe_area(&win, app);
                             }
                             Err(e) => {
                                 log::error!("failed to open window: {e:#}");
@@ -1019,8 +1013,7 @@ pub fn run_event_loop(app: &AndroidApp) {
             if let Some(platform) = PLATFORM.get() {
                 if let Some(win) = platform.primary_window() {
                     win.handle_resize();
-                    let cr = app.content_rect();
-                    win.update_safe_area_from_content_rect(cr.left, cr.top, cr.right, cr.bottom);
+                    refresh_safe_area(&win, app);
                 }
             }
         }
@@ -1526,6 +1519,84 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
         style.navigation_bar_color,
         style.status_bar_style
     );
+}
+
+/// Sets the safe area from the content rect, widened by the system bars the
+/// window reports over it.
+fn refresh_safe_area(win: &super::AndroidWindow, app: &AndroidApp) {
+    let content = app.content_rect();
+    win.update_safe_area_from_content_rect(content.left, content.top, content.right, content.bottom);
+    if let Some(bars) = system_bar_insets() {
+        win.merge_safe_area_insets(bars);
+    }
+}
+
+/// The system bars' insets in physical pixels, as the window reports them now.
+///
+/// The content rect stays the whole window when the app draws edge to edge
+/// under the bars, so the insets have to be asked for directly. None until the
+/// window exists.
+pub fn system_bar_insets() -> Option<super::SafeAreaInsets> {
+    with_env(|env| {
+        let activity = activity(env)?;
+        let window = env
+            .call_method(
+                &activity,
+                jni::jni_str!("getWindow"),
+                jni::jni_sig!("()Landroid/view/Window;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        let decor = env
+            .call_method(
+                &window,
+                jni::jni_str!("getDecorView"),
+                jni::jni_sig!("()Landroid/view/View;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        let insets = env
+            .call_method(
+                &decor,
+                jni::jni_str!("getRootWindowInsets"),
+                jni::jni_sig!("()Landroid/view/WindowInsets;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        if insets.is_null() {
+            return Err("the window has no insets yet".into());
+        }
+        // Deprecated since API 30, and still the one call that works below it.
+        macro_rules! inset {
+            ($method:literal) => {
+                env.call_method(&insets, jni::jni_str!($method), jni::jni_sig!("()I"), &[])
+                    .and_then(|value| value.i())
+                    .map_err(|error| {
+                        env.exception_clear();
+                        error.to_string()
+                    })? as f32
+            };
+        }
+        Ok(super::SafeAreaInsets {
+            top: inset!("getSystemWindowInsetTop"),
+            bottom: inset!("getSystemWindowInsetBottom"),
+            left: inset!("getSystemWindowInsetLeft"),
+            right: inset!("getSystemWindowInsetRight"),
+        })
+    })
+    .ok()
 }
 
 // ── software keyboard (IME) control ───────────────────────────────────────────

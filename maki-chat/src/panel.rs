@@ -31,6 +31,8 @@ const STOP_LABEL: &str = "Stop";
 const COMPOSER_PLACEHOLDER: &str = "Ask makima to explore, explain, or change the code";
 const COMPOSER_HINT: &str = "Enter sends, Shift+Enter adds a line, / opens commands";
 const TRANSCRIPT_MAX_WIDTH: f32 = 860.;
+/// Below this the composer and status bar drop what a phone has no room for.
+const NARROW_WIDTH: f32 = 600.;
 const PICK_WIDTH: f32 = 560.;
 const PICK_MAX_HEIGHT: f32 = 480.;
 const MAX_SLASH_ROWS: usize = 8;
@@ -638,6 +640,7 @@ impl SessionPanel {
                     self.notice(error);
                 }
             }
+            Event::Attached => self.busy = false,
             Event::Closed(reason) => {
                 self.backend = None;
                 self.closed = true;
@@ -1692,7 +1695,7 @@ impl SessionPanel {
             .children(rows)
     }
 
-    fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn composer(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .w_full()
             .border_t_1()
@@ -1750,7 +1753,7 @@ impl SessionPanel {
                                     .flex_1()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(COMPOSER_HINT),
+                                    .when(!narrow, |this| this.child(COMPOSER_HINT)),
                             )
                             .when(!self.busy, |this| {
                                 this.child(
@@ -1778,7 +1781,7 @@ impl SessionPanel {
             )
     }
 
-    fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn status_bar(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let context = match self.status.context {
             Some(used) if self.status.context_window > 0 => {
                 let percent = used.saturating_mul(100) / self.status.context_window;
@@ -1806,6 +1809,7 @@ impl SessionPanel {
         h_flex()
             .w_full()
             .items_center()
+            .flex_wrap()
             .gap_3()
             .px_4()
             .py_1()
@@ -1815,7 +1819,7 @@ impl SessionPanel {
             .text_color(cx.theme().muted_foreground)
             .child(self.status.model.clone())
             .child(div().flex_1())
-            .children(thinking)
+            .children(thinking.filter(|_| !narrow))
             .when(!context.is_empty(), |this| this.child(context))
             .children(self.status.cost.clone())
             .when(self.read_only, |this| {
@@ -2173,7 +2177,8 @@ fn tool_text(content: &[ToolCallContent]) -> Option<String> {
 }
 
 impl Render for SessionPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let narrow = window.viewport_size().width < px(NARROW_WIDTH);
         div()
             .relative()
             .size_full()
@@ -2188,8 +2193,8 @@ impl Render for SessionPanel {
                             .as_ref()
                             .map(|pending| self.permission_card(pending, cx)),
                     )
-                    .child(self.composer(cx))
-                    .child(self.status_bar(cx)),
+                    .child(self.composer(narrow, cx))
+                    .child(self.status_bar(narrow, cx)),
             )
             .children(self.pick.as_ref().map(|pick| self.pick_modal(pick, cx)))
     }

@@ -1122,6 +1122,16 @@ impl AndroidWindow {
         state.safe_area_insets = insets;
     }
 
+    /// Widens the safe area with insets the window reports for its system bars.
+    pub fn merge_safe_area_insets(&self, insets: SafeAreaInsets) {
+        let mut state = self.state.lock();
+        let current = &mut state.safe_area_insets;
+        current.top = current.top.max(insets.top);
+        current.bottom = current.bottom.max(insets.bottom);
+        current.left = current.left.max(insets.left);
+        current.right = current.right.max(insets.right);
+    }
+
     // ── state queries ─────────────────────────────────────────────────────────
 
     /// Whether the window currently has an active wgpu surface.
@@ -1539,6 +1549,19 @@ impl PlatformWindow for AndroidPlatformWindow {
 
     fn scale_factor(&self) -> f32 {
         self.window.scale_factor()
+    }
+
+    fn insets(&self) -> gpui::WindowInsets {
+        let insets = self.window.safe_area_insets_logical();
+        gpui::WindowInsets {
+            safe_area: gpui::Edges {
+                top: gpui::px(insets.top),
+                right: gpui::px(insets.right),
+                bottom: gpui::px(insets.bottom),
+                left: gpui::px(insets.left),
+            },
+            ..Default::default()
+        }
     }
 
     fn appearance(&self) -> gpui::WindowAppearance {

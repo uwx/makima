@@ -21,7 +21,7 @@ pub use agent_client_protocol_schema::{
     ProtocolVersion, Request, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionId, SessionNotification, SessionUpdate, StopReason,
-    TextContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolCallContent,
+    TextContent, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use flume::{Receiver, Sender};
 use serde::de::DeserializeOwned;
@@ -74,7 +74,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(5);
 const THEME_TIMEOUT: Duration = Duration::from_secs(30);
 const DIFF_CONTEXT_LINES: usize = 3;
-const TRUNCATED_HISTORY: &str = "This shared session is long; its oldest updates were not replayed.";
+const TRUNCATED_HISTORY: &str =
+    "This shared session is long; its oldest updates were not replayed.";
 
 /// An inbound event from the agent, already narrowed to what the desktop renders.
 pub enum Event {
@@ -101,6 +102,9 @@ pub enum Event {
     Unshare(Result<(), String>),
     RewindDone(Result<String, String>),
     PromptDone(Result<StopReason, String>),
+    /// A shared session finished replaying its transcript; from here on its
+    /// updates are live.
+    Attached,
     Closed(String),
 }
 
@@ -448,9 +452,11 @@ impl Target {
         if let Some(lan) = &self.lan {
             let mut stream = TcpStream::connect(&lan.address)
                 .map_err(|error| format!("connect to {} over the LAN: {error}", lan.address))?;
-            stream.set_read_timeout(Some(LAN_TIMEOUT)).map_err(|error| {
-                format!("set the LAN connect timeout for {}: {error}", lan.address)
-            })?;
+            stream
+                .set_read_timeout(Some(LAN_TIMEOUT))
+                .map_err(|error| {
+                    format!("set the LAN connect timeout for {}: {error}", lan.address)
+                })?;
             let _ = stream.set_nodelay(true);
             handshake(&mut stream, &lan.token)?;
             stream
@@ -580,6 +586,8 @@ fn open_session(
             if reply.get("truncated").and_then(Value::as_bool) == Some(true) {
                 let _ = client.emit(Event::Flash(TRUNCATED_HISTORY.to_owned()));
             }
+            // Queued behind the replay, so a watcher knows where history ends.
+            let _ = client.emit(Event::Attached);
             let options = session_options(&reply);
             let view = session_view(&options);
             let model = view.model.clone().unwrap_or_default();
@@ -616,8 +624,8 @@ fn handshake(stream: &mut TcpStream, token: &str) -> Result<(), String> {
         .and_then(|()| stream.flush())
         .map_err(|error| format!("send the LAN handshake: {error}"))?;
     let reply = read_line(stream)?;
-    let reply: Value =
-        serde_json::from_str(&reply).map_err(|error| format!("decode the LAN handshake: {error}"))?;
+    let reply: Value = serde_json::from_str(&reply)
+        .map_err(|error| format!("decode the LAN handshake: {error}"))?;
     if reply["ok"] != true {
         let reason = reply["error"].as_str().unwrap_or("no reason given");
         return Err(format!("LAN handshake refused: {reason}"));

@@ -41,10 +41,15 @@ impl Phone {
 }
 
 impl Render for Phone {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let safe = window.insets().effective();
         div()
             .size_full()
             .bg(rgb(BACKGROUND))
+            .pt(safe.top)
+            .pb(safe.bottom)
+            .pl(safe.left)
+            .pr(safe.right)
             .child(self.panel.clone())
     }
 }
