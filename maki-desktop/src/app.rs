@@ -24,7 +24,9 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::Value;
 
-use crate::acp::{self, ArgItem, Event, PickItem, PickOutcome, RewindTurn, SessionEntry, Target};
+use crate::acp::{
+    self, ArgItem, Event, PickItem, PickOutcome, RewindTurn, SessionEntry, ShareInfo, Target,
+};
 use crate::backend::{Backend, Command, Started};
 
 const SEND_LABEL: &str = "Send";
@@ -63,6 +65,15 @@ const YOLO_BADGE: &str = "[yolo]";
 const NORMAL_BADGE: &str = "[normal]";
 const READ_ONLY_BADGE: &str = "[read-only]";
 const TAKE_CONTROL_LABEL: &str = "Take control";
+const SHARE_LABEL: &str = "Share";
+const SHARE_STOP_LABEL: &str = "Stop sharing";
+const SHARE_LINK_LABEL: &str = "Copy link";
+const SHARE_TOKEN_LABEL: &str = "Copy token";
+const SHARE_BADGE: &str = "[shared]";
+const SHARED_NOTICE: &str = "Sharing this session";
+const SHARE_STOPPED: &str = "This session is no longer shared";
+const LINK_COPIED: &str = "Link copied";
+const TOKEN_COPIED: &str = "Token copied";
 const WATCHING_NOTICE: &str = "Watching a shared session; take control to type";
 const READ_ONLY_NOTICE: &str = "This shared session is read-only; take control to type";
 const CONTROL_TAKEN: &str = "You control this shared session";
@@ -213,6 +224,8 @@ pub struct SessionPanel {
     busy: bool,
     /// True while the session belongs to another window.
     read_only: bool,
+    /// Set while this window shares the session with other machines.
+    share: Option<ShareInfo>,
     pending: Option<PendingPermission>,
     pick: Option<PendingPick>,
     status: Status,
@@ -267,6 +280,7 @@ impl SessionPanel {
             scroll: ScrollHandle::new(),
             busy: false,
             read_only: false,
+            share: None,
             pending: None,
             pick: None,
             status: Status::default(),
@@ -422,6 +436,32 @@ impl SessionPanel {
         cx.notify();
     }
 
+    fn start_share(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = &self.backend else {
+            return;
+        };
+        if let Err(error) = backend.share() {
+            self.notice(error);
+        }
+        cx.notify();
+    }
+
+    fn stop_share(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = &self.backend else {
+            return;
+        };
+        if let Err(error) = backend.unshare() {
+            self.notice(error);
+        }
+        cx.notify();
+    }
+
+    fn copy(&mut self, text: String, copied: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.notice(copied.to_owned());
+        cx.notify();
+    }
+
     fn cancel(&mut self, cx: &mut Context<Self>) {
         if let Some(backend) = &self.backend {
             _ = backend.send(Command::Cancel);
@@ -466,6 +506,29 @@ impl SessionPanel {
                 } else {
                     CONTROL_LOST.to_owned()
                 });
+                cx.notify();
+            }
+            Event::Share(result) => {
+                match result {
+                    Ok(share) => {
+                        self.notice(format!(
+                            "{SHARED_NOTICE} at {} with token {}",
+                            share.link, share.token
+                        ));
+                        self.share = Some(share);
+                    }
+                    Err(error) => self.notice(format!("Could not share this session: {error}")),
+                }
+                cx.notify();
+            }
+            Event::Unshare(result) => {
+                match result {
+                    Ok(()) => {
+                        self.share = None;
+                        self.notice(SHARE_STOPPED.to_owned());
+                    }
+                    Err(error) => self.notice(format!("Could not stop sharing: {error}")),
+                }
                 cx.notify();
             }
             Event::Pick(prompt) => self.open_pick(prompt),
@@ -1689,6 +1752,11 @@ impl SessionPanel {
         } else {
             NORMAL_BADGE
         };
+        let can_share = !self.read_only
+            && self
+                .backend
+                .as_ref()
+                .is_some_and(|backend| backend.can_share);
 
         h_flex()
             .w_full()
@@ -1713,6 +1781,40 @@ impl SessionPanel {
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| this.take_control(cx))),
                     )
+            })
+            .when_some(self.share.clone(), |this, share| {
+                let (link, token) = (share.link.clone(), share.token.clone());
+                this.child(div().text_xs().child(format!("{SHARE_BADGE} {}", share.address)))
+                    .child(
+                        Button::new("share-link")
+                            .label(SHARE_LINK_LABEL)
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.copy(link.clone(), LINK_COPIED, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("share-token")
+                            .label(SHARE_TOKEN_LABEL)
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.copy(token.clone(), TOKEN_COPIED, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("share-stop")
+                            .label(SHARE_STOP_LABEL)
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| this.stop_share(cx))),
+                    )
+            })
+            .when(self.share.is_none() && can_share, |this| {
+                this.child(
+                    Button::new("share")
+                        .label(SHARE_LABEL)
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| this.start_share(cx))),
+                )
             })
             .child(permission)
     }

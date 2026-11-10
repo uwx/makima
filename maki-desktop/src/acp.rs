@@ -59,6 +59,8 @@ const SESSION_LOAD_METHOD: &str = "session/load";
 const LIVE_METHOD: &str = "maki/live";
 const ATTACH_METHOD: &str = "maki/attach";
 const TAKE_CONTROL_METHOD: &str = "maki/take_control";
+const SHARE_METHOD: &str = "maki/share";
+const UNSHARE_METHOD: &str = "maki/unshare";
 const CONTROL_METHOD: &str = "maki/ui/control";
 const REWIND_METHOD: &str = "maki/rewind";
 const REWOUND_METHOD: &str = "maki/ui/rewind";
@@ -89,9 +91,21 @@ pub enum Event {
     Rewound,
     /// This window gained (true) or lost (false) control of the session.
     Control(bool),
+    /// The agent started sharing this session, or said why it could not.
+    Share(Result<ShareInfo, String>),
+    /// The agent stopped sharing this session, or said why it could not.
+    Unshare(Result<(), String>),
     RewindDone(Result<String, String>),
     PromptDone(Result<StopReason, String>),
     Closed(String),
+}
+
+/// Where another machine reaches a shared session, and the token it presents.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShareInfo {
+    pub address: String,
+    pub link: String,
+    pub token: String,
 }
 
 /// A stored session the agent can reopen.
@@ -327,6 +341,11 @@ impl Target {
         self.lan.is_some()
     }
 
+    /// Whether this window runs the agent itself, so it can share it.
+    pub fn is_local(&self) -> bool {
+        self.lan.is_none() && self.process_cwd.is_some()
+    }
+
     pub fn session_cwd(&self) -> &Path {
         &self.session_cwd
     }
@@ -345,17 +364,23 @@ impl Target {
     }
 
     /// `lan://host:port:/absolute/path`: the session runs on the machine that
-    /// shares it, so the path is that machine's.
+    /// shares it, so the path is that machine's. A bare `lan://host:port`
+    /// watches the session that machine already serves.
     fn lan(spec: &str, token: Option<&str>) -> Result<Self, String> {
         let rest = spec
             .strip_prefix(LAN_SCHEME)
             .ok_or_else(|| format!("{LAN_SCHEME} expected, got {spec:?}"))?;
-        let (address, path) = rest
-            .split_once(":/")
-            .filter(|(address, path)| !address.is_empty() && !path.is_empty())
-            .ok_or_else(|| {
-                format!("{REMOTE_ENV} must be {LAN_SCHEME}host:port:/absolute/path, got {spec:?}")
-            })?;
+        let (address, path) = match rest.split_once(":/") {
+            Some((address, path)) if !address.is_empty() && !path.is_empty() => {
+                (address, PathBuf::from(format!("/{path}")))
+            }
+            _ if !rest.is_empty() && !rest.contains(":/") => (rest, PathBuf::from("/")),
+            _ => {
+                return Err(format!(
+                    "{REMOTE_ENV} must be {LAN_SCHEME}host:port:/absolute/path, got {spec:?}"
+                ));
+            }
+        };
         let token = token
             .map(str::trim)
             .filter(|token| !token.is_empty())
@@ -365,7 +390,7 @@ impl Target {
             program: String::new(),
             args: Vec::new(),
             process_cwd: None,
-            session_cwd: PathBuf::from(format!("/{path}")),
+            session_cwd: path,
             lan: Some(Lan {
                 address: address.to_owned(),
                 token: token.to_owned(),
@@ -725,6 +750,17 @@ impl Client {
         )?;
         *self.session.lock().unwrap() = Some(session.clone());
         Ok(reply)
+    }
+
+    /// Opens a listener other machines can watch this session through.
+    pub fn share(&self) -> Result<ShareInfo, String> {
+        self.request(SHARE_METHOD, json!({}), Some(SESSION_TIMEOUT))
+    }
+
+    /// Stops the listener this connection opened.
+    pub fn unshare(&self) -> Result<(), String> {
+        let _: Value = self.request(UNSHARE_METHOD, json!({}), Some(SESSION_TIMEOUT))?;
+        Ok(())
     }
 
     /// Makes this window the one that may act on the session.
@@ -1198,8 +1234,16 @@ old
         assert!(target.lan.is_some());
     }
 
-    #[test_case("lan://buildbox" ; "missing directory")]
+    #[test]
+    fn a_copied_lan_link_attaches_without_a_directory() {
+        let target = Target::lan("lan://buildbox:7331", Some("token")).unwrap();
+        assert_eq!(target.label(), "lan://buildbox:7331");
+        assert_eq!(target.session_cwd(), Path::new("/"));
+        assert!(!target.is_local());
+    }
+
     #[test_case("lan://:/srv/app" ; "missing address")]
+    #[test_case("lan://" ; "missing host and directory")]
     fn lan_rejects_malformed_spec(spec: &str) {
         assert!(Target::lan(spec, Some("token")).is_err());
     }
@@ -1326,6 +1370,48 @@ old
         assert_eq!(
             server.join().unwrap(),
             ["initialize", "maki/live", "maki/attach"]
+        );
+    }
+
+    #[test]
+    fn sharing_answers_the_places_other_windows_reach() {
+        const TOKEN: &str = "shared-session-token";
+
+        let (address, server) = fake_agent(5, |method, _| match method {
+            "initialize" => initialized(method),
+            "maki/live" => Some(serde_json::json!({ "sessions": [] })),
+            "session/new" => Some(serde_json::json!({
+                "sessionId": "sess-new",
+                "configOptions": [],
+            })),
+            "maki/share" => Some(serde_json::json!({
+                "bind": "0.0.0.0:4000",
+                "address": "192.168.1.4:4000",
+                "link": "lan://192.168.1.4:4000",
+                "token": TOKEN,
+            })),
+            "maki/unshare" => Some(serde_json::json!({ "shared": false })),
+            _ => None,
+        });
+        let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
+        let connection = super::connect(&target).unwrap();
+
+        let share = connection.client.share().unwrap();
+        assert_eq!(share.link, "lan://192.168.1.4:4000");
+        assert_eq!(share.address, "192.168.1.4:4000");
+        assert_eq!(share.token, TOKEN);
+
+        connection.client.unshare().unwrap();
+        drop(connection);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "initialize",
+                "maki/live",
+                "session/new",
+                "maki/share",
+                "maki/unshare"
+            ]
         );
     }
 }

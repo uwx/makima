@@ -67,6 +67,24 @@ A process serves one session at a time. Closing the connection that owns it ends
 
 The listener speaks plain TCP, and the token is its only gate. Use it on a network you trust or over a private network such as Tailscale, and prefer `127.0.0.1` unless another machine needs it.
 
+### Sharing a running session
+
+A connection that owns a session can open a listener for it later, without a restart:
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"maki/share","params":{}}
+```
+
+```json
+{"bind":"0.0.0.0:60667","address":"192.168.2.4:60667","link":"lan://192.168.2.4:60667","token":"..."}
+```
+
+`bind` is what the agent bound, `address` what another machine reaches, `link` the agent address a client sets, and `token` what it presents in the handshake. The token is `MAKIMA_LAN_TOKEN` when set, then the stored `lan-token`. Asking twice answers the same listener. `maki/unshare` closes it, and so does ending the connection that opened it.
+
+Only the connection that owns the session can share it: a watching connection gets `-32014`, even while it holds control. A share that cannot bind answers `-32013`.
+
+The desktop window has the same thing as a status bar toggle. `Share` opens the listener and shows the address with buttons for the link and the token, `Stop sharing` closes it. Another window reaches it with `MAKI_DESKTOP_REMOTE=lan://192.168.2.4:60667` and `MAKI_DESKTOP_LAN_TOKEN=...`. The link names no directory: that window watches the session the other machine serves instead of starting one.
+
 ### Watching a session
 
 While a connection owns a session, other connections can watch it read only. `maki/live` lists what this process serves:

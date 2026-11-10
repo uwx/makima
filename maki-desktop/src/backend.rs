@@ -23,6 +23,8 @@ pub struct Backend {
     pub session: String,
     pub cwd: PathBuf,
     pub target: String,
+    /// Whether this window runs the agent, so it can share its session.
+    pub can_share: bool,
 }
 
 pub struct Started {
@@ -45,6 +47,7 @@ impl Backend {
             session: acp::short_session(&connection.session),
             cwd: target.session_cwd().to_path_buf(),
             target: target.label().to_owned(),
+            can_share: target.is_local(),
         };
         Ok(Started {
             backend,
@@ -67,6 +70,32 @@ impl Backend {
                 let _ = client.emit(event);
             })
             .map_err(|error| format!("start take control: {error}"))?;
+        Ok(())
+    }
+
+    /// Opens a LAN listener for this session, so another window can watch it.
+    pub fn share(&self) -> Result<(), String> {
+        let client = Arc::clone(&self.client);
+        thread::Builder::new()
+            .name("maki-share".into())
+            .spawn(move || {
+                let result = client.share();
+                let _ = client.emit(Event::Share(result));
+            })
+            .map_err(|error| format!("start sharing: {error}"))?;
+        Ok(())
+    }
+
+    /// Closes that listener.
+    pub fn unshare(&self) -> Result<(), String> {
+        let client = Arc::clone(&self.client);
+        thread::Builder::new()
+            .name("maki-unshare".into())
+            .spawn(move || {
+                let result = client.unshare();
+                let _ = client.emit(Event::Unshare(result));
+            })
+            .map_err(|error| format!("stop sharing: {error}"))?;
         Ok(())
     }
 
