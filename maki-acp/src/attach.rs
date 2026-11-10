@@ -33,6 +33,7 @@ pub const BUSY_CONTROL_CODE: i32 = -32012;
 pub const BUSY_CONTROL_MESSAGE: &str = "the session is busy; take control once it is idle";
 
 const SESSION_UPDATE: &str = "session/update";
+const CONFIG_OPTION_UPDATE: &str = "config_option_update";
 /// Older updates than this are dropped, and the attach says so.
 const MAX_LOG_UPDATES: usize = 4000;
 
@@ -116,6 +117,14 @@ impl Taps {
                     return;
                 };
                 if let Some(tap) = self.get(id) {
+                    if message
+                        .pointer("/params/update/sessionUpdate")
+                        .and_then(Value::as_str)
+                        == Some(CONFIG_OPTION_UPDATE)
+                        && let Some(options) = message.pointer("/params/update/configOptions")
+                    {
+                        tap.set_info(options.clone());
+                    }
                     tap.publish(message);
                 }
             }
@@ -143,6 +152,9 @@ pub struct RemoteRequest {
 pub struct SessionTap {
     state: Mutex<TapState>,
     controller: Mutex<Option<Sender<Value>>>,
+    /// The session's config options, so an attach can paint its status bar
+    /// without asking the owning loop.
+    info: Mutex<Option<Value>>,
     inbound: (Sender<RemoteRequest>, flume::Receiver<RemoteRequest>),
 }
 
@@ -151,6 +163,7 @@ impl Default for SessionTap {
         Self {
             state: Mutex::default(),
             controller: Mutex::default(),
+            info: Mutex::default(),
             inbound: flume::unbounded(),
         }
     }
@@ -195,6 +208,14 @@ impl SessionTap {
             .0
             .send(RemoteRequest { message, reply })
             .is_ok()
+    }
+
+    pub fn set_info(&self, options: Value) {
+        *self.info.lock().unwrap() = Some(options);
+    }
+
+    pub fn info(&self) -> Option<Value> {
+        self.info.lock().unwrap().clone()
     }
 
     pub fn set_controller(&self, controller: Sender<Value>) {

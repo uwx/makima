@@ -74,10 +74,10 @@ Then send `maki/attach` with the session id:
 Makima first replays what the session already emitted, as the same `session/update` notifications a client already renders, then streams new ones. The reply follows the replay:
 
 ```json
-{"sessionId":"...","readOnly":true,"replayed":12,"truncated":false}
+{"sessionId":"...","readOnly":true,"replayed":12,"truncated":false,"configOptions":[...]}
 ```
 
-`replayed` counts the updates sent before the reply, and `truncated` says the oldest ones were dropped because the session ran past the recording limit. Several connections can watch one session.
+`replayed` counts the updates sent before the reply, `truncated` says the oldest ones were dropped because the session ran past the recording limit, and `configOptions` is the session's current option list, so a client can paint its status bar without asking. Several connections can watch one session.
 
 A watching connection that does not hold control cannot write: `session/prompt`, `session/new`, `session/load`, `session/set_mode`, `session/set_config_option` and `maki/rewind` answer with error code `-32010`. It can still initialize, list sessions, switch themes and complete arguments.
 

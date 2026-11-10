@@ -56,6 +56,10 @@ const COMPLETE_METHOD: &str = "maki/complete";
 const THEME_METHOD: &str = "maki/theme";
 const SESSIONS_METHOD: &str = "maki/sessions";
 const SESSION_LOAD_METHOD: &str = "session/load";
+const LIVE_METHOD: &str = "maki/live";
+const ATTACH_METHOD: &str = "maki/attach";
+const TAKE_CONTROL_METHOD: &str = "maki/take_control";
+const CONTROL_METHOD: &str = "maki/ui/control";
 const REWIND_METHOD: &str = "maki/rewind";
 const REWOUND_METHOD: &str = "maki/ui/rewind";
 const SHORT_SESSION_CHARS: usize = 8;
@@ -64,6 +68,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(5);
 const THEME_TIMEOUT: Duration = Duration::from_secs(30);
 const DIFF_CONTEXT_LINES: usize = 3;
+const TRUNCATED_HISTORY: &str = "This shared session is long; its oldest updates were not replayed.";
 
 /// An inbound event from the agent, already narrowed to what the desktop renders.
 pub enum Event {
@@ -82,6 +87,8 @@ pub enum Event {
     RewindTurns(Result<Vec<RewindTurn>, String>),
     /// The agent rewound its history; the replay follows as updates.
     Rewound,
+    /// This window gained (true) or lost (false) control of the session.
+    Control(bool),
     RewindDone(Result<String, String>),
     PromptDone(Result<StopReason, String>),
     Closed(String),
@@ -102,6 +109,17 @@ pub struct SessionEntry {
 #[derive(Deserialize)]
 struct SessionsResponse {
     sessions: Vec<SessionEntry>,
+}
+
+#[derive(Deserialize)]
+struct LiveSessions {
+    sessions: Vec<LiveSession>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveSession {
+    session_id: String,
 }
 
 /// One user turn a rewind can return to.
@@ -303,6 +321,12 @@ impl Target {
         &self.label
     }
 
+    /// Whether the agent may already serve a session: a LAN listener does, a
+    /// spawned process never does.
+    fn shares_a_session(&self) -> bool {
+        self.lan.is_some()
+    }
+
     pub fn session_cwd(&self) -> &Path {
         &self.session_cwd
     }
@@ -434,6 +458,8 @@ pub struct Connection {
     pub session: SessionId,
     pub model: String,
     pub themes: ThemeCatalog,
+    /// A shared session is watched, not owned, until this window takes control.
+    pub read_only: bool,
 }
 
 pub fn connect(target: &Target) -> Result<Connection, String> {
@@ -461,13 +487,35 @@ pub fn connect(target: &Target) -> Result<Connection, String> {
     }
 
     let themes = client.initialize()?;
-    let (session, model, options) = client.new_session(target.session_cwd())?;
+    let live = if target.shares_a_session() {
+        client.live_sessions()?.into_iter().next()
+    } else {
+        None
+    };
+    let (session, model, options, read_only) = match live {
+        Some(id) => {
+            let session = SessionId::new(id);
+            let reply = client.attach(&session)?;
+            if reply.get("truncated").and_then(Value::as_bool) == Some(true) {
+                let _ = client.emit(Event::Flash(TRUNCATED_HISTORY.to_owned()));
+            }
+            let options = session_options(&reply);
+            let view = session_view(&options);
+            let model = view.model.clone().unwrap_or_default();
+            (session, model, view, true)
+        }
+        None => {
+            let (session, model, options) = client.new_session(target.session_cwd())?;
+            (session, model, options, false)
+        }
+    };
     Ok(Connection {
         client,
         events: events_rx,
         session,
         model,
         options,
+        read_only,
         themes,
     })
 }
@@ -658,6 +706,33 @@ impl Client {
         Ok((response.session_id, model, options))
     }
 
+    /// The sessions the agent serves right now. Empty for a spawned process.
+    fn live_sessions(&self) -> Result<Vec<String>, String> {
+        let response: LiveSessions = self.request(LIVE_METHOD, json!({}), Some(SESSION_TIMEOUT))?;
+        Ok(response
+            .sessions
+            .into_iter()
+            .map(|session| session.session_id)
+            .collect())
+    }
+
+    /// Watches {session}: its history replays as updates, then new ones follow.
+    fn attach(&self, session: &SessionId) -> Result<Value, String> {
+        let reply: Value = self.request(
+            ATTACH_METHOD,
+            json!({ "sessionId": session.0 }),
+            Some(SESSION_TIMEOUT),
+        )?;
+        *self.session.lock().unwrap() = Some(session.clone());
+        Ok(reply)
+    }
+
+    /// Makes this window the one that may act on the session.
+    pub fn take_control(&self) -> Result<bool, String> {
+        let reply: Value = self.request(TAKE_CONTROL_METHOD, json!({}), Some(SESSION_TIMEOUT))?;
+        Ok(reply.get("controller").and_then(Value::as_bool) == Some(true))
+    }
+
     pub fn prompt(&self, text: &str) -> Result<StopReason, String> {
         let session = self
             .session
@@ -773,6 +848,14 @@ impl Client {
             REWOUND_METHOD => {
                 let _ = self.emit(Event::Rewound);
             }
+            CONTROL_METHOD => {
+                if let Some(controller) = message
+                    .pointer("/params/controller")
+                    .and_then(Value::as_bool)
+                {
+                    let _ = self.emit(Event::Control(controller));
+                }
+            }
             _ => {}
         }
     }
@@ -886,6 +969,21 @@ pub fn session_view(options: &[SessionConfigOption]) -> SessionView {
     view
 }
 
+/// The config options a shared session reported, which is what lets an
+/// attached window paint its status bar.
+fn session_options(reply: &Value) -> Vec<SessionConfigOption> {
+    reply
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| serde_json::from_value(value.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn push_model(args: &mut Vec<String>, model: Option<&str>) {
     if let Some(model) = model {
         args.push(MODEL_FLAG.to_owned());
@@ -906,6 +1004,7 @@ mod tests {
     use std::path::Path;
 
     use agent_client_protocol_schema::{Diff, ToolCallContent};
+    use serde_json::Value;
 
     use super::{
         ACP_SUBCOMMAND, MODEL_FLAG, SSH_PROGRAM, Target, ThemePalette, diff_text, themes_from,
@@ -1111,17 +1210,21 @@ old
         assert!(Target::lan("lan://buildbox:7331:/srv/app", Some(" ")).is_err());
     }
 
-    #[test]
-    fn lan_connect_handshakes_and_opens_a_session() {
+    /// A LAN agent that answers {replies} requests, then closes. Yields the
+    /// methods it saw.
+    fn fake_agent(
+        replies: usize,
+        reply: impl Fn(&str, &Value) -> Option<Value> + Send + 'static,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
 
-        use agent_client_protocol_schema::{NewSessionResponse, SessionId};
         use serde_json::{Value, json};
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
+            let mut methods = Vec::new();
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
@@ -1137,25 +1240,92 @@ old
                     break;
                 }
                 let request: Value = serde_json::from_str(line.trim()).unwrap();
-                let result = match request["method"].as_str() {
-                    Some("initialize") => json!({ "protocolVersion": 1 }),
-                    Some("session/new") => serde_json::to_value(NewSessionResponse::new(
-                        SessionId::new("sess-lan"),
-                    ))
-                    .unwrap(),
-                    _ => continue,
-                };
-                let reply = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result });
-                stream.write_all(reply.to_string().as_bytes()).unwrap();
-                stream.write_all(b"\n").unwrap();
-                if request["method"] == "session/new" {
+                let method = request["method"].as_str().unwrap_or_default().to_owned();
+                methods.push(method.clone());
+                let Some(result) = reply(&method, &request) else {
                     break;
+                };
+                let message = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result });
+                stream.write_all(message.to_string().as_bytes()).unwrap();
+                stream.write_all(b"\n").unwrap();
+                if methods.len() == replies {
+                    // Let the client see that no more replies follow, while
+                    // still reading its writes until it hangs up.
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
                 }
             }
+            methods
+        });
+        (address, server)
+    }
+
+    fn initialized(method: &str) -> Option<Value> {
+        (method == "initialize").then(|| serde_json::json!({ "protocolVersion": 1 }))
+    }
+
+    #[test]
+    fn lan_connect_handshakes_and_opens_a_session() {
+        use agent_client_protocol_schema::{NewSessionResponse, SessionId};
+
+        let (address, server) = fake_agent(3, |method, _| match method {
+            "initialize" => initialized(method),
+            "maki/live" => Some(serde_json::json!({ "sessions": [] })),
+            "session/new" => Some(
+                serde_json::to_value(NewSessionResponse::new(SessionId::new("sess-lan"))).unwrap(),
+            ),
+            _ => None,
         });
         let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
         let connection = super::connect(&target).unwrap();
         assert_eq!(&*connection.session.0, "sess-lan");
-        server.join().unwrap();
+        assert!(!connection.read_only);
+        drop(connection);
+        assert_eq!(
+            server.join().unwrap(),
+            ["initialize", "maki/live", "session/new"]
+        );
+    }
+
+    #[test]
+    fn lan_connect_attaches_to_a_live_session() {
+        use agent_client_protocol_schema::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        };
+
+        let model = SessionConfigOption::select(
+            "model".to_owned(),
+            "Model".to_owned(),
+            "openai/gpt-5".to_owned(),
+            vec![SessionConfigSelectOption::new(
+                "openai/gpt-5".to_owned(),
+                "openai/gpt-5".to_owned(),
+            )],
+        )
+        .category(SessionConfigOptionCategory::Model);
+
+        let (address, server) = fake_agent(3, move |method, _| match method {
+            "initialize" => initialized(method),
+            "maki/live" => Some(serde_json::json!({
+                "sessions": [{ "sessionId": "sess-live", "watchers": 1 }],
+            })),
+            "maki/attach" => Some(serde_json::json!({
+                "sessionId": "sess-live",
+                "readOnly": true,
+                "replayed": 2,
+                "truncated": false,
+                "configOptions": serde_json::to_value(vec![model.clone()]).unwrap(),
+            })),
+            _ => None,
+        });
+        let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
+        let connection = super::connect(&target).unwrap();
+        assert_eq!(&*connection.session.0, "sess-live");
+        assert!(connection.read_only);
+        assert_eq!(connection.model, "openai/gpt-5");
+        drop(connection);
+        assert_eq!(
+            server.join().unwrap(),
+            ["initialize", "maki/live", "maki/attach"]
+        );
     }
 }

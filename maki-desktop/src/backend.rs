@@ -7,6 +7,8 @@ use serde_json::Value;
 
 use crate::acp::{self, Client, Event, PickOutcome, SessionView, Target, ThemeCatalog};
 
+const CONTROL_REFUSED: &str = "Control was not granted";
+
 pub enum Command {
     Prompt(String),
     Cancel,
@@ -26,6 +28,8 @@ pub struct Backend {
 pub struct Started {
     pub backend: Backend,
     pub events: Receiver<Event>,
+    /// A shared session is watched until this window takes control.
+    pub read_only: bool,
 }
 
 impl Backend {
@@ -45,7 +49,25 @@ impl Backend {
         Ok(Started {
             backend,
             events: connection.events,
+            read_only: connection.read_only,
         })
+    }
+
+    /// Makes this window the one that may act on a shared session.
+    pub fn take_control(&self) -> Result<(), String> {
+        let client = Arc::clone(&self.client);
+        thread::Builder::new()
+            .name("maki-control".into())
+            .spawn(move || {
+                let event = match client.take_control() {
+                    Ok(true) => Event::Control(true),
+                    Ok(false) => Event::Flash(CONTROL_REFUSED.to_owned()),
+                    Err(error) => Event::Flash(format!("Could not take control: {error}")),
+                };
+                let _ = client.emit(event);
+            })
+            .map_err(|error| format!("start take control: {error}"))?;
+        Ok(())
     }
 
     pub fn send(&self, command: Command) -> Result<(), String> {

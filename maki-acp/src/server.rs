@@ -656,6 +656,22 @@ fn request_id(v: &Value) -> RequestId {
 /// Watches the session named in the request: its recorded updates go to this
 /// connection, then live ones follow. The connection keeps no session of its
 /// own, which is what makes every session-scoped write fail.
+/// Gives a freshly installed session's watchers its status bar contents before
+/// anything changes.
+fn publish_session_info(srv: &Server) {
+    let Some(session) = &srv.session else {
+        return;
+    };
+    let Some(coordinator) = &session.coordinator else {
+        return;
+    };
+    let options =
+        methods::session_config_options(&coordinator.read().options(), srv.supports_boolean);
+    if let Ok(options) = serde_json::to_value(options) {
+        srv.own_tap.set_info(options);
+    }
+}
+
 /// Methods a watching connection answers itself. Everything else is session
 /// traffic and belongs to the loop that owns the session.
 fn handled_locally(raw: &Value) -> bool {
@@ -732,6 +748,7 @@ fn attach_session(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
         .taps
         .get(id)
         .ok_or_else(|| AcpError::resource_not_found(Some(format!("session/{id}"))))?;
+    let config = tap.info().unwrap_or(Value::Null);
     if let Some(previous) = srv.attached.take() {
         previous.detach(&srv.wire);
     }
@@ -742,6 +759,7 @@ fn attach_session(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
         "readOnly": true,
         "replayed": replayed,
         "truncated": truncated,
+        "configOptions": config,
     }))
 }
 
@@ -966,6 +984,7 @@ async fn new_session(
         srv.taps.release(&session_id);
         session_registration_error(error)
     })?;
+    publish_session_info(srv);
     let mode = committed_mode(srv).await?;
     let resp =
         methods::new_session_response(&session_id, &mode, &srv.lua_event_handle.mode_registry())
@@ -1072,6 +1091,7 @@ async fn load_session(
         srv.taps.release(&sid.0);
         session_registration_error(error)
     })?;
+    publish_session_info(srv);
     if let Some(session) = &srv.session
         && let Some(orchestration) = &session.orchestration
         && let Err(error) = async {

@@ -61,6 +61,12 @@ const DOUBLE_TAP: Duration = Duration::from_millis(1500);
 const PICK_HINT: &str = "Enter";
 const YOLO_BADGE: &str = "[yolo]";
 const NORMAL_BADGE: &str = "[normal]";
+const READ_ONLY_BADGE: &str = "[read-only]";
+const TAKE_CONTROL_LABEL: &str = "Take control";
+const WATCHING_NOTICE: &str = "Watching a shared session; take control to type";
+const READ_ONLY_NOTICE: &str = "This shared session is read-only; take control to type";
+const CONTROL_TAKEN: &str = "You control this shared session";
+const CONTROL_LOST: &str = "Another window took control of this shared session";
 const THINKING_LABEL: &str = "thinking";
 const CLOCK_FORMAT: &str = "%H:%M";
 const THOUSAND: f64 = 1_000.0;
@@ -205,6 +211,8 @@ pub struct SessionPanel {
     views: Vec<ChatView>,
     scroll: ScrollHandle,
     busy: bool,
+    /// True while the session belongs to another window.
+    read_only: bool,
     pending: Option<PendingPermission>,
     pick: Option<PendingPick>,
     status: Status,
@@ -258,6 +266,7 @@ impl SessionPanel {
             views: Vec::new(),
             scroll: ScrollHandle::new(),
             busy: false,
+            read_only: false,
             pending: None,
             pick: None,
             status: Status::default(),
@@ -283,7 +292,15 @@ impl SessionPanel {
         cx: &mut Context<Self>,
     ) {
         match started {
-            Ok(Started { backend, events }) => {
+            Ok(Started {
+                backend,
+                events,
+                read_only,
+            }) => {
+                self.read_only = read_only;
+                if read_only {
+                    self.notice(WATCHING_NOTICE.to_owned());
+                }
                 self.status = session_status(&backend);
                 self.themes = backend.themes.names.clone();
                 self.theme = backend
@@ -350,6 +367,11 @@ impl SessionPanel {
             cx.notify();
             return;
         }
+        if self.read_only {
+            self.notice(READ_ONLY_NOTICE.to_owned());
+            cx.notify();
+            return;
+        }
         if self.busy {
             return;
         }
@@ -390,6 +412,16 @@ impl SessionPanel {
         true
     }
 
+    fn take_control(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = &self.backend else {
+            return;
+        };
+        if let Err(error) = backend.take_control() {
+            self.notice(error);
+        }
+        cx.notify();
+    }
+
     fn cancel(&mut self, cx: &mut Context<Self>) {
         if let Some(backend) = &self.backend {
             _ = backend.send(Command::Cancel);
@@ -427,6 +459,15 @@ impl SessionPanel {
                 });
             }
             Event::Flash(text) => self.notice(text),
+            Event::Control(controller) => {
+                self.read_only = !controller;
+                self.notice(if controller {
+                    CONTROL_TAKEN.to_owned()
+                } else {
+                    CONTROL_LOST.to_owned()
+                });
+                cx.notify();
+            }
             Event::Pick(prompt) => self.open_pick(prompt),
             Event::Completion { text, items } => {
                 self.apply_arguments(text, items, cx);
@@ -1664,6 +1705,15 @@ impl SessionPanel {
             .children(thinking)
             .when(!context.is_empty(), |this| this.child(context))
             .children(self.status.cost.clone())
+            .when(self.read_only, |this| {
+                this.child(div().text_xs().child(READ_ONLY_BADGE))
+                    .child(
+                        Button::new("take-control")
+                            .label(TAKE_CONTROL_LABEL)
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| this.take_control(cx))),
+                    )
+            })
             .child(permission)
     }
 }
