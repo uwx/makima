@@ -16,6 +16,11 @@ local RULE_FILE = "AGENTS.md"
 local IMPORT_MARKER = "<!-- imported by makima /inherit from "
 local PROJECT_SKILL_DIR = ".claude/skills"
 local MAX_RULE_BYTES = 512 * 1024
+-- Enough of a transcript to hold its title or first message without loading
+-- a long chat whole.
+local PREVIEW_BYTES = 128 * 1024
+local UNTITLED = "(untitled)"
+local NO_PROJECT = "project not recorded"
 
 local function flash(msg)
   maki.ui.flash(msg)
@@ -401,6 +406,15 @@ local function inherit_all(cwd, model)
   return tally
 end
 
+-- The project a conversation records, tidied for display: sources that encode
+-- it in a folder name lose the drive colon and gain repeated slashes.
+local function project_line(cwd)
+  if not cwd then
+    return NO_PROJECT
+  end
+  return (cwd:gsub("/+", "/"):gsub("^(%a)/", "%1:/"))
+end
+
 local function pick_and_apply(cwd, items, apply, describe)
   if #items == 0 then
     maki.ui.flash("Nothing to inherit here")
@@ -412,6 +426,7 @@ local function pick_and_apply(cwd, items, apply, describe)
       label = item.name or item.label or item.id,
       detail = describe(item),
       section = item.source,
+      age = item.age,
     }
   end
   local event = maki.ui.open_list_picker(rows, {
@@ -423,7 +438,8 @@ local function pick_and_apply(cwd, items, apply, describe)
   end
   local ok, err = apply(items[event.index])
   if ok then
-    flash("Imported " .. (items[event.index].name or items[event.index].id))
+    local imported = items[event.index]
+    flash("Imported " .. (imported.name or imported.label or imported.id))
   else
     flash("Import failed: " .. tostring(err))
   end
@@ -493,10 +509,17 @@ local function run_picker(cwd, model)
       return memory.description ~= "" and memory.description or memory.path
     end)
   elseif event.index == 5 then
+    -- The label is the title the imported session will carry, read from the
+    -- transcript's head; the id is a UUID and says nothing about the chat.
+    for _, conversation in ipairs(plan.conversations) do
+      local head = maki.fs.read_head(conversation.path, PREVIEW_BYTES)
+      conversation.label = (head and T.preview_title(conversation.source, head)) or UNTITLED
+      conversation.age = conversation.mtime > 0 and maki.time.at(math.floor(conversation.mtime)) or nil
+    end
     pick_and_apply(cwd, plan.conversations, function(conversation)
       return import_conversation(conversation, cwd, model)
     end, function(conversation)
-      return conversation.source .. " · " .. maki.fs.basename(conversation.path)
+      return project_line(conversation.cwd)
     end)
   end
 end

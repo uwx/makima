@@ -47,4 +47,4 @@ inherits: rules 1, skills 10, mcp 4, memories 3, conversations 117
 
 - A conversation is converted to Makima's own message shape. The text, thinking, tool calls and tool results come across; tool output that a source stored separately is dropped.
 - Very large transcripts (over 24 MB) are skipped rather than read into memory.
-- Imported sessions record the model that was current when you imported them, not the model the other agent used. A session whose stored model no longer resolves still opens, on the current model.
+- Imported sessions record the model that was current when you imported them, not the model the other agent used. A session whose stored model no longer resolves, or whose provider has no credentials on this machine, still opens, on the current model.

@@ -66,6 +66,16 @@ pub(crate) type BoxFuture<'a, T> =
 pub trait FsBackend: Send + Sync + std::any::Any {
     fn read(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<String>>;
     fn read_bytes(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<Vec<u8>>>;
+    /// The first {max_bytes} bytes of the file as text, cut at a character
+    /// boundary. A backend that can read a prefix should, so previewing a
+    /// large file costs no more than the prefix; the default reads the whole
+    /// file and keeps the head.
+    fn read_head(&self, path: PathBuf, max_bytes: usize) -> BoxFuture<'_, std::io::Result<String>> {
+        Box::pin(async move {
+            let text = self.read(path).await?;
+            Ok(head(&text, max_bytes))
+        })
+    }
     fn stat(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<FsMeta>>;
     fn write(&self, path: PathBuf, content: Vec<u8>) -> BoxFuture<'_, std::io::Result<()>>;
     fn atomic_write(&self, path: PathBuf, content: Vec<u8>) -> BoxFuture<'_, std::io::Result<()>>;
@@ -136,6 +146,18 @@ fn path_to_string(p: &Path) -> LuaResult<String> {
         .ok_or_else(|| mlua::Error::runtime("non-utf8 path"))
 }
 
+/// {text} cut to at most {max_bytes} bytes without splitting a character.
+fn head(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
 /// Read the entire file at {path} as a UTF-8 string.
 /// If the file contains bytes that are not valid UTF-8, this function throws.
 /// Use `read_bytes` for binary files.
@@ -176,6 +198,23 @@ async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
     let fs = backend(&lua);
     let bytes = try_pair!(fs.read_bytes(abs).await);
     Ok((Some(lua.create_buffer(bytes)?), None))
+}
+
+/// Read at most {max_bytes} bytes from the start of the file at {path} as a
+/// UTF-8 string. A character the cut splits is dropped, and invalid UTF-8
+/// elsewhere is replaced. Useful to preview a large log or transcript without
+/// loading the whole file.
+///
+/// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
+/// @param max_bytes integer Maximum number of bytes to read.
+/// @return (string?, string?) The file's head, or nil plus an error message.
+/// @example
+/// local head = maki.fs.read_head("session.jsonl", 65536)
+#[lua_fn(guard = FsRead)]
+async fn read_head(lua: Lua, path: String, max_bytes: usize) -> LuaResult<Pair<String>> {
+    let abs = make_absolute(&path)?;
+    let fs = backend(&lua);
+    Ok(pair(fs.read_head(abs, max_bytes).await))
 }
 
 /// Get metadata for the file or directory at {path}.
@@ -663,7 +702,7 @@ lua_table! {
     /// if err then return end
     /// ```
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions), DOCS [
-        read(perms), read_bytes(perms), metadata(perms), dirname, basename,
+        read(perms), read_bytes(perms), read_head(perms), metadata(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
         dir(perms), write(perms), atomic_write(perms), rm(perms), mkdir(perms),
         glob(perms), grep(perms),
@@ -696,6 +735,25 @@ mod tests {
         let read: mlua::Function = tbl.get("read").unwrap();
         let result: String = smol::block_on(read.call_async(file.to_str().unwrap())).unwrap();
         assert_eq!(result, "world");
+    }
+
+    #[test]
+    fn read_head_stops_at_the_byte_limit_without_splitting_a_character() {
+        // Two bytes per character, so a five-byte cut lands inside the third.
+        const CONTENT: &str = "αβγδ";
+        const HEAD_BYTES: usize = 5;
+
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("head.txt");
+        std::fs::write(&file, CONTENT).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let read_head: mlua::Function = tbl.get("read_head").unwrap();
+        let (head, err): Pair<String> =
+            smol::block_on(read_head.call_async((file.to_str().unwrap(), HEAD_BYTES))).unwrap();
+        assert_eq!(err, None);
+        assert_eq!(head.as_deref(), Some("αβ"));
     }
 
     #[test]

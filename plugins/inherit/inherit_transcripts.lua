@@ -14,6 +14,7 @@
 local M = {}
 
 local MAX_TEXT_BYTES = 200 * 1024
+local TITLE_CHARS = 60
 
 local function clip(text)
   if type(text) ~= "string" then
@@ -437,20 +438,16 @@ M.CONVERTERS = {
   copilot = M.copilot,
 }
 
--- Builds the record table for one transcript, so a caller that wants to write
--- its own JSONL (or a test) works from the same data as `session_jsonl`.
-function M.session_records(converted, id, cwd, model, now)
-  local messages = converted.messages or {}
-  if #messages == 0 then
-    return nil, "no messages"
-  end
+-- The name a session list shows: the transcript's own title, else the first
+-- user text, collapsed onto one line. Nil when the transcript has neither.
+function M.title(converted)
   local title = converted.title
-  if type(title) ~= "string" or title == "" then
+  if type(title) ~= "string" or title:match("^%s*$") then
     title = nil
-    for _, message in ipairs(messages) do
+    for _, message in ipairs(converted.messages or {}) do
       if message.role == "user" then
-        for _, block in ipairs(message.content) do
-          if block.type == "text" then
+        for _, block in ipairs(message.content or {}) do
+          if block.type == "text" and block.text ~= "" then
             title = block.text
             break
           end
@@ -461,7 +458,36 @@ function M.session_records(converted, id, cwd, model, now)
       end
     end
   end
-  title = (title or "Imported session"):gsub("%s+", " "):sub(1, 60)
+  if type(title) ~= "string" then
+    return nil
+  end
+  local one_line = title:gsub("%s+", " "):match("^%s*(.-)%s*$")
+  return one_line ~= "" and one_line:sub(1, TITLE_CHARS) or nil
+end
+
+-- The title an import would give a transcript, from a prefix of its text. A
+-- line-oriented source loses only the last line, which may be incomplete; a
+-- JSON source longer than the prefix does not parse and has no title.
+function M.preview_title(source, head)
+  local convert = M.CONVERTERS[source]
+  if not convert then
+    return nil
+  end
+  local ok, converted = pcall(convert, head)
+  if not ok or type(converted) ~= "table" then
+    return nil
+  end
+  return M.title(converted)
+end
+
+-- Builds the record table for one transcript, so a caller that wants to write
+-- its own JSONL (or a test) works from the same data as `session_jsonl`.
+function M.session_records(converted, id, cwd, model, now)
+  local messages = converted.messages or {}
+  if #messages == 0 then
+    return nil, "no messages"
+  end
+  local title = M.title(converted) or "Imported session"
 
   local records = {
     { t = "header", v = 2, id = id, model = model, cwd = cwd, created_at = now },

@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs::FileType;
-use std::io::{Error as IoError, ErrorKind};
+use std::io::{Error as IoError, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use maki_agent::GrepFileEntry;
@@ -23,6 +23,27 @@ impl FsBackend for RealFs {
 
     fn read_bytes(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<Vec<u8>>> {
         Box::pin(async move { smol::unblock(move || std::fs::read(&path)).await })
+    }
+
+    fn read_head(&self, path: PathBuf, max_bytes: usize) -> BoxFuture<'_, std::io::Result<String>> {
+        Box::pin(async move {
+            smol::unblock(move || {
+                let mut bytes = Vec::new();
+                std::fs::File::open(&path)?
+                    .take(max_bytes as u64)
+                    .read_to_end(&mut bytes)?;
+                // A cut may split the last character. Drop that piece rather
+                // than turning it into a replacement char; genuinely invalid
+                // bytes elsewhere are replaced, like `from_utf8_lossy`.
+                let end = match std::str::from_utf8(&bytes) {
+                    Ok(_) => bytes.len(),
+                    Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                    Err(_) => bytes.len(),
+                };
+                Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
+            })
+            .await
+        })
     }
 
     /// Follows symlinks, like `smol::fs::metadata` did. Directory fields are

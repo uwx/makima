@@ -231,4 +231,34 @@ case("split_frontmatter_without_header", function()
   eq(body, "plain text")
 end)
 
+case("preview_title_reads_the_transcript_head", function()
+  local claude = table.concat({
+    '{"type":"user","message":{"role":"user","content":"Fix the flaky session lock"},"isSidechain":false}',
+    '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"on it"}]}}',
+    -- A head cut mid-record loses only that record.
+    '{"type":"user","message":{"role":"user","content":"trunc',
+  }, "\n")
+  eq(T.preview_title("claude", claude), "Fix the flaky session lock")
+end)
+
+case("preview_title_reads_a_whole_json_transcript", function()
+  local continue_json = maki.json.encode({ title = "Wire the picker", history = {} })
+  eq(T.preview_title("continue", continue_json), "Wire the picker")
+  -- The same file cut short does not parse, so there is no title to show.
+  eq(T.preview_title("continue", continue_json:sub(1, 20)), nil)
+end)
+
+case("title_falls_back_to_the_first_user_text", function()
+  local converted = {
+    messages = {
+      { role = "assistant", content = { { type = "text", text = "not this" } } },
+      { role = "user", content = { { type = "text", text = "  hello\n\t world  " } } },
+    },
+  }
+  eq(T.title(converted), "hello world")
+  eq(T.title({ title = "own title", messages = converted.messages }), "own title")
+  eq(T.title({ title = "   ", messages = converted.messages }), "hello world")
+  eq(T.title({ messages = {} }), nil)
+end)
+
 th.report()

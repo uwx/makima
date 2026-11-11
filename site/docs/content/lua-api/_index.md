@@ -3108,6 +3108,34 @@ local encoded = maki.base64.encode(buf)
 
 ---
 
+### `maki.fs.read_head()` {#maki-fs-read_head}
+
+```lua
+maki.fs.read_head({path}, {max_bytes})
+```
+
+Read at most {max_bytes} bytes from the start of the file at {path} as a
+UTF-8 string. A character the cut splits is dropped, and invalid UTF-8
+elsewhere is replaced. Useful to preview a large log or transcript without
+loading the whole file.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
+- `{max_bytes}` (`integer`) Maximum number of bytes to read.
+
+**Returns:** (`string?`, `string?`) The file's head, or nil plus an error message.
+
+**Example:**
+
+```lua
+local head = maki.fs.read_head("session.jsonl", 65536)
+```
+
+---
+
 ### `maki.fs.metadata()` {#maki-fs-metadata}
 
 ```lua
