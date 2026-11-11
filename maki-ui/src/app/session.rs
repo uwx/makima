@@ -15,7 +15,7 @@ use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredPost, StoredSubagent};
 
 use crate::AppSession;
-use maki_providers::RequestOptions;
+use maki_providers::{Message, RequestOptions};
 
 #[cfg(test)]
 use super::PendingInput;
@@ -487,6 +487,45 @@ impl App {
         self.refresh_at_ref_labels(&draft);
         self.input_box.set_input(draft);
         self.input_box.buffer.move_to_end();
+    }
+
+    /// Takes the transcript the shared session committed, and paints it. A
+    /// window that just attached never streamed those first turns, and after a
+    /// settle the rows are the same ones the stream painted.
+    pub(crate) fn adopt_shared_history(&mut self, messages: Vec<Message>, compacted: bool) {
+        let baseline = self
+            .state
+            .context_size
+            .saturating_sub(estimate_message_tokens(self.state.session.messages()));
+        let mut snapshot = HistorySnapshot::new(messages);
+        snapshot.compacted = compacted;
+        let context_size = baseline.saturating_add(estimate_message_tokens(&snapshot.messages));
+        self.state.session_mut().adopt_history(&snapshot);
+        self.state
+            .session_mut()
+            .prune_posts(None, snapshot.messages.len());
+        self.state.context_size = context_size;
+        self.chats[0].context_size = context_size;
+
+        let (mut display, items) = history_to_display_with_lookup(
+            &snapshot.messages,
+            self.state.session.tool_outputs(),
+            &self.ui_config.tool_output_lines,
+            &posts_in(self.state.session.posts(), None),
+            &|id| {
+                self.live_chat_index.contains_key(&id) || self.historical_chat_index(id).is_some()
+            },
+        );
+        for message in &mut display {
+            if message
+                .result_agent
+                .is_some_and(|id| self.live_chat_index.contains_key(&id))
+            {
+                message.result_historical = false;
+            }
+        }
+        self.chats[0].load_messages(display);
+        self.fire_restore_items(items);
     }
 
     #[cfg(test)]

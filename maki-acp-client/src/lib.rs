@@ -65,6 +65,7 @@ const ATTACH_METHOD: &str = "maki/attach";
 const SHARE_METHOD: &str = "maki/share";
 const UNSHARE_METHOD: &str = "maki/unshare";
 const TURN_METHOD: &str = "maki/ui/turn";
+const COMMITTED_METHOD: &str = "maki/ui/committed";
 const REWIND_METHOD: &str = "maki/rewind";
 const REWOUND_METHOD: &str = "maki/ui/rewind";
 const SHORT_SESSION_CHARS: usize = 8;
@@ -103,6 +104,15 @@ pub enum Event {
     /// updates are live, and `busy` says whether a turn is already running.
     Attached {
         busy: bool,
+    },
+    /// The session finished a turn and committed its history: append these
+    /// messages, or replace the transcript when `replace` says a rewrite
+    /// happened (a rewind or a compaction).
+    Committed {
+        messages: Vec<Value>,
+        start: usize,
+        replace: bool,
+        compacted: bool,
     },
     /// The session started (true) or finished (false) a turn.
     Turn(bool),
@@ -666,6 +676,23 @@ fn error_message(error: &Value) -> String {
     }
 }
 
+fn committed_event(message: &Value) -> Option<Event> {
+    let params = message.get("params")?;
+    let messages = params.get("messages")?.as_array()?.clone();
+    Some(Event::Committed {
+        messages,
+        start: params.get("start").and_then(Value::as_u64).unwrap_or(0) as usize,
+        replace: params
+            .get("replace")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        compacted: params
+            .get("compacted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
 fn read_line(stream: &mut TcpStream) -> Result<String, String> {
     let mut line = Vec::new();
     let mut byte = [0_u8; 1];
@@ -984,6 +1011,11 @@ impl Client {
                     let _ = self.emit(Event::Turn(running));
                 }
             }
+            COMMITTED_METHOD => {
+                if let Some(event) = committed_event(message) {
+                    let _ = self.emit(event);
+                }
+            }
             _ => {}
         }
     }
@@ -1178,6 +1210,35 @@ old
             ),
         )];
         assert_eq!(diff_text(&content), None);
+    }
+
+    #[test]
+    fn committed_notifications_carry_messages_and_shape() {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": super::COMMITTED_METHOD,
+            "params": {
+                "messages": [{ "role": "user" }],
+                "start": 3,
+                "replace": true,
+                "compacted": false,
+            },
+        });
+        match super::committed_event(&message) {
+            Some(super::Event::Committed {
+                messages,
+                start,
+                replace,
+                compacted,
+            }) => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(start, 3);
+                assert!(replace);
+                assert!(!compacted);
+            }
+            _ => panic!("no committed event"),
+        }
+        assert!(super::committed_event(&serde_json::json!({ "params": {} })).is_none());
     }
 
     const HOST: &str = "buildbox";

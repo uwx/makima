@@ -583,6 +583,9 @@ impl SessionPanel {
                 Ok(turns) => self.open_rewind_picker(turns),
                 Err(error) => self.notice(format!("Rewind unavailable: {error}")),
             },
+            // The panel draws the transcript as it streams; the committed
+            // copy is for a client that runs its own agent, like the TUI.
+            Event::Committed { .. } => {}
             Event::Rewound => {
                 self.views.clear();
                 self.pending = None;

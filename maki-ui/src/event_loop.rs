@@ -73,9 +73,23 @@ use maki_storage::StorageError;
 use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::session_lock::{self, ClaimedSessionLock};
-use maki_storage::sessions::{SESSIONS_DIR, SessionError, normalize_title};
+use maki_storage::sessions::{HistorySnapshot, SESSIONS_DIR, SessionError, normalize_title};
 use serde_json::json;
 use tracing::{info, warn};
+
+/// Appends what a session announced, skipping the part this window already
+/// has: an announcement can overlap its copy when the window attached between
+/// the commit and the announcement. False when the announcement starts past
+/// the copy, which means a notification was lost.
+fn extend_committed(known: &mut Vec<Message>, messages: &[Message], start: usize) -> bool {
+    if start > known.len() {
+        return false;
+    }
+    if start + messages.len() > known.len() {
+        known.extend_from_slice(&messages[known.len() - start..]);
+    }
+    true
+}
 
 fn claim_lock(dir: &Path, id: &MakiId) -> Result<ClaimedSessionLock> {
     session_lock::claim(dir, id)?.ok_or_else(|| eyre!(session_lock::OPEN_ELSEWHERE_MSG))
@@ -773,6 +787,17 @@ struct SessionRuntime {
     lock_lost: bool,
     restore_pending: bool,
     pending_approval: Option<PendingPlanApproval>,
+    /// The history the shared session committed, waiting for the actor to be
+    /// idle enough to take it.
+    pending_adoption: Option<AdoptedHistory>,
+}
+
+/// A copy of the history the session this window follows committed. It is
+/// applied whole, because the local actor may have missed an announcement
+/// while it was busy running the turn that produced it.
+struct AdoptedHistory {
+    messages: Vec<Message>,
+    compacted: bool,
 }
 
 /// Where a session goes once the model it needs is prepared.
@@ -900,6 +925,7 @@ impl PreparedSessionRuntime {
             lock_lost: false,
             restore_pending: resumed,
             pending_approval: None,
+            pending_adoption: None,
         })
     }
 
@@ -975,6 +1001,7 @@ impl PreparedSessionRuntime {
             lock_lost: false,
             restore_pending: resumed,
             pending_approval: None,
+            pending_adoption: None,
         })
     }
 }
@@ -1571,6 +1598,8 @@ enum SessionOpKind {
     HistoryRewound {
         change: Arc<Mutex<Option<HistoryChange>>>,
     },
+    /// The shared session committed history; this window's copy follows it.
+    HistoryAdopted { adopted: AdoptedHistory },
     /// `/yolo`, `/fast`, `/workflow`: apply the toggle the coordinator took.
     OptionToggled {
         id: &'static str,
@@ -2696,6 +2725,19 @@ impl<'t> EventLoop<'t> {
     }
 
     fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
+        // A shared session told this window what it committed: the transcript
+        // the local actor, the window's own copy, has to match. The rows are
+        // the same ones the stream painted, and the ones an attach missed.
+        if let AgentEvent::HistoryCommitted {
+            messages,
+            start,
+            replace,
+            compacted,
+        } = &envelope.event
+        {
+            self.adopt_history(idx, Arc::clone(messages), *start, *replace, *compacted);
+            return;
+        }
         let rt = &mut self.sessions[idx];
         rt.app.adopt_actor_presentation(&envelope);
         if let AgentEvent::Post(post) = envelope.event {
@@ -2735,6 +2777,7 @@ impl<'t> EventLoop<'t> {
         if self.sessions[idx].app.take_pending_bell() {
             ring_bell();
         }
+        self.flush_adoption(idx);
     }
 
     fn drain_channels(&mut self) -> Result<Dirty> {
@@ -2750,6 +2793,13 @@ impl<'t> EventLoop<'t> {
             }
         }
 
+        // A commit that arrived while the actor was busy waited for a turn to
+        // end; this is the frame that notices it is idle now.
+        for idx in 0..self.sessions.len() {
+            if self.sessions[idx].pending_adoption.is_some() {
+                self.flush_adoption(idx);
+            }
+        }
         // These two only fire Lua autocmds. Anything a handler does comes back
         // as a `UiAction` on the next wake, which repaints then.
         self.emit_focus_change();
@@ -4009,6 +4059,12 @@ impl<'t> EventLoop<'t> {
                     self.sessions[idx].app.flash(error);
                 }
             }
+            SessionOpKind::HistoryAdopted { adopted } => match result {
+                Ok(()) => self.sessions[idx]
+                    .app
+                    .adopt_shared_history(adopted.messages, adopted.compacted),
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
             SessionOpKind::HistoryRewound { change } => match result {
                 Ok(()) => {
                     if let Some(change) = change
@@ -4114,6 +4170,120 @@ impl<'t> EventLoop<'t> {
 
     fn selected_target(&self, idx: usize) -> Option<AgentRef> {
         selected_agent(&self.sessions[idx])
+    }
+
+    /// Keeps a copy of what the shared session committed, and hands it to the
+    /// local actor once the actor is idle.
+    fn adopt_history(
+        &mut self,
+        idx: usize,
+        messages: Arc<Vec<Message>>,
+        start: usize,
+        replace: bool,
+        compacted: bool,
+    ) {
+        if !replace && self.sessions[idx].pending_adoption.is_none() {
+            // The session always announces a full snapshot before appending;
+            // seeding from the actor keeps the copy whole if one is missed.
+            let seed = self
+                .root_actor(idx)
+                .map(|actor| Arc::unwrap_or_clone(actor.committed_snapshot().messages))
+                .unwrap_or_default();
+            self.sessions[idx].pending_adoption = Some(AdoptedHistory {
+                messages: seed,
+                compacted: false,
+            });
+        }
+        let adopted = self.sessions[idx]
+            .pending_adoption
+            .get_or_insert_with(|| AdoptedHistory {
+                messages: Vec::new(),
+                compacted: false,
+            });
+        if replace {
+            adopted.messages = messages.as_ref().clone();
+            adopted.compacted = compacted;
+        } else if !extend_committed(&mut adopted.messages, &messages, start) {
+            warn!(start, "committed history skipped messages");
+        }
+        self.flush_adoption(idx);
+    }
+
+    fn root_actor(&self, idx: usize) -> Option<maki_agent::AgentActorHandle> {
+        let (manager, root) = self.sessions[idx].handles.manager_and_root();
+        manager.actor(root).ok()
+    }
+
+    /// Commits the waiting copy through the actor, so its mirror, checkpoint
+    /// and context counts all see the shared transcript. A busy actor (this
+    /// window's own turn, whose commit arrives before its outcome) keeps the
+    /// copy waiting for the next event or frame.
+    fn flush_adoption(&mut self, idx: usize) {
+        let Some(adopted) = self.sessions[idx].pending_adoption.take() else {
+            return;
+        };
+        let Some(target) = self.sessions[idx].app.root_agent.clone() else {
+            self.sessions[idx].pending_adoption = Some(adopted);
+            return;
+        };
+        let actor = match self.target_actor(idx, &target) {
+            Ok(actor) => actor,
+            Err(error) => {
+                self.sessions[idx].app.flash(error);
+                return;
+            }
+        };
+        let Ok(guard) = actor.prepare_idle() else {
+            self.sessions[idx].pending_adoption = Some(adopted);
+            return;
+        };
+        let mut replacement = HistorySnapshot::new(adopted.messages.clone());
+        replacement.compacted = adopted.compacted;
+        let prepared = (|| {
+            let operation = guard
+                .reserve_prepared_operation(None)
+                .map_err(|error| error.to_string())?;
+            let publication = CheckpointPublication::default();
+            operation
+                .register_publication(&publication)
+                .map_err(|error| error.to_string())?;
+            let transaction = self.reserve_history_transaction(idx, &target, publication)?;
+            Ok::<_, String>((operation, transaction))
+        })();
+        let (operation, transaction) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.sessions[idx].app.flash(error);
+                return;
+            }
+        };
+        let session = self.sessions[idx].id();
+        let runtime = self.sessions[idx].handles.identity();
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let result = async {
+                operation.resolve(None)?;
+                operation.wait_ready().await?;
+                operation.ready_config()
+            }
+            .await
+            .map_err(|error: maki_agent::ActorError| error.to_string());
+            let result = match result.and_then(|config| transaction(config, true)) {
+                Ok(transaction) => guard
+                    .commit_prepared_transaction_held(operation, Some(replacement), transaction)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error),
+            };
+            let _ = internal_tx.send(InternalEvent::SessionOp {
+                session,
+                runtime,
+                kind: SessionOpKind::HistoryAdopted { adopted },
+                result,
+            });
+        })
+        .detach();
     }
 
     fn dispatch_rewind(
@@ -5061,6 +5231,41 @@ mod tests {
     use maki_providers::{Invocation, RequestDelivery};
     use maki_storage::checkpoint::ClaimingWriter;
 
+    #[test_case(0, 0, 2, 2 ; "an empty copy takes the whole announcement")]
+    #[test_case(0, 1, 2, 1 ; "the part the copy already has is skipped")]
+    #[test_case(2, 3, 2, 1 ; "an overlapping announcement only adds its tail")]
+    #[test_case(0, 3, 2, 0 ; "an announcement already held adds nothing")]
+    fn extend_committed_skips_what_the_copy_has(
+        start: usize,
+        known: usize,
+        incoming: usize,
+        added: usize,
+    ) {
+        let mut known_messages = (0..known)
+            .map(|index| Message::user(format!("known {index}")))
+            .collect::<Vec<_>>();
+        let messages = (0..incoming)
+            .map(|index| Message::user(format!("new {index}")))
+            .collect::<Vec<_>>();
+
+        assert!(extend_committed(&mut known_messages, &messages, start));
+
+        let appended = known_messages.len() - known;
+        assert_eq!(appended, added);
+        assert_eq!(&known_messages[known..], &messages[incoming - added..]);
+    }
+
+    #[test]
+    fn an_announcement_past_the_copy_is_a_lost_notification() {
+        let mut known = vec![Message::user("one".into())];
+        assert!(!extend_committed(
+            &mut known,
+            &[Message::user("two".into())],
+            2
+        ));
+        assert_eq!(known.len(), 1);
+    }
+
     /// A preparer for tests, from a blocking one over the resolved model,
     /// run off the executor as a real prepare may block.
     pub(super) fn sync_preparer(
@@ -5242,6 +5447,44 @@ mod tests {
                 }
             }
             assert!(actor.effective_config().unwrap().workflow);
+        });
+    }
+
+    #[test]
+    fn a_committed_history_lands_in_the_local_actor() {
+        with_event_loop(|event_loop| {
+            let messages = vec![
+                Message::user("shared one".into()),
+                Message::user("shared two".into()),
+            ];
+            event_loop.adopt_history(0, Arc::new(messages), 0, true, false);
+
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            loop {
+                let event = event_loop
+                    .internal_rx
+                    .recv_timeout(SESSION_OP_TIMEOUT)
+                    .unwrap();
+                let adopted = matches!(
+                    &event,
+                    InternalEvent::SessionOp {
+                        kind: SessionOpKind::HistoryAdopted { .. },
+                        result: Ok(()),
+                        ..
+                    }
+                );
+                event_loop.handle_internal(event);
+                if adopted {
+                    break;
+                }
+            }
+
+            assert_eq!(actor.committed_message_count(), 2);
+            assert_eq!(
+                event_loop.sessions[0].app.state.session.messages()[1].user_text(),
+                Some("shared two")
+            );
         });
     }
 
@@ -6009,6 +6252,7 @@ mod tests {
             lock_lost: false,
             restore_pending: false,
             pending_approval: None,
+            pending_adoption: None,
         }
     }
 

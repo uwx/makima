@@ -862,6 +862,16 @@ pub enum AgentEvent {
     MirroredPrompt {
         text: String,
     },
+    /// The session committed this much history. A window keeping its own copy
+    /// appends these messages, or starts the transcript over when `replace`
+    /// says a rewind or a compaction rewrote it.
+    HistoryCommitted {
+        messages: Arc<Vec<Message>>,
+        /// Where `messages` starts in the session's transcript.
+        start: usize,
+        replace: bool,
+        compacted: bool,
+    },
     ThinkingDelta {
         text: String,
     },

@@ -10,12 +10,12 @@ use std::time::Duration;
 
 use agent_client_protocol_schema::{
     AgentNotification, AgentRequest, AgentResponse, AvailableCommand, AvailableCommandInput,
-    AvailableCommandsUpdate, ConfigOptionUpdate, ContentBlock, CreateElicitationResponse,
-    ContentChunk, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
-    InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer, NewSessionRequest,
-    Notification, PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
-    RequestPermissionResponse, Response, SessionConfigOptionValue, SessionId, SessionModeId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    AvailableCommandsUpdate, ConfigOptionUpdate, ContentBlock, ContentChunk,
+    CreateElicitationResponse, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError,
+    ImageContent, InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer,
+    NewSessionRequest, Notification, PromptRequest, PromptResponse, Request, RequestId,
+    RequestPermissionRequest, RequestPermissionResponse, Response, SessionConfigOptionValue,
+    SessionId, SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, ToolCallStatus, UnstructuredCommandInput,
 };
@@ -387,7 +387,6 @@ impl Server {
         let id = self.session.as_ref()?.handle.session_id.to_string();
         self.taps.get(&id)
     }
-
 }
 
 /// The first line of a TCP connection: `{"maki":"lan","version":1,"token":"..."}`.
@@ -921,6 +920,7 @@ fn attach_session(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
         previous.detach(&srv.wire);
     }
     let (replayed, truncated) = tap.subscribe(srv.wire.clone());
+    tap.send_history(&srv.wire);
     let busy = tap.busy();
     srv.attached = Some(tap);
     Ok(json!({
@@ -1760,6 +1760,17 @@ async fn install_session_with_lock(
         tap.watch_busy(Arc::new(move || {
             let pending = pending.lock().unwrap();
             pending.operation.is_some() || !pending.queued.is_empty()
+        }));
+    }
+    if let Some(tap) = srv.session_tap()
+        && let Some(manager) = srv
+            .session
+            .as_ref()
+            .map(|session| session.handle.manager.clone())
+    {
+        tap.watch_history(Arc::new(move || {
+            let root = manager.root().ok()?;
+            root.actor().ok().map(|actor| actor.committed_snapshot())
         }));
     }
     Ok(option_snapshot)

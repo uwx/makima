@@ -1,7 +1,7 @@
 //! Watching a live session from another connection. Each session records what
 //! it emitted, so an attach can replay that first and then follow along live.
-//! Watchers never write: the connection that owns the session stays the only
-//! one that can prompt, change options or rewind.
+//! The connection that owns the session keeps serializing its work; any
+//! watcher may ask for a turn, and the answers go back to the one that asked.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
@@ -10,6 +10,8 @@ use std::sync::{
 };
 
 use flume::Sender;
+use maki_providers::Message;
+use maki_storage::sessions::HistorySnapshot;
 use serde_json::{Value, json};
 
 use crate::ui::REWOUND_METHOD;
@@ -25,6 +27,9 @@ pub const TAKE_CONTROL_METHOD: &str = "maki/take_control";
 /// Server to client: the session started or finished a turn, so a window knows
 /// whether its Stop button would do anything.
 pub const TURN_METHOD: &str = "maki/ui/turn";
+/// What the session added to its history, or the whole of it after a rewrite,
+/// so every window keeps the same transcript to resume, rewind or compact.
+pub const COMMITTED_METHOD: &str = "maki/ui/committed";
 
 /// Answers `session/new` or `session/load` while another connection already
 /// owns the process's session.
@@ -74,6 +79,7 @@ impl Taps {
     /// Starts recording the session {id}, replacing any earlier recording of
     /// the same id.
     pub fn register(&self, id: &str, tap: Arc<SessionTap>) {
+        tap.identify(id);
         self.sessions.lock().unwrap().insert(id.to_owned(), tap);
     }
 
@@ -130,15 +136,30 @@ impl Taps {
             // A rewind replaced the transcript: watchers clear what they show,
             // and the updates that follow rebuild it.
             Some(REWOUND_METHOD) => {
-                for tap in self.sessions.lock().unwrap().values() {
+                let taps = self
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for tap in taps {
                     tap.reset(message);
+                    tap.announce_committed();
                 }
             }
             _ => {}
         }
         // A turn can end in a task of its own, whose last message is this one,
         // so every message is a chance for the flag to have moved.
-        for tap in self.sessions.lock().unwrap().values() {
+        let taps = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for tap in taps {
             tap.refresh_busy();
         }
     }
@@ -146,6 +167,9 @@ impl Taps {
 
 /// Whether the session is in a turn, as its own bookkeeping sees it.
 pub type BusyProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The session's committed history, read when a turn settles.
+pub type HistoryProbe = Arc<dyn Fn() -> Option<HistorySnapshot<Message>> + Send + Sync>;
 
 /// A request from a watching connection that holds control, on its way to the
 /// loop that owns the session.
@@ -164,6 +188,14 @@ pub struct SessionTap {
     /// Reads the session's own idea of that, so a turn that ends inside another
     /// task still moves the flag.
     busy_probe: Mutex<Option<BusyProbe>>,
+    /// Reads the history a settled turn left behind, so the windows can copy it.
+    history: Mutex<Option<HistoryProbe>>,
+    /// Where the last committed announcement left off: the history's epoch and
+    /// length. A new epoch means messages changed in place, so the copy has to
+    /// start over.
+    announced: Mutex<Option<(u64, usize)>>,
+    /// The id this tap was registered under, named in its announcements.
+    session_id: Mutex<Option<String>>,
     /// The connection the session belongs to. It shows the session whether or
     /// not it is the one acting, so it hears about turns and resets.
     owner: Mutex<Option<Sender<Value>>>,
@@ -182,6 +214,9 @@ impl Default for SessionTap {
             state: Mutex::default(),
             busy: AtomicBool::new(false),
             busy_probe: Mutex::default(),
+            history: Mutex::default(),
+            announced: Mutex::default(),
+            session_id: Mutex::default(),
             owner: Mutex::default(),
             asker: Mutex::default(),
             info: Mutex::default(),
@@ -222,6 +257,15 @@ impl SessionTap {
         *self.busy_probe.lock().unwrap() = Some(probe);
     }
 
+    /// Reads the session's committed history when a turn ends.
+    pub fn watch_history(&self, probe: HistoryProbe) {
+        *self.history.lock().unwrap() = Some(probe);
+    }
+
+    pub fn identify(&self, id: &str) {
+        *self.session_id.lock().unwrap() = Some(id.to_owned());
+    }
+
     /// Asks the session whether a turn is running, announcing any change.
     pub fn refresh_busy(&self) {
         let probe = self.busy_probe.lock().unwrap().clone();
@@ -231,7 +275,8 @@ impl SessionTap {
     }
 
     /// Records whether a turn is running, and tells the watchers when that
-    /// changed.
+    /// changed. A turn that ends is also when the history grew, so the windows
+    /// hear what was committed.
     pub fn set_busy(&self, busy: bool) {
         if self.busy.swap(busy, Ordering::Relaxed) == busy {
             return;
@@ -241,6 +286,69 @@ impl SessionTap {
             "method": TURN_METHOD,
             "params": { "running": busy },
         }));
+        if !busy {
+            self.announce_committed();
+        }
+    }
+
+    /// Sends the whole committed history to a window that just attached.
+    pub fn send_history(&self, out: &Sender<Value>) {
+        let Some(history) = self.snapshot() else {
+            return;
+        };
+        let _ = out.send(self.committed_message(&history.messages, 0, &history, true));
+    }
+
+    /// Announces whatever the history gained since the last announcement, or
+    /// all of it when a rewrite moved the epoch.
+    fn announce_committed(&self) {
+        let Some(history) = self.snapshot() else {
+            return;
+        };
+        let len = history.messages.len();
+        let message = {
+            let mut announced = self.announced.lock().unwrap();
+            let message = match *announced {
+                Some((epoch, start)) if epoch == history.epoch && start <= len => {
+                    if start == len {
+                        return;
+                    }
+                    self.committed_message(&history.messages[start..], start, &history, false)
+                }
+                _ => self.committed_message(&history.messages, 0, &history, true),
+            };
+            *announced = Some((history.epoch, len));
+            message
+        };
+        self.announce(message);
+    }
+
+    fn snapshot(&self) -> Option<HistorySnapshot<Message>> {
+        let probe = self.history.lock().unwrap().clone()?;
+        probe()
+    }
+
+    fn committed_message(
+        &self,
+        messages: &[Message],
+        start: usize,
+        history: &HistorySnapshot<Message>,
+        replace: bool,
+    ) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": COMMITTED_METHOD,
+            "params": {
+                "sessionId": self.session_id.lock().unwrap().clone(),
+                "messages": messages,
+                // Where these start in the transcript, so a window that
+                // attached in the middle of the announcement can tell what it
+                // already has.
+                "start": start,
+                "replace": replace,
+                "compacted": history.compacted,
+            },
+        })
     }
 
     pub fn watchers(&self) -> usize {
@@ -292,9 +400,7 @@ impl SessionTap {
     pub fn announce(&self, message: Value) {
         let mut targets: Vec<Sender<Value>> = self.state.lock().unwrap().subscribers.to_vec();
         if let Some(owner) = self.owner.lock().unwrap().clone()
-            && !targets
-                .iter()
-                .any(|target| target.same_channel(&owner))
+            && !targets.iter().any(|target| target.same_channel(&owner))
         {
             targets.push(owner);
         }
@@ -368,6 +474,138 @@ mod tests {
             "method": SESSION_UPDATE,
             "params": { "sessionId": session, "update": { "sessionUpdate": "agentMessageChunk", "content": { "type": "text", "text": text } } },
         })
+    }
+
+    fn committed(rx: &flume::Receiver<Value>) -> Value {
+        loop {
+            let message = rx.recv().unwrap();
+            if message["method"] == COMMITTED_METHOD {
+                return message;
+            }
+        }
+    }
+
+    fn tap_reading(
+        history: &Arc<Mutex<HistorySnapshot<Message>>>,
+    ) -> (Arc<SessionTap>, flume::Receiver<Value>) {
+        let tap = Arc::new(SessionTap::default());
+        let read = Arc::clone(history);
+        tap.watch_history(Arc::new(move || Some(read.lock().unwrap().clone())));
+        let (tx, rx) = flume::unbounded();
+        tap.subscribe(tx);
+        (tap, rx)
+    }
+
+    #[test]
+    fn a_settled_turn_announces_only_what_it_committed() {
+        let history = Arc::new(Mutex::new(HistorySnapshot::new(vec![Message::user(
+            "one".into(),
+        )])));
+        let (tap, rx) = tap_reading(&history);
+
+        tap.set_busy(true);
+        tap.set_busy(false);
+
+        let message = committed(&rx);
+        assert_eq!(message["params"]["replace"], json!(true));
+        assert_eq!(message["params"]["start"], json!(0));
+        assert_eq!(message["params"]["messages"].as_array().unwrap().len(), 1);
+
+        history.lock().unwrap().messages = Arc::new(vec![
+            Message::user("one".into()),
+            Message::user("two".into()),
+        ]);
+        tap.set_busy(true);
+        tap.set_busy(false);
+
+        let message = committed(&rx);
+        assert_eq!(message["params"]["replace"], json!(false));
+        assert_eq!(message["params"]["start"], json!(1));
+        let messages = message["params"]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0], json!(Message::user("two".into())));
+    }
+
+    #[test]
+    fn a_rewritten_history_is_announced_whole() {
+        let history = Arc::new(Mutex::new(HistorySnapshot::new(vec![Message::user(
+            "one".into(),
+        )])));
+        let (tap, rx) = tap_reading(&history);
+        tap.set_busy(true);
+        tap.set_busy(false);
+        let _ = committed(&rx);
+
+        *history.lock().unwrap() = HistorySnapshot::new(vec![Message::user("summary".into())]);
+        tap.set_busy(true);
+        tap.set_busy(false);
+
+        let message = committed(&rx);
+        assert_eq!(message["params"]["replace"], json!(true));
+        assert_eq!(
+            message["params"]["messages"],
+            json!([Message::user("summary".into())])
+        );
+    }
+
+    #[test]
+    fn a_quiet_turn_announces_no_history() {
+        let history = Arc::new(Mutex::new(HistorySnapshot::new(vec![Message::user(
+            "one".into(),
+        )])));
+        let (tap, rx) = tap_reading(&history);
+
+        tap.set_busy(true);
+        tap.set_busy(false);
+        let first = rx.drain().collect::<Vec<Value>>();
+        assert_eq!(
+            first
+                .iter()
+                .filter(|message| message["method"] == COMMITTED_METHOD)
+                .count(),
+            1
+        );
+
+        tap.set_busy(true);
+        tap.set_busy(false);
+        let second = rx.drain().collect::<Vec<Value>>();
+        assert_eq!(
+            second
+                .iter()
+                .filter(|message| message["method"] == COMMITTED_METHOD)
+                .count(),
+            0
+        );
+        assert_eq!(
+            second
+                .iter()
+                .filter(|message| message["method"] == TURN_METHOD)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_attach_is_sent_the_whole_history() {
+        let tap = Arc::new(SessionTap::default());
+        let history: Arc<Mutex<HistorySnapshot<Message>>> = Arc::new(Mutex::new(
+            HistorySnapshot::new(vec![Message::user("one".into())]),
+        ));
+        let read = Arc::clone(&history);
+        tap.watch_history(Arc::new(move || Some(read.lock().unwrap().clone())));
+        let (out, rx) = flume::unbounded();
+
+        tap.send_history(&out);
+
+        let message = rx.recv().unwrap();
+        assert_eq!(message["method"], COMMITTED_METHOD);
+        assert_eq!(message["params"]["replace"], json!(true));
+        assert_eq!(message["params"]["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            tap.announced.lock().unwrap().clone(),
+            None,
+            "sending a snapshot does not move the announcement cursor"
+        );
     }
 
     #[test]

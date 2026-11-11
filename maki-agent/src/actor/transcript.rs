@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use maki_providers::{ContentBlock, Message};
+use maki_storage::sessions::HistorySnapshot;
 
 use super::{ActorError, AgentActorHandle};
 use crate::TurnId;
@@ -40,6 +41,10 @@ impl AgentActorHandle {
     #[cfg(any(test, feature = "test-util"))]
     pub fn committed_history(&self) -> std::sync::Arc<Vec<Message>> {
         std::sync::Arc::clone(&self.inner.history.load().messages)
+    }
+
+    pub fn committed_snapshot(&self) -> HistorySnapshot<Message> {
+        self.inner.history.load_full().as_ref().clone()
     }
 
     pub fn transcript(&self, request: TranscriptRequest) -> Result<TranscriptSnapshot, ActorError> {

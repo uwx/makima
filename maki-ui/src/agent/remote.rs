@@ -27,6 +27,7 @@ use maki_agent::{
 use maki_config::ToolKey;
 use maki_domain::{Post, PostLevel};
 use maki_providers::{Message, TokenUsage};
+use serde_json::Value;
 use tracing::warn;
 
 use crate::app::MIRROR_PRESENTATION;
@@ -83,7 +84,6 @@ impl AcpBackend {
             model: connection.model.clone(),
         }
     }
-
 }
 
 impl ActorBackend for AcpBackend {
@@ -283,6 +283,15 @@ impl Reader {
             }
             // A watcher attaching mid-turn follows the turn already running.
             maki_acp_client::Event::Attached { busy: true } => self.mirror.start(),
+            // The session committed history. The rows are already on screen;
+            // this is what gives the local actor the same transcript to
+            // resume, rewind or compact from.
+            maki_acp_client::Event::Committed {
+                messages,
+                start,
+                replace,
+                compacted,
+            } => self.mirror.committed(messages, start, replace, compacted),
             _ => {}
         }
     }
@@ -400,6 +409,21 @@ impl Mirror {
         if self.running {
             self.translator.update(update);
         }
+    }
+
+    fn committed(&self, messages: Vec<Value>, start: usize, replace: bool, compacted: bool) {
+        let Ok(messages) = serde_json::from_value::<Vec<Message>>(Value::Array(messages)) else {
+            warn!("the session announced a history this window could not read");
+            return;
+        };
+        self.translator
+            .sender
+            .try_send(AgentEvent::HistoryCommitted {
+                messages: Arc::new(messages),
+                start,
+                replace,
+                compacted,
+            });
     }
 }
 
@@ -704,7 +728,11 @@ mod tests {
             .collect::<Vec<_>>()
             .as_slice()
         {
-            [AgentEvent::Post(label), AgentEvent::TextDelta { text }, AgentEvent::TurnOutcome(_)] => {
+            [
+                AgentEvent::Post(label),
+                AgentEvent::TextDelta { text },
+                AgentEvent::TurnOutcome(_),
+            ] => {
                 assert_eq!(label.text, MIRROR_LABEL);
                 assert_eq!(text, "hello");
             }
@@ -716,6 +744,36 @@ mod tests {
         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
             text,
         ))))
+    }
+
+    #[test]
+    fn a_committed_history_reaches_the_local_actor() {
+        let (tx, rx) = flume::unbounded();
+        let mirror = Mirror::new(tx, MODEL.to_owned());
+
+        mirror.committed(
+            vec![serde_json::to_value(Message::user("one".into())).unwrap()],
+            0,
+            true,
+            false,
+        );
+
+        match drain(&rx).as_slice() {
+            [
+                AgentEvent::HistoryCommitted {
+                    messages,
+                    start,
+                    replace,
+                    compacted,
+                },
+            ] => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(*start, 0);
+                assert!(replace);
+                assert!(!compacted);
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
     }
 
     #[test]

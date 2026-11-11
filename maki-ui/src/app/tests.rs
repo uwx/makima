@@ -883,7 +883,10 @@ fn rows_another_window_streamed_are_painted_and_never_recorded() {
     app.update(agent_msg_with_run_id(done(), MIRROR_PRESENTATION));
 
     let screen = rendered(&mut app);
-    assert!(screen.contains(MIRROR_PROMPT), "the question shows: {screen}");
+    assert!(
+        screen.contains(MIRROR_PROMPT),
+        "the question shows: {screen}"
+    );
     assert!(screen.contains(MIRROR_TEXT), "the answer shows: {screen}");
     assert_eq!(app.status, Status::Idle);
     assert!(app.state.session.messages().is_empty());
@@ -7356,6 +7359,28 @@ fn apply_rewind_action(app: &mut App, actions: Vec<Action>) {
     let change = change.unwrap();
     assert_eq!(change.agent_id, target.id());
     app.apply_history_change(maki_agent::HistoryChange { draft, ..change });
+}
+
+#[test]
+fn an_adopted_history_replaces_the_window_copy() {
+    let mut app = test_app();
+    app.state
+        .session_mut()
+        .replace_messages(vec![Message::user("stale".into())]);
+    let stale_tokens = estimate_message_tokens(app.state.session.messages());
+    app.state.context_size = 10_000;
+
+    let adopted = vec![Message::user("one".into()), Message::user("two".into())];
+    app.adopt_shared_history(adopted.clone(), false);
+
+    assert_eq!(app.state.session.messages().len(), 2);
+    assert_eq!(app.state.session.messages()[0].user_text(), Some("one"));
+    assert_eq!(
+        app.state.context_size,
+        10_000 - stale_tokens + estimate_message_tokens(&adopted)
+    );
+    assert_eq!(app.chats[0].message_at(0).unwrap().text, "one");
+    assert_eq!(app.chats[0].message_at(1).unwrap().text, "two");
 }
 
 fn build_rewind_app() -> App {

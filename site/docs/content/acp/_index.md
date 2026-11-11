@@ -114,7 +114,7 @@ Then send `maki/attach` with the session id:
 {"jsonrpc":"2.0","id":3,"method":"maki/attach","params":{"sessionId":"..."}}
 ```
 
-Makima first replays what the session already emitted, as the same `session/update` notifications a client already renders, then streams new ones. The reply follows the replay:
+Makima first replays what the session already emitted, as the same `session/update` notifications a client already renders, then sends the history the session has committed (see [`maki/ui/committed`](#history)), then streams new updates live. The reply follows the replay:
 
 ```json
 {"sessionId":"...","readOnly":false,"replayed":12,"truncated":false,"configOptions":[...]}
@@ -135,7 +135,7 @@ makima attach lan://192.168.2.4:60667 --token my-token
 makima attach 192.168.2.4:60667 --plain # line rendering instead
 ```
 
-With no link it waits a few seconds and lists the announced sessions to choose from. The chat then shows the turn you start: streamed text, thinking, tool calls, and the usual permission prompt. Each turn is a `session/prompt` sent to the machine that runs the agent, so the model, the tools and the files all stay there, and typing is all it takes to act on a session another window is showing. A turn another window starts while you watch streams into the same transcript, under a line saying it runs in another window. Those rows are a view: they belong to the session on the machine that ran the turn, not to this window's own history, so a restart does not replay them. Messages from before you attached stay on that machine; `--plain` prints them in line mode.
+With no link it waits a few seconds and lists the announced sessions to choose from. The chat then shows the turn you start: streamed text, thinking, tool calls, and the usual permission prompt. Each turn is a `session/prompt` sent to the machine that runs the agent, so the model, the tools and the files all stay there, and typing is all it takes to act on a session another window is showing. A turn another window starts while you watch streams into the same transcript, under a line saying it runs in another window. Those rows are a view: they belong to the session on the machine that ran the turn. That machine also says what each turn committed, so a window that attaches later starts with the transcript it missed, and every window keeps the same history to resume, rewind and compact from. `--plain` prints the replay in line mode.
 
 `--plain` keeps the line renderer for a terminal that cannot take the full screen, which is also what a pipe gets. There `/cancel` stops a turn, `/quit` leaves, tool calls print as `→ title` and `✓ title`, and permissions and pickers take a number.
 
@@ -152,6 +152,18 @@ Every connection that shows the session, the owner's included, hears when a turn
 ```
 
 A prompt another window sends arrives as a `user_message_chunk` update, so every window shows the question and not just the answer.
+
+### History
+
+When a turn settles, the session tells every window what it committed:
+
+```json
+{"method":"maki/ui/committed","params":{"sessionId":"...","messages":[...],"replace":false,"compacted":false}}
+```
+
+Append `messages` to the transcript you keep, or replace it whole when `replace` is true: the session rewound or compacted, and the list is now the complete history. `compacted` says a compaction summary is part of it. A client that just attached receives the whole history the same way, with `replace: true`, so its own copy starts where the session is instead of at the first turn it watches.
+
+The messages are the stored form of Makima's messages, the same shape `session/load` writes. Tool results are included, so a window can draw the whole turn and not only its text. A window that watched the turn already drew it from the updates; this list is what keeps its history, and its resume, rewind and token count, identical to every other window's.
 
 The recording follows the session, not the connection: when any window rewinds, the others receive `maki/ui/rewind` and the recording starts over from the rewound transcript. The session lives as long as the process that runs it; when the connection that owns it ends, the session ends and the others lose it.
 
