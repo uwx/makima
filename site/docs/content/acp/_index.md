@@ -173,6 +173,12 @@ The messages are the stored form of Makima's messages, the same shape `session/l
 
 The recording follows the session, not the connection: when any window rewinds, the others receive `maki/ui/rewind` and the recording starts over from the rewound transcript. The session lives as long as the process that runs it; when the connection that owns it ends, the session ends and the others lose it.
 
+### When the link drops
+
+A client attached over TCP reconnects on its own. It retries with backoff (from 250 ms, capped at 5 s), runs `initialize` again, asks `maki/live` for the sessions the agent serves, and attaches the one it was watching. The reattach replays the session's updates and its committed history, so the transcript the client missed comes back in order, and a turn that ran while it was away shows up too.
+
+The client clears what it draws before the replay, so the transcript is the session as it is now rather than a mix. If `maki/live` no longer lists the session, the window is told the shared session ended while it was disconnected and stops retrying. An agent started by the client itself (stdio or SSH) is not reconnected: that process is the session.
+
 ## What works
 
 - Sessions persist. Loading a session replays the full conversation in the editor. A session that is open in another terminal cannot be loaded.

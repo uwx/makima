@@ -621,6 +621,8 @@ impl SessionPanel {
             }
             Event::Attached { busy } => self.busy = busy,
             Event::Turn(running) => self.busy = running,
+            Event::Reconnecting => self.notice("Connection lost; reconnecting...".to_owned()),
+            Event::Reconnected => self.notice("Reconnected".to_owned()),
             Event::Closed(reason) => {
                 self.backend = None;
                 self.closed = true;

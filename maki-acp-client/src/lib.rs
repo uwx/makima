@@ -9,7 +9,7 @@ use std::net::TcpStream;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
@@ -42,6 +42,10 @@ const ACP_SUBCOMMAND: &str = "acp";
 const MODEL_FLAG: &str = "--model";
 const SSH_PROGRAM: &str = "ssh";
 const AGENT_GONE: &str = "agent is not running";
+const AGENT_CLOSED: &str = "agent closed the connection";
+const SESSION_ENDED: &str = "the shared session ended while this window was disconnected";
+const RECONNECT_INITIAL: Duration = Duration::from_millis(250);
+const RECONNECT_MAX: Duration = Duration::from_secs(5);
 const JSONRPC_VERSION: &str = "2.0";
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -121,6 +125,12 @@ pub enum Event {
     },
     /// The session started (true) or finished (false) a turn.
     Turn(bool),
+    /// The link to the agent dropped; a reconnect is running in the
+    /// background and the session replays once it is back.
+    Reconnecting,
+    /// The link is back and the session this window watches was attached
+    /// again, so its transcript replays from here.
+    Reconnected,
     Closed(String),
 }
 
@@ -323,6 +333,7 @@ pub fn diff_text(content: &[ToolCallContent]) -> Option<String> {
 
 /// Where the ACP agent lives: a local process, an SSH connection, or an agent
 /// another machine shares over the LAN.
+#[derive(Clone)]
 pub struct Target {
     label: String,
     program: String,
@@ -337,6 +348,7 @@ pub struct Target {
     quiet: bool,
 }
 
+#[derive(Clone)]
 struct Lan {
     address: String,
     token: String,
@@ -551,7 +563,8 @@ pub struct Connection {
 
 pub fn connect(target: &Target) -> Result<Connection, String> {
     let (reader, writer, child) = target.open()?;
-    let (client, events) = spawn_agent(reader, writer, child)?;
+    let reconnect = target.lan.as_ref().map(|_| target.clone());
+    let (client, events) = spawn_agent(reader, writer, child, reconnect)?;
     open_session(
         client,
         events,
@@ -570,7 +583,7 @@ pub fn connect_streams(
     writer: impl Write + Send + 'static,
     cwd: &Path,
 ) -> Result<Connection, String> {
-    let (client, events) = spawn_agent(reader, writer, None)?;
+    let (client, events) = spawn_agent(reader, writer, None, None)?;
     open_session(client, events, cwd, false, false, "streams")
 }
 
@@ -578,19 +591,25 @@ fn spawn_agent(
     reader: impl Read + Send + 'static,
     writer: impl Write + Send + 'static,
     child: Option<Child>,
+    target: Option<Target>,
 ) -> Result<(Arc<Client>, Receiver<Event>), String> {
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let (events_tx, events_rx) = flume::unbounded::<Event>();
     let client = Arc::new(Client {
         next_id: AtomicI64::new(0),
-        out: out_tx,
+        link: Mutex::new(Link {
+            generation: 0,
+            out: Some(out_tx),
+            target,
+        }),
         pending: Mutex::new(HashMap::new()),
         events: events_tx,
         session: Mutex::new(None),
+        reconnecting: AtomicBool::new(false),
     });
 
     spawn_writer(writer, out_rx)?;
-    spawn_reader(reader, Arc::downgrade(&client))?;
+    spawn_reader(reader, 0, Arc::downgrade(&client))?;
     if let Some(mut child) = child {
         thread::Builder::new()
             .name("acp-wait".into())
@@ -743,6 +762,7 @@ fn spawn_writer(
 /// see EOF and the agent would outlive the desktop.
 fn spawn_reader(
     stdout: impl std::io::Read + Send + 'static,
+    generation: u64,
     client: Weak<Client>,
 ) -> Result<(), String> {
     thread::Builder::new()
@@ -762,20 +782,35 @@ fn spawn_reader(
                 client.dispatch(message);
             }
             if let Some(client) = client.upgrade() {
-                client.abort_pending();
-                let _ = client.emit(Event::Closed("agent closed the connection".to_owned()));
+                client.link_lost(generation);
             }
         })
         .map_err(|error| format!("start agent reader: {error}"))?;
     Ok(())
 }
 
+/// Why a reconnect attempt did not restore the link. A link failure is worth
+/// retrying; a session the agent no longer serves is not.
+enum ReopenError {
+    Link,
+    SessionEnded,
+}
+
+/// The live connection to the agent. A LAN link can come back, so the channel
+/// to the writer and a generation that tells stale readers apart live here.
+struct Link {
+    generation: u64,
+    out: Option<Sender<String>>,
+    target: Option<Target>,
+}
+
 pub struct Client {
     next_id: AtomicI64,
-    out: Sender<String>,
+    link: Mutex<Link>,
     pending: Mutex<HashMap<i64, Sender<Result<Value, String>>>>,
     events: Sender<Event>,
     session: Mutex<Option<SessionId>>,
+    reconnecting: AtomicBool,
 }
 
 impl Client {
@@ -783,6 +818,118 @@ impl Client {
         for (_, sender) in self.pending.lock().unwrap().drain() {
             let _ = sender.send(Err(AGENT_GONE.to_owned()));
         }
+    }
+
+    fn send_line(&self, text: String) -> bool {
+        let link = self.link.lock().unwrap();
+        link.out.as_ref().is_some_and(|out| out.send(text).is_ok())
+    }
+
+    /// The reader saw its stream end. A LAN link retries with backoff; a
+    /// spawned or SSH agent is gone for good.
+    fn link_lost(self: &Arc<Self>, generation: u64) {
+        let target = {
+            let mut link = self.link.lock().unwrap();
+            if link.generation != generation {
+                return;
+            }
+            link.out = None;
+            link.target.clone()
+        };
+        self.abort_pending();
+        let Some(target) = target else {
+            let _ = self.emit(Event::Closed(AGENT_CLOSED.to_owned()));
+            return;
+        };
+        if self.reconnecting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if self.emit(Event::Reconnecting).is_err() {
+            self.reconnecting.store(false, Ordering::SeqCst);
+            return;
+        }
+        let client = Arc::clone(self);
+        let spawned = thread::Builder::new()
+            .name("acp-reconnect".into())
+            .spawn(move || client.reconnect(target));
+        if let Err(error) = spawned {
+            let _ = self.emit(Event::Closed(format!("start reconnecting: {error}")));
+        }
+    }
+
+    fn drop_link(&self, generation: u64) {
+        let mut link = self.link.lock().unwrap();
+        if link.generation == generation {
+            link.out = None;
+        }
+    }
+
+    /// Reopens {target} and attaches the session again, until it works or the
+    /// session is no longer there. The replay that follows the attach repaints
+    /// the transcript, so nothing the window missed is lost.
+    fn reconnect(self: Arc<Self>, target: Target) {
+        let mut delay = RECONNECT_INITIAL;
+        loop {
+            thread::sleep(delay);
+            delay = (delay * 2).min(RECONNECT_MAX);
+            if !self.reconnecting.load(Ordering::SeqCst) || self.events.is_disconnected() {
+                return;
+            }
+            match self.reopen(&target) {
+                Ok(()) => {
+                    self.reconnecting.store(false, Ordering::SeqCst);
+                    let _ = self.emit(Event::Reconnected);
+                    return;
+                }
+                Err(ReopenError::SessionEnded) => {
+                    self.reconnecting.store(false, Ordering::SeqCst);
+                    let _ = self.emit(Event::Closed(SESSION_ENDED.to_owned()));
+                    return;
+                }
+                Err(ReopenError::Link) => {}
+            }
+        }
+    }
+
+    fn reopen(self: &Arc<Self>, target: &Target) -> Result<(), ReopenError> {
+        let (reader, writer, _child) = target.open().map_err(|_| ReopenError::Link)?;
+        let (out_tx, out_rx) = flume::unbounded::<String>();
+        spawn_writer(writer, out_rx).map_err(|_| ReopenError::Link)?;
+        let generation = {
+            let mut link = self.link.lock().unwrap();
+            link.generation += 1;
+            link.out = Some(out_tx);
+            link.generation
+        };
+        if spawn_reader(reader, generation, Arc::downgrade(self)).is_err() {
+            self.drop_link(generation);
+            return Err(ReopenError::Link);
+        }
+        let live = self
+            .initialize()
+            .and_then(|_| self.live_sessions())
+            .map_err(|_| ReopenError::Link);
+        let live = match live {
+            Ok(live) => live,
+            Err(error) => {
+                self.drop_link(generation);
+                return Err(error);
+            }
+        };
+        let Some(session) = self.session.lock().unwrap().clone() else {
+            self.drop_link(generation);
+            return Err(ReopenError::Link);
+        };
+        if !live.iter().any(|id| id.as_str() == &*session.0) {
+            self.drop_link(generation);
+            return Err(ReopenError::SessionEnded);
+        }
+        let _ = self.emit(Event::Rewound);
+        if self.attach(&session).is_err() {
+            self.drop_link(generation);
+            return Err(ReopenError::Link);
+        }
+        Ok(())
     }
 
     pub fn emit(&self, event: Event) -> Result<(), String> {
@@ -957,7 +1104,7 @@ impl Client {
         });
         let text =
             serde_json::to_string(&message).map_err(|error| format!("encode {method}: {error}"))?;
-        if self.out.send(text).is_err() {
+        if !self.send_line(text) {
             self.pending.lock().unwrap().remove(&id);
             return Err(AGENT_GONE.to_owned());
         }
@@ -1113,7 +1260,7 @@ impl Client {
 
     fn send_value(&self, message: impl Serialize) {
         if let Ok(text) = serde_json::to_string(&message) {
-            let _ = self.out.send(text);
+            self.send_line(text);
         }
     }
 }
@@ -1181,9 +1328,11 @@ mod tests {
     use agent_client_protocol_schema::{Diff, ToolCallContent};
     use serde_json::Value;
 
+    use std::time::{Duration, Instant};
+
     use super::{
-        ACP_SUBCOMMAND, MODEL_FLAG, SSH_PROGRAM, Target, ThemePalette, diff_text, error_message,
-        themes_from,
+        ACP_SUBCOMMAND, Event, MODEL_FLAG, SESSION_ENDED, SSH_PROGRAM, Target, ThemePalette,
+        diff_text, error_message, themes_from,
     };
     use test_case::test_case;
 
@@ -1561,6 +1710,215 @@ old
             server.join().unwrap(),
             ["initialize", "maki/live", "maki/attach"]
         );
+    }
+
+    /// One LAN life: consume the handshake and keep the reader for the rest.
+    fn accept_lan(
+        listener: &std::net::TcpListener,
+    ) -> (std::net::TcpStream, std::io::BufReader<std::net::TcpStream>) {
+        use std::io::{BufRead, BufReader, Write};
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        stream
+            .write_all(b"{\"maki\":\"lan\",\"version\":1,\"ok\":true}\n")
+            .unwrap();
+        (stream, reader)
+    }
+
+    fn read_request(reader: &mut impl std::io::BufRead) -> Value {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0, "client hung up");
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    fn write_message(stream: &mut std::net::TcpStream, message: Value) {
+        use std::io::Write;
+
+        stream.write_all(message.to_string().as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+    }
+
+    fn answer(stream: &mut std::net::TcpStream, request: &Value, result: Value) {
+        write_message(
+            stream,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": result,
+            }),
+        );
+    }
+
+    /// A LAN agent in two lives: the first opens a session and hangs up, the
+    /// second serves `live` and, when it still lists the session, replays one
+    /// update and one commit before answering the attach.
+    fn reconnect_agent(
+        live: Value,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<String>>) {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            {
+                let (mut stream, mut reader) = accept_lan(&listener);
+                for (method, result) in [
+                    ("initialize", serde_json::json!({ "protocolVersion": 1 })),
+                    ("maki/live", serde_json::json!({ "sessions": [] })),
+                    (
+                        "session/new",
+                        serde_json::json!({ "sessionId": "sess-1", "configOptions": [] }),
+                    ),
+                ] {
+                    let request = read_request(&mut reader);
+                    assert_eq!(request["method"], method);
+                    seen.push(method.to_owned());
+                    answer(&mut stream, &request, result);
+                }
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            let (mut stream, mut reader) = accept_lan(&listener);
+            let request = read_request(&mut reader);
+            assert_eq!(request["method"], "initialize");
+            seen.push("initialize".to_owned());
+            answer(
+                &mut stream,
+                &request,
+                serde_json::json!({ "protocolVersion": 1 }),
+            );
+            let request = read_request(&mut reader);
+            assert_eq!(request["method"], "maki/live");
+            seen.push("maki/live".to_owned());
+            answer(&mut stream, &request, live.clone());
+            if live["sessions"]
+                .as_array()
+                .is_some_and(|sessions| !sessions.is_empty())
+            {
+                let request = read_request(&mut reader);
+                assert_eq!(request["method"], "maki/attach");
+                seen.push("maki/attach".to_owned());
+                write_message(
+                    &mut stream,
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": "sess-1",
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": "replayed" },
+                            },
+                        },
+                    }),
+                );
+                write_message(
+                    &mut stream,
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "maki/ui/committed",
+                        "params": {
+                            "sessionId": "sess-1",
+                            "messages": [],
+                            "start": 0,
+                            "replace": true,
+                            "compacted": false,
+                        },
+                    }),
+                );
+                answer(
+                    &mut stream,
+                    &request,
+                    serde_json::json!({
+                        "sessionId": "sess-1",
+                        "readOnly": false,
+                        "replayed": 1,
+                        "truncated": false,
+                        "busy": false,
+                        "configOptions": [],
+                    }),
+                );
+            }
+            seen
+        });
+        (address, server)
+    }
+
+    fn next_matching(
+        events: &flume::Receiver<Event>,
+        what: &str,
+        matches: fn(&Event) -> bool,
+    ) -> Event {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let event = events
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("no {what}"));
+            if matches(&event) {
+                return event;
+            }
+        }
+    }
+
+    #[test]
+    fn a_dropped_lan_link_reconnects_and_reattaches_the_session() {
+        let live = serde_json::json!({
+            "sessions": [{ "sessionId": "sess-1", "watchers": 0 }],
+        });
+        let (address, server) = reconnect_agent(live);
+        let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
+        let connection = super::connect(&target).unwrap();
+        assert_eq!(&*connection.session.0, "sess-1");
+        let events = connection.events.clone();
+
+        next_matching(&events, "reconnecting", |event| {
+            matches!(event, Event::Reconnecting)
+        });
+        next_matching(&events, "rewound", |event| matches!(event, Event::Rewound));
+        next_matching(&events, "replayed update", |event| {
+            matches!(event, Event::Update(_))
+        });
+        next_matching(&events, "replayed history", |event| {
+            matches!(event, Event::Committed { .. })
+        });
+        next_matching(&events, "reconnected", |event| {
+            matches!(event, Event::Reconnected)
+        });
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "initialize",
+                "maki/live",
+                "session/new",
+                "initialize",
+                "maki/live",
+                "maki/attach"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_session_that_ended_is_not_retried() {
+        let (address, server) = reconnect_agent(serde_json::json!({ "sessions": [] }));
+        let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
+        let connection = super::connect(&target).unwrap();
+        let events = connection.events.clone();
+
+        next_matching(&events, "reconnecting", |event| {
+            matches!(event, Event::Reconnecting)
+        });
+        let Event::Closed(reason) =
+            next_matching(&events, "closed", |event| matches!(event, Event::Closed(_)))
+        else {
+            unreachable!()
+        };
+        assert_eq!(reason, SESSION_ENDED);
+        drop(connection);
+        server.join().unwrap();
     }
 
     #[test]
