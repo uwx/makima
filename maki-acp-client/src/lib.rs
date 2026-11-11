@@ -19,9 +19,11 @@ pub use agent_client_protocol_schema::{
     InitializeRequest, JsonRpcMessage, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
     NewSessionResponse, Notification, PermissionOption, PromptRequest, PromptResponse,
     ProtocolVersion, Request, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionId, SessionNotification, SessionUpdate, StopReason,
-    TextContent, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue, SessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, TextContent, ToolCallContent, ToolCallId,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use flume::{Receiver, Sender};
 use serde::de::DeserializeOwned;
@@ -64,6 +66,7 @@ const COMPLETE_METHOD: &str = "maki/complete";
 const THEME_METHOD: &str = "maki/theme";
 const SESSIONS_METHOD: &str = "maki/sessions";
 const SESSION_LOAD_METHOD: &str = "session/load";
+const SET_CONFIG_OPTION_METHOD: &str = "session/set_config_option";
 const LIVE_METHOD: &str = "maki/live";
 const ATTACH_METHOD: &str = "maki/attach";
 const SHARE_METHOD: &str = "maki/share";
@@ -1071,6 +1074,25 @@ impl Client {
         Ok(())
     }
 
+    /// Sets one session option where the session lives, so a window that
+    /// keeps its own copy of the config can change the agent's too.
+    pub fn set_config_option(&self, id: &str, value: &str) -> Result<(), String> {
+        let session = self
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no active session".to_owned())?;
+        let request = SetSessionConfigOptionRequest::new(
+            session,
+            SessionConfigId::new(id.to_owned()),
+            SessionConfigOptionValue::value_id(value.to_owned()),
+        );
+        let _: SetSessionConfigOptionResponse =
+            self.request(SET_CONFIG_OPTION_METHOD, request, Some(SESSION_TIMEOUT))?;
+        Ok(())
+    }
+
     pub fn prompt(&self, text: &str) -> Result<StopReason, String> {
         self.prompt_blocks(vec![ContentBlock::Text(TextContent::new(text.to_owned()))])
     }
@@ -1772,6 +1794,42 @@ old
         assert_eq!(connection.model, "openai/gpt-5");
         drop(connection);
         assert_eq!(server.join().unwrap(), ["initialize", "session/load"]);
+    }
+
+    #[test]
+    fn setting_a_session_option_names_it_and_its_value() {
+        use agent_client_protocol_schema::{NewSessionResponse, SessionId};
+
+        let (address, server) = fake_agent(4, |method, request| match method {
+            "initialize" => initialized(method),
+            "maki/live" => Some(serde_json::json!({ "sessions": [] })),
+            "session/new" => Some(
+                serde_json::to_value(NewSessionResponse::new(SessionId::new("sess-opt"))).unwrap(),
+            ),
+            "session/set_config_option" => {
+                assert_eq!(request["params"]["sessionId"], "sess-opt");
+                assert_eq!(request["params"]["configId"], "model");
+                assert_eq!(request["params"]["value"], "openai/gpt-5");
+                Some(serde_json::json!({ "configOptions": [] }))
+            }
+            _ => None,
+        });
+        let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
+        let connection = super::connect(&target).unwrap();
+        connection
+            .client
+            .set_config_option("model", "openai/gpt-5")
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "initialize",
+                "maki/live",
+                "session/new",
+                "session/set_config_option"
+            ]
+        );
     }
 
     /// One LAN life: consume the handshake and keep the reader for the rest.

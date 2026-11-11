@@ -715,6 +715,32 @@ fn observe_config_commits(
     Ok(ui_rx)
 }
 
+/// The built-in options whose value moved, as the pairs
+/// `session/set_config_option` takes. Plugin options are left out: each side
+/// keeps its own copy of what a plugin stores.
+fn changed_builtin_options(
+    previous: &SessionOptionsSnapshot,
+    current: &SessionOptionsSnapshot,
+) -> Vec<(String, String)> {
+    current
+        .options
+        .iter()
+        .filter(|option| matches!(option.definition.owner, SessionOptionOwner::Builtin))
+        .filter_map(|option| {
+            let before = previous
+                .options
+                .iter()
+                .find(|before| before.definition.id == option.definition.id)?;
+            (before.current_value != option.current_value).then(|| {
+                (
+                    option.definition.id.to_string(),
+                    option.current_value.to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
 fn apply_options_to_session(session: &mut AppSession, snapshot: &SessionOptionsSnapshot) {
     for option in snapshot.options.iter() {
         let id = option.definition.id.as_ref();
@@ -774,6 +800,9 @@ struct SessionRuntime {
     /// The last root commit the app followed, so the next one can tell what
     /// changed.
     projected_config: Option<ConfigCommit>,
+    /// The session options this window last told the agent about. The first
+    /// commit only seeds it, so what the window starts with changes nothing.
+    forwarded_options: Option<SessionOptionsSnapshot>,
     app: App,
     handles: AgentHandles,
     model_slot: Arc<ProviderSlot>,
@@ -912,6 +941,7 @@ impl PreparedSessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
             projected_config: None,
+            forwarded_options: None,
             app,
             handles,
             model_slot,
@@ -988,6 +1018,7 @@ impl PreparedSessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
             projected_config: None,
+            forwarded_options: None,
             app,
             handles,
             model_slot,
@@ -1114,6 +1145,15 @@ impl SessionRuntime {
         self.app.project_root_mode(&previous, &commit.config.mode);
         self.settle_plan_approval();
         true
+    }
+
+    /// The built-in options this window changed since it last told the agent.
+    fn changed_options(&mut self) -> Vec<(String, String)> {
+        let snapshot = self.coordinator.read().options();
+        let Some(previous) = self.forwarded_options.replace(snapshot.clone()) else {
+            return Vec::new();
+        };
+        changed_builtin_options(&previous, &snapshot)
     }
 
     /// Commits a saved `/fast` that was restored while discovery was pending,
@@ -1585,6 +1625,11 @@ enum InternalEvent {
     SessionHeartbeat(u64),
     /// A share request finished; the window that asked says how it went.
     Shared(Result<maki_acp_client::ShareInfo, String>),
+    /// The agent refused a session option this window had already applied.
+    OptionForwardFailed {
+        session: MakiId,
+        error: String,
+    },
     Unshared(Result<(), String>),
 }
 
@@ -2315,6 +2360,13 @@ impl<'t> EventLoop<'t> {
                     self.complete_plan_approval(idx, result);
                 }
             }
+            InternalEvent::OptionForwardFailed { session, error } => {
+                if let Some(idx) = self.position(session) {
+                    self.sessions[idx]
+                        .app
+                        .flash(format!("the agent refused this change: {error}"));
+                }
+            }
             InternalEvent::Shared(result) => {
                 let message = match result {
                     Ok(info) => format!(
@@ -2712,6 +2764,7 @@ impl<'t> EventLoop<'t> {
             }
         }
         let mut login_actions: Vec<(usize, Vec<Action>)> = Vec::new();
+        let mut forwards = Vec::new();
         let mut approvals = Vec::new();
         for (i, rt) in self.sessions.iter_mut().enumerate() {
             if matches!(rt.session_lock, Some(SessionLockState::InFlight(_))) {
@@ -2728,6 +2781,10 @@ impl<'t> EventLoop<'t> {
             while let Ok(commit) = rt.config_commits.try_recv() {
                 if rt.project_config(&commit) {
                     dirty = Dirty::YES;
+                    let changed = rt.changed_options();
+                    if !changed.is_empty() {
+                        forwards.push((rt.id(), changed));
+                    }
                 }
             }
             let (session_dirty, actions) = tick_session(&mut rt.app, i == self.focused, now);
@@ -2738,6 +2795,9 @@ impl<'t> EventLoop<'t> {
         }
         for (i, actions) in login_actions {
             self.dispatch(i, actions);
+        }
+        for (id, changed) in forwards {
+            self.forward_options(id, changed);
         }
         for (i, step) in approvals {
             self.complete_plan_approval(i, Ok(step));
@@ -4158,9 +4218,37 @@ impl<'t> EventLoop<'t> {
             .actor(root)
             .ok()
             .and_then(|actor| actor.config_snapshot())
+            && self.sessions[idx].project_config(&commit)
         {
-            self.sessions[idx].project_config(&commit);
+            let id = self.sessions[idx].id();
+            let changed = self.sessions[idx].changed_options();
+            if !changed.is_empty() {
+                self.forward_options(id, changed);
+            }
         }
+    }
+
+    /// Sends the options this window changed to the agent that owns a shared
+    /// session, so `/model`, `/fast`, `/workflow` and `/yolo` mean the same on
+    /// both sides. A window that runs its session itself has nothing to send.
+    fn forward_options(&mut self, session: MakiId, changed: Vec<(String, String)>) {
+        let Some(remote) = &self.ctx.remote else {
+            return;
+        };
+        let client = Arc::clone(&remote.connection.client);
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            for (option, value) in changed {
+                if let Err(error) = client.set_config_option(&option, &value) {
+                    let _ = internal_tx.send(InternalEvent::OptionForwardFailed {
+                        session,
+                        error: format!("{option}: {error}"),
+                    });
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// The app-side half of a model change, run once the coordinator has
@@ -5670,6 +5758,70 @@ mod tests {
         })
     }
 
+    fn options_snapshot(model: &str, yolo: bool) -> SessionOptionsSnapshot {
+        use maki_agent::session_options::SessionOptionState;
+
+        let definitions = maki_agent::session_coordinator::builtin_option_definitions(
+            Arc::from(model),
+            std::iter::empty::<Arc<str>>(),
+            yolo,
+            false,
+            false,
+            maki_agent::ThinkingConfig::Off,
+        );
+        let options: Vec<SessionOptionState> = definitions
+            .into_iter()
+            .map(|definition| SessionOptionState {
+                current_value: Arc::clone(&definition.initial_value),
+                definition,
+            })
+            .collect();
+        SessionOptionsSnapshot {
+            version: 1,
+            options: options.into(),
+        }
+    }
+
+    #[test]
+    fn only_the_options_the_window_changed_are_forwarded() {
+        let before = options_snapshot("openai/gpt-5", false);
+        assert!(changed_builtin_options(&before, &before).is_empty());
+
+        let after = options_snapshot("anthropic/claude-opus-4-8", true);
+        assert_eq!(
+            changed_builtin_options(&before, &after),
+            [
+                ("model".to_owned(), "anthropic/claude-opus-4-8".to_owned()),
+                ("yolo".to_owned(), ENABLED_VALUE.to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plugin_option_is_not_sent_to_the_agent() {
+        use maki_agent::session_options::SessionOptionState;
+
+        let before = options_snapshot("openai/gpt-5", false);
+        let mut after = options_snapshot("openai/gpt-5", false);
+        let options: Vec<SessionOptionState> = after
+            .options
+            .iter()
+            .map(|option| SessionOptionState {
+                definition: maki_agent::session_options::SessionOptionDefinition {
+                    owner: SessionOptionOwner::Plugin {
+                        plugin: Arc::from("bash"),
+                        generation: 1,
+                    },
+                    ..option.definition.clone()
+                },
+                current_value: Arc::from("other"),
+            })
+            .collect();
+        after.options = options.into();
+
+        assert!(changed_builtin_options(&before, &after).is_empty());
+    }
+
     fn pending_fast_runtime() -> SessionRuntime {
         let mut runtime = test_runtime(fast_model(PENDING_FAST_MODEL, FastSupport::Pending));
         runtime.app.state.fast_pending = true;
@@ -6284,6 +6436,7 @@ mod tests {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
             projected_config: None,
+            forwarded_options: None,
             app,
             handles,
             model_slot,

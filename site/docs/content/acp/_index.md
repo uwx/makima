@@ -177,6 +177,16 @@ The messages are the stored form of Makima's messages, the same shape `session/l
 
 The recording follows the session, not the connection: when any window rewinds, the others receive `maki/ui/rewind` and the recording starts over from the rewound transcript. The session lives as long as the process that runs it; when the connection that owns it ends, the session ends and the others lose it.
 
+### Changing what future turns use
+
+A window that keeps its own copy of the session's config, like the terminal interface, sends what it changed back to the agent:
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"session/set_config_option","params":{"sessionId":"...","configId":"model","value":"openai/gpt-5"}}
+```
+
+The window compares the option list after each change of its own and sends only the built-ins that moved: model, thinking, fast, workflow, yolo. Plugin options stay on the side that owns them. If the agent refuses the value, the window says so and keeps running on the config the agent still has.
+
 ### When the link drops
 
 A client attached over TCP reconnects on its own. It retries with backoff (from 250 ms, capped at 5 s), runs `initialize` again, asks `maki/live` for the sessions the agent serves, and attaches the one it was watching. The reattach replays the session's updates and its committed history, so the transcript the client missed comes back in order, and a turn that ran while it was away shows up too.
