@@ -6397,6 +6397,21 @@ fn drain_writer(app: App, writer: Arc<StorageWriter>) {
 }
 
 #[test]
+fn share_asks_for_a_hosted_window_and_unshare_stops_nothing_here() {
+    let (_tmp, _dir, writer, mut app) = tempdir_app();
+
+    let actions = app.execute_command(cmd("/unshare"), 0);
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(NOT_SHARING_MSG));
+
+    let actions = app.execute_command(cmd("/share"), 0);
+    assert_eq!(app.exit_request, ExitRequest::Share);
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+    drain_writer(app, writer);
+}
+
+#[test]
 fn reload_persists_session_with_content_to_disk() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
     app.state

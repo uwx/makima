@@ -83,6 +83,9 @@ pub enum RunOutcome {
         tabs: Vec<AppSession>,
         focused: usize,
     },
+    /// The focused session should reopen on an agent this window starts, so
+    /// other machines can watch it.
+    Share { session: Option<MakiId> },
 }
 
 pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
@@ -96,6 +99,9 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         components::ExitRequest::Reload => RunOutcome::Reload {
             tabs: report.tabs,
             focused: report.focused,
+        },
+        components::ExitRequest::Share => RunOutcome::Share {
+            session: report.tabs.get(report.focused).map(|tab| tab.id),
         },
         exit => {
             let session_id = report

@@ -61,6 +61,8 @@ The token comes from `--token`, then `MAKIMA_LAN_TOKEN`, then `lan-token` in the
 makima acp --share 0.0.0.0:7331
 ```
 
+`makima --share 0.0.0.0:7331 -c <ID>` opens an existing session on the agent instead of a new one, and `-l` picks the latest session for the directory. The window names that session in its resume hint, and `makima -c <ID>` resumes it later without the listener.
+
 The stdio connection owns the session, and other connections attach to it as below. Closing stdio ends the session and the process, and watchers see the connection end. `--share` and `--listen` are mutually exclusive: `--listen` serves TCP only, `--share` adds TCP beside stdio.
 
 A process serves one session at a time. Closing the connection that owns it ends it, like closing an agent's stdin; until then another connection that asks for a new session is refused with error code `-32011`, and can watch instead.
@@ -82,6 +84,8 @@ A connection that owns a session can open a listener for it later, without a res
 `bind` is what the agent bound, `address` what another machine reaches, `link` the agent address a client sets, and `token` what it presents in the handshake. The token is `MAKIMA_LAN_TOKEN` when set, then the stored `lan-token`. Asking twice answers the same listener. `maki/unshare` closes it, and so does ending the connection that opened it.
 
 Only the connection that owns the session can share it: a watching connection gets `-32014`, even while it holds control. A share that cannot bind answers `-32013`.
+
+The terminal window starts a listener with `/share` and stops it with `/unshare`. In a window that runs the session itself, `/share` restarts the interface as a client of an agent that serves the same session, on every interface and a port the system picks, and shows the link other machines use. From there the window talks ACP like `--share` does, and `/unshare` stops the listener without ending the session; the session keeps running until the window closes.
 
 The desktop window has the same thing as a status bar toggle. `Share` opens the listener and shows the address with buttons for the link and the token, `Stop sharing` closes it. Another window reaches it with `MAKI_DESKTOP_REMOTE=lan://192.168.2.4:60667` and `MAKI_DESKTOP_LAN_TOKEN=...`, or by choosing the session under `Remote` in its sidebar, which asks for the token. The same link works in the composer as `/connect lan://192.168.2.4:60667 <token>`. The link names no directory: that window watches the session the other machine serves instead of starting one.
 

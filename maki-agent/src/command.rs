@@ -551,6 +551,8 @@ impl CommandBehavior for BuiltinBehavior {
                 maki_commands::BuiltinId::Exit => BuiltinOperation::Exit,
                 maki_commands::BuiltinId::Reload => BuiltinOperation::Reload,
                 maki_commands::BuiltinId::Trust => BuiltinOperation::Trust,
+                maki_commands::BuiltinId::Share => BuiltinOperation::Share,
+                maki_commands::BuiltinId::Unshare => BuiltinOperation::Unshare,
             };
             match invocation
                 .host_request(HostRequest::Builtin(operation))

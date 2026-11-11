@@ -282,12 +282,15 @@ pub enum ExitRequest {
     Success,
     Error,
     Reload,
+    /// Tear the window down so it can reopen as a client of an agent that
+    /// serves the same session.
+    Share,
 }
 
 impl ExitRequest {
     pub fn code(&self) -> i32 {
         match self {
-            Self::None | Self::Success | Self::Reload => 0,
+            Self::None | Self::Success | Self::Reload | Self::Share => 0,
             Self::Error => 1,
         }
     }

@@ -102,6 +102,8 @@ pub enum BuiltinId {
     Exit,
     Reload,
     Trust,
+    Share,
+    Unshare,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -141,6 +143,8 @@ pub enum BuiltinOperation {
     Exit,
     Reload,
     Trust,
+    Share,
+    Unshare,
 }
 
 pub fn parse_model_selection(arguments: &str) -> Result<ModelSelection, crate::CommandError> {
@@ -511,6 +515,26 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         NO_ARGUMENT_COMPLETIONS,
         None,
         RELOAD,
+    ),
+    builtin!(
+        Share,
+        "/share",
+        &[],
+        "Let other machines watch this session",
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
+        None,
+        INTERACTIVE,
+    ),
+    builtin!(
+        Unshare,
+        "/unshare",
+        &[],
+        "Stop other machines watching this session",
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
+        None,
+        INTERACTIVE,
     ),
 ];
 

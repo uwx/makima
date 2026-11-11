@@ -1583,6 +1583,9 @@ enum InternalEvent {
         result: Result<PreparedProvider, String>,
     },
     SessionHeartbeat(u64),
+    /// A share request finished; the window that asked says how it went.
+    Shared(Result<maki_acp_client::ShareInfo, String>),
+    Unshared(Result<(), String>),
 }
 
 /// The event loop must never await a coordinator operation on its own thread:
@@ -2312,6 +2315,23 @@ impl<'t> EventLoop<'t> {
                     self.complete_plan_approval(idx, result);
                 }
             }
+            InternalEvent::Shared(result) => {
+                let message = match result {
+                    Ok(info) => format!(
+                        "other machines can watch this session at {} with token {}",
+                        info.link, info.token
+                    ),
+                    Err(error) => format!("could not share this session: {error}"),
+                };
+                self.sessions[self.focused].app.flash(message);
+            }
+            InternalEvent::Unshared(result) => {
+                let message = match result {
+                    Ok(()) => "this session is no longer shared".to_owned(),
+                    Err(error) => format!("could not stop sharing: {error}"),
+                };
+                self.sessions[self.focused].app.flash(message);
+            }
             InternalEvent::ModelsDiscovered => {
                 self.ctx.model_capabilities.clear();
                 self.refresh_discovered_models();
@@ -2474,6 +2494,26 @@ impl<'t> EventLoop<'t> {
                         if let Err(error) = result {
                             let _ = reply.send(Err(error));
                         }
+                        return;
+                    }
+                    if matches!(
+                        operation,
+                        BuiltinOperation::Share | BuiltinOperation::Unshare
+                    ) && let Some(remote) = &self.ctx.remote
+                    {
+                        let share = matches!(operation, BuiltinOperation::Share);
+                        let client = Arc::clone(&remote.connection.client);
+                        let internal = self.internal_tx.clone();
+                        smol::spawn(async move {
+                            let event = if share {
+                                InternalEvent::Shared(client.share())
+                            } else {
+                                InternalEvent::Unshared(client.unshare())
+                            };
+                            let _ = internal.send(event);
+                        })
+                        .detach();
+                        let _ = reply.send(Ok(HostResponse::Completed));
                         return;
                     }
                     if let BuiltinOperation::Compact(instructions) = operation {

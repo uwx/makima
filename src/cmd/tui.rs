@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal, Read};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -371,6 +371,12 @@ fn exit_resume_hint(id: &str, colored: bool) -> String {
 }
 
 const ATTACHED_RELOAD: &str = "this window is attached to another machine; restart it to reload";
+const NOTHING_TO_SHARE: &str = "there is no session to share";
+
+/// Where `/share` binds: every interface, on a port the system picks.
+fn share_bind() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+}
 
 /// Runs this window on a session an agent of its own owns, so other machines
 /// can watch it: the interface talks ACP to that agent, as `makima attach` does.
@@ -435,7 +441,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
             resume,
         )?);
     }
-    let attached = remote.is_some();
+    let mut attached = remote.is_some();
     let _instance = (!cli.print)
         .then(|| {
             maki_storage::instances::InstanceGuard::register(
@@ -572,7 +578,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
     let mut teardown = Teardown::default();
     // A shared session lives in the agent this window started; the local
     // transcript is only a view of it, so the resume hint must name that one.
-    let shared_session = remote
+    let mut shared_session = remote
         .as_ref()
         .filter(|_| cli.share.is_some())
         .map(|remote| remote.connection.session.0.to_string());
@@ -653,6 +659,31 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
                     std::process::exit(code);
                 }
                 return Ok(());
+            }
+            RunOutcome::Share { session } => {
+                let Some(id) = session else {
+                    bail!(NOTHING_TO_SHARE);
+                };
+                let mut hosted = hosted_session(
+                    &cwd,
+                    share_bind(),
+                    cli.share_token.clone(),
+                    cli.model.clone(),
+                    Some(id.to_string()),
+                )?;
+                let info = hosted.connection.client.share().map_err(|e| eyre!(e))?;
+                hosted.label = format!("this machine, shared on {}", info.address);
+                cli.share = Some(share_bind());
+                shared_session = Some(hosted.connection.session.0.to_string());
+                notice = Some(format!(
+                    "{}; other machines can attach to this session",
+                    hosted.label
+                ));
+                tabs = vec![AppSession::new(&hosted.connection.model, &cwd_str)];
+                remote = Some(hosted);
+                attached = true;
+                session_picker = false;
+                focused = 0;
             }
             RunOutcome::Reload {
                 tabs: reloaded,

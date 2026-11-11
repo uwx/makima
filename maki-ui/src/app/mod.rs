@@ -171,6 +171,8 @@ impl maki_providers::provider::Provider for DetachedProvider {
     }
 }
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
+const NOT_SHARING_MSG: &str =
+    "this window does not share its session; run it with --share ADDR, or /share here";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 
 const TASK_DONE_DETAIL: &str = "✓ ";
@@ -3442,6 +3444,11 @@ impl App {
             BuiltinOperation::Exit => self.quit(),
             BuiltinOperation::Reload => self.quit_with(ExitRequest::Reload),
             BuiltinOperation::Trust => self.trust_folder(),
+            BuiltinOperation::Share => self.quit_with(ExitRequest::Share),
+            BuiltinOperation::Unshare => {
+                self.flash(NOT_SHARING_MSG.into());
+                Vec::new()
+            }
         };
         Ok((HostResponse::Completed, actions))
     }
