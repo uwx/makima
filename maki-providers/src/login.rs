@@ -385,6 +385,30 @@ fn restore(storage: &StateDir, id: &str, snapshot: Option<Value>) {
     }
 }
 
+/// Whether {provider} reports credentials right now: a provider that needs
+/// none counts as configured, and one without a check of its own counts while
+/// its credentials file exists. A provider the registry does not know is
+/// never configured.
+pub async fn is_configured(
+    registry: &ProviderRegistry,
+    storage: &StateDir,
+    provider: &str,
+) -> bool {
+    let Some((id, entry)) = registry.entries().find(|(id, _)| id.as_ref() == provider) else {
+        return false;
+    };
+    let section = ProvidersConfig::load_or_default()
+        .get(id)
+        .cloned()
+        .unwrap_or_default();
+    let Ok(config) = serde_json::to_value(section) else {
+        return false;
+    };
+    status_of(entry, id, storage, config)
+        .await
+        .is_ok_and(|status| !matches!(status.state, AuthState::Missing | AuthState::Failed))
+}
+
 /// Every registered provider's status, in registration order with sectioned
 /// providers last. A failing check is reported as `Failed` and the listing
 /// continues.
@@ -961,6 +985,31 @@ mod tests {
             vec![(FAILING, AuthState::Failed), (PROVIDER, AuthState::Saved)]
         );
         assert_eq!(statuses[0].status.detail.as_deref(), Some(STATUS_ERR));
+    }
+
+    #[test]
+    fn is_configured_follows_the_auth_status() {
+        let fixture = Fixture::new();
+        save_credentials(&fixture.storage, PROVIDER, &json!({ "api_key": OLD_KEY })).unwrap();
+        let configured = |status| {
+            let registry = fixture.registry(FakeAuthBackend::new(&fixture.storage, status), &[]);
+            smol::block_on(is_configured(&registry, &fixture.storage, PROVIDER))
+        };
+
+        assert!(configured(Status::CredentialsFile));
+        assert!(!configured(Status::Missing));
+        assert!(!configured(Status::Fails));
+        assert!(
+            !smol::block_on(is_configured(
+                &fixture.registry(
+                    FakeAuthBackend::new(&fixture.storage, Status::Missing),
+                    &[]
+                ),
+                &fixture.storage,
+                UNKNOWN
+            )),
+            "an unregistered provider is never configured"
+        );
     }
 
     #[test]

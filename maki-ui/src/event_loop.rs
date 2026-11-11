@@ -3404,9 +3404,37 @@ impl<'t> EventLoop<'t> {
         session: AppSession,
         result: Result<PreparedProvider, String>,
     ) {
-        let result =
-            result.and_then(|provider| self.place_runtime(&target, session, Some(provider)));
+        let result = match result {
+            Ok(provider) => self.place_runtime(&target, session, Some(provider)),
+            // A stored model whose provider cannot be prepared (an imported
+            // session, or a login since removed) still opens, on the model the
+            // app already runs, the same way a failed startup restore does.
+            Err(error) => {
+                let spec = session.model.clone();
+                match self.place_runtime(&target, session, None) {
+                    Ok(()) => {
+                        let warning = {
+                            let current = self.ctx.model_slot.load();
+                            restore_warning(&spec, &error, &current.model)
+                        };
+                        self.flash_target(&target, warning);
+                        Ok(())
+                    }
+                    Err(place_error) => Err(place_error),
+                }
+            }
+        };
         self.report_placement(target, result);
+    }
+
+    fn flash_target(&mut self, target: &RuntimeTarget, message: String) {
+        let idx = match target {
+            RuntimeTarget::Open { .. } => self.focused,
+            RuntimeTarget::Replace { runtime, .. } => {
+                self.runtime_position(runtime).unwrap_or(self.focused)
+            }
+        };
+        self.sessions[idx].app.flash(message);
     }
 
     fn place_runtime(
@@ -7697,15 +7725,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_replacement_provider_preparation_preserves_current_runtime() {
+    fn unresolvable_replacement_model_opens_on_the_current_one() {
         const INVALID_MODEL: &str = "unsupported-provider/test-model";
 
         with_event_loop(|event_loop| {
             let current_id = event_loop.sessions[0].id();
-            let current_target = event_loop.sessions[0].app.command_target.id();
-            let (current_manager, current_root) = event_loop.sessions[0].handles.manager_and_root();
-            let current_provider = event_loop.ctx.model_slot.load().provider.identity();
+            let current_model = event_loop.ctx.model_slot.load().model.spec();
             let session = AppSession::new(INVALID_MODEL, &event_loop.session_cwd);
+            let loaded_id = session.id;
             let (reply_tx, reply_rx) = flume::bounded(1);
             let target = RuntimeTarget::Replace {
                 runtime: event_loop.sessions[0].handles.identity(),
@@ -7716,20 +7743,41 @@ mod tests {
             event_loop.bring_up(target, session);
             pump_until(event_loop, |_| !reply_rx.is_empty());
 
-            assert!(reply_rx.try_recv().unwrap().is_err());
+            assert!(reply_rx.try_recv().unwrap().is_ok());
             let runtime = &event_loop.sessions[0];
-            assert_eq!(runtime.id(), current_id);
-            assert_eq!(runtime.app.command_target.id(), current_target);
-            assert_eq!(
-                runtime.handles.manager_and_root().0.generation(),
-                current_manager.generation()
-            );
-            assert_eq!(runtime.handles.manager_and_root().1, current_root);
-            assert!(runtime.session_lock.is_some());
-            assert_eq!(
-                event_loop.ctx.model_slot.load().provider.identity(),
-                current_provider
-            );
+            assert_ne!(runtime.id(), current_id);
+            assert_eq!(runtime.id(), loaded_id);
+            assert_eq!(runtime.app.state.session.model, current_model);
+        });
+    }
+
+    #[test]
+    fn failed_replacement_provider_preparation_opens_on_the_current_model() {
+        const STORED_MODEL: &str = "openai/stored-model";
+        const PREPARE_ERR: &str = "provider not configured";
+
+        with_event_loop(|event_loop| {
+            let current_model = event_loop.ctx.model_slot.load().model.spec();
+            event_loop.ctx.prepare_provider = sync_preparer(|_| Err(Arc::from(PREPARE_ERR)));
+            let session = AppSession::new(STORED_MODEL, &event_loop.session_cwd);
+            let loaded_id = session.id;
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            let target = RuntimeTarget::Replace {
+                runtime: event_loop.sessions[0].handles.identity(),
+                kind: None,
+                reply: Some(reply_tx),
+            };
+
+            event_loop.bring_up(target, session);
+            pump_until(event_loop, |_| !reply_rx.is_empty());
+
+            assert!(reply_rx.try_recv().unwrap().is_ok());
+            let runtime = &event_loop.sessions[0];
+            assert_eq!(runtime.id(), loaded_id);
+            assert_eq!(runtime.app.state.session.model, current_model);
+            let flash = runtime.app.status_bar.flash_text().unwrap_or_default();
+            assert!(flash.contains(STORED_MODEL), "{flash}");
+            assert!(flash.contains(&current_model), "{flash}");
         });
     }
 

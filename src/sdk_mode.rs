@@ -47,6 +47,7 @@ use maki_commands::{
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::orchestration::ModelCatalog;
 use maki_lua::session_snapshot::HeadlessObserver;
+use maki_providers::login::is_configured;
 use maki_providers::model::Model;
 use maki_providers::{
     ImageSource, Message, ProviderRegistry, StopReason, Timeouts, TokenUsage, add_cost,
@@ -659,7 +660,14 @@ pub fn run(params: SdkParams) -> Result<()> {
     let storage = StateDir::resolve().context("resolve state dir")?;
     let mut restored = resolve_session(&cli, &working_dir, &storage)?;
     let restored_state = restored.model.is_some();
-    let model = startup_model(&providers, model, &restored, explicit_model, &model_policy);
+    let model = startup_model(
+        &providers,
+        &storage,
+        model,
+        &restored,
+        explicit_model,
+        &model_policy,
+    );
     let permission_mode = restored_permission_mode(
         restored_state,
         restored.meta.yolo,
@@ -1263,8 +1271,12 @@ struct ResolvedSession {
     meta: SessionMeta,
 }
 
+/// The model a resumed session runs on. Its own model wins unless its provider
+/// reports no credentials, as an imported session can name a provider this
+/// machine never logged in to; then the startup model is used.
 fn startup_model(
     providers: &ProviderRegistry,
+    storage: &StateDir,
     startup: Model,
     restored: &ResolvedSession,
     explicit_model: bool,
@@ -1278,6 +1290,7 @@ fn startup_model(
         .as_deref()
         .and_then(|spec| providers.model(spec).ok())
         .filter(|candidate| model_policy.allows(&candidate.spec()))
+        .filter(|candidate| smol::block_on(is_configured(providers, storage, &candidate.provider)))
         .unwrap_or(startup)
 }
 
@@ -2134,7 +2147,8 @@ mod tests {
             meta: SessionMeta::default(),
         };
         let resolved = startup_model(
-            &maki_providers::test_util::offline_ids(&["anthropic", "openai"]),
+            &maki_providers::test_util::configured_ids(&["anthropic", "openai"]),
+            &StateDir::from_path(PathBuf::from("/tmp")),
             Model::from_spec(STARTUP_MODEL).unwrap(),
             &restored,
             explicit_model,
@@ -2142,6 +2156,26 @@ mod tests {
         );
 
         assert_eq!(resolved.spec(), expected);
+    }
+
+    #[test]
+    fn sdk_startup_model_without_credentials_falls_back_to_startup() {
+        let restored = ResolvedSession {
+            id: None,
+            history: Default::default(),
+            model: Some(RESTORED_MODEL.into()),
+            meta: SessionMeta::default(),
+        };
+        let resolved = startup_model(
+            &maki_providers::test_util::offline_ids(&["anthropic", "openai"]),
+            &StateDir::from_path(PathBuf::from("/tmp")),
+            Model::from_spec(STARTUP_MODEL).unwrap(),
+            &restored,
+            false,
+            &ModelPolicy::default(),
+        );
+
+        assert_eq!(resolved.spec(), STARTUP_MODEL);
     }
 
     struct OutcomeBehavior(CommandOutcome);
