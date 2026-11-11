@@ -19,24 +19,17 @@ pub const ATTACH_METHOD: &str = "maki/attach";
 /// Client to server: the sessions this process can be watched, with how many
 /// watchers each has.
 pub const LIVE_METHOD: &str = "maki/live";
-/// Client to server: make this connection the one that can act on the session.
-/// Refused while the session is busy.
+/// Client to server: an older client asking to drive the session. Every
+/// connection may act on it, so the answer is always yes.
 pub const TAKE_CONTROL_METHOD: &str = "maki/take_control";
-/// Server to client: this connection gained or lost control.
-pub const CONTROL_METHOD: &str = "maki/ui/control";
-/// Server to client: the session started or finished a turn, so a watcher knows
+/// Server to client: the session started or finished a turn, so a window knows
 /// whether its Stop button would do anything.
 pub const TURN_METHOD: &str = "maki/ui/turn";
-/// Answers a session-scoped request from a connection that only watches.
-pub const READ_ONLY_CODE: i32 = -32010;
-pub const READ_ONLY_MESSAGE: &str = "this connection is read-only";
 
 /// Answers `session/new` or `session/load` while another connection already
 /// owns the process's session.
 pub const BUSY_CODE: i32 = -32011;
 pub const BUSY_MESSAGE: &str = "this listener already serves a session; attach to it instead";
-pub const BUSY_CONTROL_CODE: i32 = -32012;
-pub const BUSY_CONTROL_MESSAGE: &str = "the session is busy; take control once it is idle";
 
 const SESSION_UPDATE: &str = "session/update";
 const CONFIG_OPTION_UPDATE: &str = "config_option_update";
@@ -171,10 +164,12 @@ pub struct SessionTap {
     /// Reads the session's own idea of that, so a turn that ends inside another
     /// task still moves the flag.
     busy_probe: Mutex<Option<BusyProbe>>,
-    controller: Mutex<Option<Sender<Value>>>,
-    /// The connection the session belongs to. It keeps showing the session
-    /// after another window takes control, so it still hears about turns.
+    /// The connection the session belongs to. It shows the session whether or
+    /// not it is the one acting, so it hears about turns and resets.
     owner: Mutex<Option<Sender<Value>>>,
+    /// The connection that asked for the turn in flight, whose window answers
+    /// what the session asks: permission questions, pickers, completions.
+    asker: Mutex<Option<Sender<Value>>>,
     /// The session's config options, so an attach can paint its status bar
     /// without asking the owning loop.
     info: Mutex<Option<Value>>,
@@ -187,8 +182,8 @@ impl Default for SessionTap {
             state: Mutex::default(),
             busy: AtomicBool::new(false),
             busy_probe: Mutex::default(),
-            controller: Mutex::default(),
             owner: Mutex::default(),
+            asker: Mutex::default(),
             info: Mutex::default(),
             inbound: flume::unbounded(),
         }
@@ -274,37 +269,28 @@ impl SessionTap {
         self.info.lock().unwrap().clone()
     }
 
-    pub fn set_controller(&self, controller: Sender<Value>) {
-        *self.controller.lock().unwrap() = Some(controller);
-    }
-
     pub fn set_owner(&self, owner: Sender<Value>) {
         *self.owner.lock().unwrap() = Some(owner);
     }
 
-    pub fn clear_controller(&self) {
-        *self.controller.lock().unwrap() = None;
+    pub fn set_asker(&self, asker: Sender<Value>) {
+        *self.asker.lock().unwrap() = Some(asker);
     }
 
-    pub fn controller(&self) -> Option<Sender<Value>> {
-        self.controller.lock().unwrap().clone()
-    }
-
-    pub fn controller_is(&self, sender: &Sender<Value>) -> bool {
-        self.controller
+    /// Where this session's questions go: the connection that asked for the
+    /// turn in flight, or the one that owns the session when nobody did.
+    pub fn asker(&self) -> Option<Sender<Value>> {
+        self.asker
             .lock()
             .unwrap()
-            .as_ref()
-            .is_some_and(|controller| controller.same_channel(sender))
+            .clone()
+            .or_else(|| self.owner.lock().unwrap().clone())
     }
 
-    /// Sends {message} to the owner, the controller and every watcher, without
-    /// recording it: control changes are not part of the transcript.
+    /// Sends {message} to the owner and every watcher, without recording it:
+    /// these are about the session, not part of its transcript.
     pub fn announce(&self, message: Value) {
         let mut targets: Vec<Sender<Value>> = self.state.lock().unwrap().subscribers.to_vec();
-        if let Some(controller) = self.controller() {
-            targets.push(controller);
-        }
         if let Some(owner) = self.owner.lock().unwrap().clone()
             && !targets
                 .iter()
@@ -505,18 +491,14 @@ mod tests {
     }
 
     #[test]
-    fn only_the_controller_may_act() {
+    fn questions_go_to_the_asker_and_to_the_owner_without_one() {
         let tap = SessionTap::default();
         let (owner, _owner_rx) = flume::unbounded();
         let (phone, _phone_rx) = flume::unbounded();
-        assert!(!tap.controller_is(&owner));
-        tap.set_controller(owner.clone());
-        assert!(tap.controller_is(&owner));
-        assert!(!tap.controller_is(&phone));
-        tap.set_controller(phone.clone());
-        assert!(tap.controller_is(&phone));
-        tap.clear_controller();
-        assert!(!tap.controller_is(&phone));
+        tap.set_owner(owner.clone());
+        assert!(tap.asker().unwrap().same_channel(&owner));
+        tap.set_asker(phone.clone());
+        assert!(tap.asker().unwrap().same_channel(&phone));
     }
 
     #[test]
@@ -531,25 +513,24 @@ mod tests {
     }
 
     #[test]
-    fn control_changes_reach_the_controller_and_watchers() {
+    fn announcements_reach_the_owner_and_watchers() {
         let tap = SessionTap::default();
-        let (controller, controller_rx) = flume::unbounded();
+        let (owner, owner_rx) = flume::unbounded();
         let (watcher, watcher_rx) = flume::unbounded();
-        tap.set_controller(controller);
+        tap.set_owner(owner);
         tap.subscribe(watcher);
-        tap.announce(json!({ "method": CONTROL_METHOD }));
-        assert_eq!(controller_rx.recv().unwrap()["method"], CONTROL_METHOD);
-        assert_eq!(watcher_rx.recv().unwrap()["method"], CONTROL_METHOD);
+        tap.announce(json!({ "method": REWOUND_METHOD }));
+        assert_eq!(owner_rx.recv().unwrap()["method"], REWOUND_METHOD);
+        assert_eq!(watcher_rx.recv().unwrap()["method"], REWOUND_METHOD);
     }
 
     #[test]
-    fn the_owner_hears_about_turns_after_it_loses_control() {
+    fn a_turn_reaches_the_owner_and_every_watcher() {
         let tap = SessionTap::default();
         let (owner, owner_rx) = flume::unbounded();
         let (phone, phone_rx) = flume::unbounded();
-        tap.set_owner(owner.clone());
-        tap.set_controller(owner);
-        tap.set_controller(phone);
+        tap.set_owner(owner);
+        tap.subscribe(phone);
 
         tap.set_busy(true);
 
@@ -558,11 +539,11 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_is_not_told_twice_while_it_still_controls_the_session() {
+    fn an_owner_that_also_watches_is_told_once() {
         let tap = SessionTap::default();
         let (owner, owner_rx) = flume::unbounded();
         tap.set_owner(owner.clone());
-        tap.set_controller(owner);
+        tap.subscribe(owner);
 
         tap.set_busy(true);
 
@@ -577,7 +558,6 @@ mod tests {
         let (watcher, watcher_rx) = flume::unbounded();
         let (owner, owner_rx) = flume::unbounded();
         tap.set_owner(owner);
-        tap.set_controller(asker.clone());
         tap.subscribe(watcher);
 
         tap.publish_elsewhere(&update("s1", "one"), &asker);

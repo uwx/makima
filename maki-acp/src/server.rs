@@ -79,16 +79,6 @@ const ROOT_CONFIG_UNAVAILABLE: &str = "session root configuration is unavailable
 const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const COMMAND_PREFIX: char = '/';
 const SESSIONS_METHOD: &str = "maki/sessions";
-/// Session-scoped methods a watching connection cannot call. Everything
-/// else, including `initialize`, themes and completion, stays available.
-const WRITE_METHODS: [&str; 6] = [
-    "session/prompt",
-    "session/new",
-    "session/load",
-    "session/set_mode",
-    "session/set_config_option",
-    REWIND_METHOD,
-];
 /// Client to server: list the user turns a rewind can return to, or rewind to
 /// the one whose `offset` is in the params.
 const REWIND_METHOD: &str = "maki/rewind";
@@ -398,15 +388,6 @@ impl Server {
         self.taps.get(&id)
     }
 
-    /// Whether this connection is the one allowed to act on the session it owns
-    /// or watches.
-    fn controls_session(&self) -> bool {
-        match self.attached.clone().or_else(|| self.session_tap()) {
-            // A tap nobody registered a controller for has nothing to arbitrate.
-            Some(tap) => tap.controller().is_none() || tap.controller_is(&self.wire),
-            None => true,
-        }
-    }
 }
 
 /// The first line of a TCP connection: `{"maki":"lan","version":1,"token":"..."}`.
@@ -640,11 +621,11 @@ async fn serve_connection(
         async move {
             while let Ok(msg) = out_rx.recv_async().await {
                 taps.observe(&msg);
-                // Answers and server requests belong to whoever controls the
-                // session, which need not be the connection that owns it.
+                // Answers and questions belong to the window that asked for
+                // what is running, which need not be the one that owns it.
                 if msg.get("id").is_some()
-                    && let Some(controller) = own_tap.controller()
-                    && controller.send(msg.clone()).is_ok()
+                    && let Some(asker) = own_tap.asker()
+                    && asker.send(msg.clone()).is_ok()
                 {
                     continue;
                 }
@@ -836,53 +817,14 @@ fn handled_locally(raw: &Value) -> bool {
     )
 }
 
-/// Passes {raw} to the owning loop when this connection holds control, which
-/// includes `maki/take_control` while it does not.
+/// Passes {raw} to the owning loop when this connection does not answer it
+/// itself. The loop that owns the session is the only one that may act on it,
+/// so every other connection's request lands there in the order it arrived.
 fn forward_to_owner(srv: &Server, tap: &SessionTap, raw: &Value) -> bool {
-    let takes_control =
-        raw.get("method").and_then(Value::as_str) == Some(attach::TAKE_CONTROL_METHOD);
-    if !takes_control && (handled_locally(raw) || !tap.controller_is(&srv.wire)) {
+    if handled_locally(raw) {
         return false;
     }
     tap.forward(raw.clone(), srv.wire.clone())
-}
-
-/// Makes the asking connection the one that may act. Only an idle session can
-/// change hands, so no permission request or turn is left without its client.
-fn take_control(srv: &mut Server) -> Result<Value, AcpError> {
-    let pending = srv
-        .session
-        .as_ref()
-        .map(|session| session.pending.lock().unwrap());
-    let idle = srv.dispatch.is_none()
-        && pending.as_ref().is_some_and(|pending| {
-            pending.operation.is_none()
-                && pending.permissions.is_empty()
-                && pending.elicitation.is_none()
-        });
-    drop(pending);
-    if !idle {
-        return Err(AcpError::new(
-            attach::BUSY_CONTROL_CODE,
-            attach::BUSY_CONTROL_MESSAGE,
-        ));
-    }
-    let tap = srv
-        .session_tap()
-        .ok_or_else(|| AcpError::new(attach::BUSY_CONTROL_CODE, "no session to control"))?;
-    let target = srv.reply().clone();
-    let previous = tap.controller();
-    tap.set_controller(target.clone());
-    if let Some(previous) = previous
-        && !previous.same_channel(&target)
-    {
-        let _ = previous.send(json!({
-            "jsonrpc": "2.0",
-            "method": attach::CONTROL_METHOD,
-            "params": { "controller": false },
-        }));
-    }
-    Ok(json!({ "controller": true }))
 }
 
 /// Listens for other machines, so they can watch a session that is already
@@ -983,7 +925,9 @@ fn attach_session(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
     srv.attached = Some(tap);
     Ok(json!({
         "sessionId": id,
-        "readOnly": true,
+        // Every connection may now drive the session; the field stays for
+        // clients that still read it.
+        "readOnly": false,
         "replayed": replayed,
         "truncated": truncated,
         "busy": busy,
@@ -999,18 +943,10 @@ async fn handle_request(
     host: &mut Host,
 ) {
     let params = &host.params;
-    // Forwarded requests only arrive from the connection that holds control,
-    // so only this connection's own client is checked against it.
-    let writes_session = (srv.attached.is_some() || srv.session.is_some()) && srv.origin.is_none();
-    if writes_session && WRITE_METHODS.contains(&method) && !srv.controls_session() {
-        srv.respond(
-            id,
-            Err(AcpError::new(
-                attach::READ_ONLY_CODE,
-                attach::READ_ONLY_MESSAGE,
-            )),
-        );
-        return;
+    // Whatever the session asks while it answers this request goes back to the
+    // window that sent it, not to whichever one happens to own the session.
+    if let Some(tap) = srv.session_tap() {
+        tap.set_asker(srv.reply().clone());
     }
     let result = match method {
         "initialize" => {
@@ -1043,9 +979,13 @@ async fn handle_request(
             );
             return;
         }
+        // Older clients ask before acting; every connection may act now, so
+        // the answer is yes and the client stops asking.
         attach::TAKE_CONTROL_METHOD => {
-            let result = take_control(srv);
-            send(srv.reply(), Response::new(id, result));
+            send(
+                srv.reply(),
+                Response::new(id, Ok::<Value, AcpError>(json!({ "controller": true }))),
+            );
             return;
         }
         share::SHARE_METHOD => {
@@ -1212,7 +1152,6 @@ async fn new_session(
         return Err(AcpError::new(attach::BUSY_CODE, attach::BUSY_MESSAGE));
     }
     srv.taps.register(&session_id, Arc::clone(&srv.own_tap));
-    srv.own_tap.set_controller(srv.wire.clone());
     srv.own_tap.set_owner(srv.wire.clone());
     let spec = params.model.spec();
     let persisted_options = Default::default();
@@ -1283,7 +1222,6 @@ async fn load_session(
         return Err(AcpError::new(attach::BUSY_CODE, attach::BUSY_MESSAGE));
     }
     srv.taps.register(&sid.0, Arc::clone(&srv.own_tap));
-    srv.own_tap.set_controller(srv.wire.clone());
     srv.own_tap.set_owner(srv.wire.clone());
     let home = maki_storage::paths::home();
     // A session imported from another tool can name a provider this machine
@@ -1563,7 +1501,6 @@ async fn close_session(srv: &mut Server) {
     let session_id = state.handle.session_id.to_string();
     srv.taps.remove(&session_id);
     srv.taps.release(&session_id);
-    srv.own_tap.clear_controller();
     srv.lua_event_handle.clear_orchestration_services();
     // The event pump dies with the session, so the requests it owed answers to
     // have to be answered here or the client waits on them forever.
