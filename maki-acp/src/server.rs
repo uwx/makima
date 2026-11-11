@@ -1324,6 +1324,12 @@ async fn load_session(
     for update in translate::replay_history(&replay_history, Some(&session_cwd), home.as_deref()) {
         session_update(&srv.out_tx, &sid, update);
     }
+    // A window that loaded the session runs its own agent over this connection
+    // and draws from the history it keeps, not from the replay above, so it
+    // needs the transcript the way an attach gets it.
+    if let Some(tap) = srv.session_tap() {
+        tap.send_history(&srv.out_tx);
+    }
     let mode = committed_mode(srv).await?;
     let resp = methods::load_session_response(&mode, &srv.lua_event_handle.mode_registry())
         .config_options(methods::session_config_options(
@@ -8609,6 +8615,65 @@ mod tests {
             serde_json::to_value(history.history.messages.as_ref()).unwrap(),
             serde_json::to_value(&messages).unwrap()
         );
+    }
+
+    /// A window that loaded the session runs its own agent over this
+    /// connection and draws from the history it keeps, so the load hands it
+    /// the whole committed transcript, the way an attach does.
+    #[test]
+    fn load_hands_the_window_the_committed_history() {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            maki_storage::paths::init_shared_for_test();
+            let message = "back again";
+            let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+                Session::new(FAST_SPEC, &tmp.path().to_string_lossy());
+            session.replace_messages(vec![Message::user(message.into())]);
+            let storage = StateDir::from_path(tmp.path().to_path_buf());
+            session.save(&storage).unwrap();
+            let providers = spec_providers();
+            let mut params = test_params(
+                providers.model(FAST_SPEC).unwrap(),
+                tmp.path().to_path_buf(),
+            );
+            params.providers = providers;
+            let (out_tx, out_rx) = flume::unbounded();
+            let mut srv = Server {
+                wire: out_tx.clone(),
+                out_tx,
+                taps: Arc::default(),
+                attached: None,
+                own_tap: Arc::default(),
+                origin: None,
+                catalog: ModelCatalog::default(),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: params.lua_event_handle.clone(),
+                ui: Default::default(),
+                dispatch: None,
+            };
+            let raw = serde_json::json!({
+                "params": {
+                    "sessionId": session.id.to_string(),
+                    "cwd": tmp.path(),
+                    "mcpServers": []
+                }
+            });
+
+            load_session(&mut srv, &raw, &params).await.unwrap();
+
+            let committed = std::iter::from_fn(|| out_rx.try_recv().ok())
+                .find(|message| message["method"] == attach::COMMITTED_METHOD)
+                .expect("the window that loaded the session gets its history");
+            assert_eq!(committed["params"]["replace"], json!(true));
+            assert!(
+                committed["params"]["messages"]
+                    .to_string()
+                    .contains(message)
+            );
+            close_session(&mut srv).await;
+        });
     }
 
     #[test]

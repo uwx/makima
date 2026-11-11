@@ -33,8 +33,7 @@ const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous 
 const PIPED_INPUT_SEPARATOR: &str = "\n\n";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 const PICKER_NEEDS_TUI_ERR: &str = "continuing without a session ID opens the session picker, which needs the TUI; run `makima sessions --json` to list session IDs";
-const SHARED_RESUME_UNSUPPORTED: &str =
-    "--share starts a new session where it runs; resuming one there is not supported yet";
+const SHARED_PICKER_UNSUPPORTED: &str = "picking a session for --share is not supported yet; pass its id, like `makima --share ADDR -c <ID>`";
 
 /// A project `.env` is loaded exactly once, when a folder that was not trusted
 /// becomes trusted. Every other rebuild must leave the process env alone.
@@ -279,36 +278,55 @@ fn resolve_session(
     cwd: &str,
     storage: &StateDir,
 ) -> Result<AppSession> {
+    match load_resumed(last_session, session_id, cwd, storage)? {
+        Some(session) => Ok(session),
+        None => Ok(AppSession::new(model, cwd)),
+    }
+}
+
+/// The session this run continues, or nothing when it starts a new one.
+fn load_resumed(
+    last_session: bool,
+    session_id: Option<&str>,
+    cwd: &str,
+    storage: &StateDir,
+) -> Result<Option<AppSession>> {
     let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
     if let Some(raw) = session_id {
         let id: MakiId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
         let session = AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
-        let locked = session_lock::open_elsewhere(&sessions_dir, &session.id);
-        if let Some(block) = session_lock::resume_block(&session.cwd, cwd, locked) {
-            return Err(color_eyre::eyre::eyre!("session {id}: {block}"));
-        }
-        return Ok(session);
+        check_resumable(&sessions_dir, &session, cwd)?;
+        return Ok(Some(session));
     }
-    if last_session {
-        match AppSession::latest(cwd, storage) {
-            Ok(Some(session)) => {
-                let locked = session_lock::open_elsewhere(&sessions_dir, &session.id);
-                if let Some(block) = session_lock::resume_block(&session.cwd, cwd, locked) {
-                    return Err(color_eyre::eyre::eyre!("session {}: {block}", session.id));
-                }
-                return Ok(session);
-            }
-            Ok(None) => {
-                tracing::info!("no previous session found for this directory, starting new");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to load latest session, starting new");
-            }
+    if !last_session {
+        return Ok(None);
+    }
+    match AppSession::latest(cwd, storage) {
+        Ok(Some(session)) => {
+            check_resumable(&sessions_dir, &session, cwd)?;
+            Ok(Some(session))
+        }
+        Ok(None) => {
+            tracing::info!("no previous session found for this directory, starting new");
+            Ok(None)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load latest session, starting new");
+            Ok(None)
         }
     }
-    Ok(AppSession::new(model, cwd))
+}
+
+/// Refuses a session this run cannot continue: one stored under another
+/// directory, or open in another terminal.
+fn check_resumable(sessions_dir: &Path, session: &AppSession, cwd: &str) -> Result<()> {
+    let locked = session_lock::open_elsewhere(sessions_dir, &session.id);
+    match session_lock::resume_block(&session.cwd, cwd, locked) {
+        Some(block) => Err(color_eyre::eyre::eyre!("session {}: {block}", session.id)),
+        None => Ok(()),
+    }
 }
 
 /// Piped stdin follows the `--prompt` text, or stands alone without it.
@@ -361,6 +379,7 @@ fn hosted_session(
     address: SocketAddr,
     token: Option<String>,
     model: Option<String>,
+    resume: Option<String>,
 ) -> Result<RemoteSession> {
     let program = std::env::current_exe().context("find this program")?;
     let mut extra = vec!["--share".to_owned(), address.to_string()];
@@ -372,7 +391,11 @@ fn hosted_session(
         extra.push("--model".to_owned());
         extra.push(model);
     }
-    let target = Target::local_with(cwd.to_path_buf(), &program.to_string_lossy(), extra).quiet();
+    let mut target =
+        Target::local_with(cwd.to_path_buf(), &program.to_string_lossy(), extra).quiet();
+    if let Some(id) = resume {
+        target = target.resuming(id);
+    }
     let connection = maki_acp_client::connect(&target).map_err(|error| eyre!(error))?;
     Ok(RemoteSession {
         connection,
@@ -380,26 +403,39 @@ fn hosted_session(
     })
 }
 
+/// The session `--share` opens where its agent runs, or nothing to start a
+/// fresh one there. Resolving it here means a session that cannot be continued
+/// fails before a window opens instead of inside the agent.
+fn hosted_resume(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Option<String>> {
+    let id = cli
+        .continue_session
+        .as_ref()
+        .and_then(|given| given.as_deref());
+    Ok(load_resumed(cli.last_session, id, cwd, storage)?.map(|session| session.id.to_string()))
+}
+
 pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession>) -> Result<()> {
     if cli.print && session_picker_requested(&cli) {
         bail!(PICKER_NEEDS_TUI_ERR);
     }
-    if cli.share.is_some() && (cli.last_session || cli.continue_session.is_some()) {
-        bail!(SHARED_RESUME_UNSUPPORTED);
+    if cli.share.is_some() && session_picker_requested(&cli) {
+        bail!(SHARED_PICKER_UNSUPPORTED);
     }
+    let explicit_model = cli.model.is_some();
+    let mut apply_explicit_model = explicit_model;
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    maki_providers::model_registry::load_from_storage(&storage);
     if let (Some(address), None) = (cli.share, remote.as_ref()) {
+        let resume = hosted_resume(&cli, &cwd.to_string_lossy(), &storage)?;
         remote = Some(hosted_session(
             &cwd,
             address,
             cli.share_token.clone(),
             cli.model.clone(),
+            resume,
         )?);
     }
     let attached = remote.is_some();
-    let explicit_model = cli.model.is_some();
-    let mut apply_explicit_model = explicit_model;
-    let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load_from_storage(&storage);
     let _instance = (!cli.print)
         .then(|| {
             maki_storage::instances::InstanceGuard::register(
@@ -422,11 +458,12 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
 
     let can_ask =
         !cli.print && !cli.is_sdk_mode() && io::stdin().is_terminal() && io::stderr().is_terminal();
-    let mut notice = remote.as_ref().map(|remote| {
-        format!(
-            "attached to {} (its earlier messages stay on the machine that runs it)",
+    let mut notice = remote.as_ref().map(|remote| match cli.share {
+        Some(_) => format!(
+            "{}; other machines can attach to this session",
             remote.label
-        )
+        ),
+        None => format!("attached to {}", remote.label),
     });
     let answer = trust.state.unanswered().and_then(|question| {
         policy_grant(question, &stack.config.trust)
@@ -961,6 +998,96 @@ mod tests {
         let err = resolve_session(last, id_arg.as_deref(), "test-model", THIS_CWD, &storage)
             .expect_err("a session locked by another instance must be rejected");
         assert!(err.to_string().contains(session_lock::OPEN_ELSEWHERE_MSG));
+    }
+
+    /// Parses the flags of a window that shares this machine.
+    fn sharing(args: &[&str]) -> Cli {
+        use clap::Parser;
+
+        let mut argv = vec!["makima", "--share", "127.0.0.1:7331"];
+        argv.extend_from_slice(args);
+        Cli::parse_from(argv)
+    }
+
+    #[test]
+    fn a_shared_window_resumes_the_session_it_names() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session = AppSession::new("test-model", THIS_CWD);
+        session.save(&storage).unwrap();
+        let cli = sharing(&["-c", &session.id.to_string()]);
+
+        assert_eq!(
+            hosted_resume(&cli, THIS_CWD, &storage).unwrap(),
+            Some(session.id.to_string())
+        );
+    }
+
+    #[test]
+    fn a_shared_window_continues_the_latest_session_of_its_directory() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session = AppSession::new("test-model", THIS_CWD);
+        session.save(&storage).unwrap();
+
+        assert_eq!(
+            hosted_resume(&sharing(&["-l"]), THIS_CWD, &storage).unwrap(),
+            Some(session.id.to_string())
+        );
+    }
+
+    #[test]
+    fn a_shared_window_with_nothing_to_continue_starts_a_fresh_session() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+
+        assert_eq!(
+            hosted_resume(&sharing(&["-l"]), THIS_CWD, &storage).unwrap(),
+            None
+        );
+        assert_eq!(
+            hosted_resume(&sharing(&[]), THIS_CWD, &storage).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_shared_window_refuses_a_session_open_elsewhere() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session = AppSession::new("test-model", THIS_CWD);
+        session.save(&storage).unwrap();
+        let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
+        fs::write(
+            session_lock::lock_path(&sessions_dir, &session.id),
+            FAKE_PID.to_string(),
+        )
+        .unwrap();
+
+        let err = hosted_resume(&sharing(&["-l"]), THIS_CWD, &storage)
+            .expect_err("the agent cannot take a session another terminal holds");
+        assert!(err.to_string().contains(session_lock::OPEN_ELSEWHERE_MSG));
+    }
+
+    #[test]
+    fn sharing_with_the_session_picker_asks_for_the_id_instead() {
+        use clap::Parser;
+
+        let err = run(
+            Cli::parse_from(["makima", "--share", "127.0.0.1:7331", "-c"]),
+            PathBuf::from(THIS_CWD),
+            None,
+        )
+        .expect_err("the picker needs a window that runs the session");
+        assert!(err.to_string().contains(SHARED_PICKER_UNSUPPORTED));
     }
 
     #[test]

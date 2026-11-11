@@ -343,6 +343,8 @@ pub struct Target {
     lan: Option<Lan>,
     /// Whether the session must already exist there, as a copied link implies.
     attach_only: bool,
+    /// A session the agent should open instead of starting a new one.
+    resume: Option<String>,
     /// Whether the agent's stderr is dropped instead of shared with us, for a
     /// frontend that owns the terminal.
     quiet: bool,
@@ -416,8 +418,15 @@ impl Target {
             session_cwd: cwd,
             lan: None,
             attach_only: false,
+            resume: None,
             quiet: false,
         }
+    }
+
+    /// Opens {id} on the agent instead of starting a new session.
+    pub fn resuming(mut self, id: impl Into<String>) -> Self {
+        self.resume = Some(id.into());
+        self
     }
 
     /// Keeps the agent's stderr out of ours, for a frontend drawing the terminal.
@@ -457,6 +466,7 @@ impl Target {
             args: Vec::new(),
             process_cwd: None,
             attach_only,
+            resume: None,
             quiet: false,
             session_cwd: path,
             lan: Some(Lan {
@@ -491,6 +501,7 @@ impl Target {
             session_cwd: path,
             lan: None,
             attach_only: false,
+            resume: None,
             quiet: false,
         })
     }
@@ -571,6 +582,7 @@ pub fn connect(target: &Target) -> Result<Connection, String> {
         target.session_cwd(),
         target.shares_a_session(),
         target.attach_only(),
+        target.resume.as_deref(),
         target.label(),
     )
 }
@@ -584,7 +596,7 @@ pub fn connect_streams(
     cwd: &Path,
 ) -> Result<Connection, String> {
     let (client, events) = spawn_agent(reader, writer, None, None)?;
-    open_session(client, events, cwd, false, false, "streams")
+    open_session(client, events, cwd, false, false, None, "streams")
 }
 
 fn spawn_agent(
@@ -628,9 +640,21 @@ fn open_session(
     cwd: &Path,
     shares_a_session: bool,
     attach_only: bool,
+    resume: Option<&str>,
     label: &str,
 ) -> Result<Connection, String> {
     let themes = client.initialize()?;
+    if let Some(id) = resume {
+        let loaded = client.load_session(id, cwd)?;
+        return Ok(Connection {
+            client,
+            events,
+            session: loaded.session,
+            model: loaded.model,
+            options: loaded.options,
+            themes,
+        });
+    }
     let live = if shares_a_session {
         client.live_sessions()?.into_iter().next()
     } else {
@@ -1710,6 +1734,44 @@ old
             server.join().unwrap(),
             ["initialize", "maki/live", "maki/attach"]
         );
+    }
+
+    #[test]
+    fn resuming_loads_the_named_session_instead_of_starting_one() {
+        use agent_client_protocol_schema::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        };
+
+        let model = SessionConfigOption::select(
+            "model".to_owned(),
+            "Model".to_owned(),
+            "openai/gpt-5".to_owned(),
+            vec![SessionConfigSelectOption::new(
+                "openai/gpt-5".to_owned(),
+                "openai/gpt-5".to_owned(),
+            )],
+        )
+        .category(SessionConfigOptionCategory::Model);
+
+        let (address, server) = fake_agent(2, move |method, request| match method {
+            "initialize" => initialized(method),
+            "session/load" => {
+                assert_eq!(request["params"]["sessionId"], "sess-old");
+                assert_eq!(request["params"]["cwd"], "/srv/app");
+                Some(serde_json::json!({
+                    "configOptions": serde_json::to_value(vec![model.clone()]).unwrap(),
+                }))
+            }
+            _ => None,
+        });
+        let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token"))
+            .unwrap()
+            .resuming("sess-old");
+        let connection = super::connect(&target).unwrap();
+        assert_eq!(&*connection.session.0, "sess-old");
+        assert_eq!(connection.model, "openai/gpt-5");
+        drop(connection);
+        assert_eq!(server.join().unwrap(), ["initialize", "session/load"]);
     }
 
     /// One LAN life: consume the handshake and keep the reader for the rest.
