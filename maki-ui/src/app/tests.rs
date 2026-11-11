@@ -862,11 +862,18 @@ fn assert_last_is_post(chat: &Chat) {
     );
 }
 
+const MIRROR_PROMPT: &str = "why does it hang";
 const MIRROR_TEXT: &str = "answered from the other window";
 
 #[test]
 fn rows_another_window_streamed_are_painted_and_never_recorded() {
     let mut app = test_app();
+    app.update(agent_msg_with_run_id(
+        AgentEvent::MirroredPrompt {
+            text: MIRROR_PROMPT.into(),
+        },
+        MIRROR_PRESENTATION,
+    ));
     app.update(agent_msg_with_run_id(
         AgentEvent::TextDelta {
             text: MIRROR_TEXT.into(),
@@ -875,8 +882,10 @@ fn rows_another_window_streamed_are_painted_and_never_recorded() {
     ));
     app.update(agent_msg_with_run_id(done(), MIRROR_PRESENTATION));
 
+    let screen = rendered(&mut app);
+    assert!(screen.contains(MIRROR_PROMPT), "the question shows: {screen}");
+    assert!(screen.contains(MIRROR_TEXT), "the answer shows: {screen}");
     assert_eq!(app.status, Status::Idle);
-    assert_eq!(app.chats[0].last_message_text(), MIRROR_TEXT);
     assert!(app.state.session.messages().is_empty());
 }
 

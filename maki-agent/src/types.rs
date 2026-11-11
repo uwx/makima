@@ -857,6 +857,11 @@ pub enum AgentEvent {
     TextDelta {
         text: String,
     },
+    /// A prompt another window sent to a session both show, so this window's
+    /// transcript reads like the one that typed it.
+    MirroredPrompt {
+        text: String,
+    },
     ThinkingDelta {
         text: String,
     },

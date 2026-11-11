@@ -11,7 +11,7 @@ use std::time::Duration;
 use agent_client_protocol_schema::{
     AgentNotification, AgentRequest, AgentResponse, AvailableCommand, AvailableCommandInput,
     AvailableCommandsUpdate, ConfigOptionUpdate, ContentBlock, CreateElicitationResponse,
-    CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
+    ContentChunk, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
     InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer, NewSessionRequest,
     Notification, PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
     RequestPermissionResponse, Response, SessionConfigOptionValue, SessionId, SessionModeId,
@@ -2268,11 +2268,13 @@ fn validate_session<'a>(srv: &'a Server, requested: &str) -> Result<&'a SessionS
 /// once it resolves.
 fn start_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
-    let session = validate_session(srv, req.session_id.0.as_ref())?;
     let content = extract_prompt_content(&req.prompt)?;
     if srv.dispatch.is_some() {
         return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
     }
+    // Only a prompt that will run is shown to the other windows.
+    echo_prompt(srv, &req.session_id, &content);
+    let session = validate_session(srv, req.session_id.0.as_ref())?;
     let mut pending = session.pending.lock().unwrap();
     let operation_id = (!pending.admits_prompt()?).then(|| {
         let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
@@ -3392,6 +3394,33 @@ fn send_with_pending_tool_status(out_tx: &Sender<Value>, msg: impl Serialize, po
         }
         let _ = out_tx.send(json);
     }
+}
+
+/// Shows the question to the windows that did not ask it, so every window on
+/// a shared session reads as one transcript and not as answers to nothing.
+fn echo_prompt(srv: &Server, sid: &SessionId, content: &CommandContent) {
+    let Some(session) = &srv.session else {
+        return;
+    };
+    if session.handle.session_id.to_string() != sid.0.as_ref() || content.text.is_empty() {
+        return;
+    }
+    let Some(tap) = srv.session_tap() else {
+        return;
+    };
+    let Ok(update) = serde_json::to_value(SessionUpdate::UserMessageChunk(ContentChunk::new(
+        ContentBlock::Text(TextContent::new(content.text.to_string())),
+    ))) else {
+        return;
+    };
+    tap.publish_elsewhere(
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": { "sessionId": sid, "update": update },
+        }),
+        srv.reply(),
+    );
 }
 
 fn session_update(out_tx: &Sender<Value>, sid: &SessionId, update: SessionUpdate) {

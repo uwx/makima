@@ -508,6 +508,12 @@ impl Translator {
                         .try_send(AgentEvent::TextDelta { text: text.text });
                 }
             }
+            SessionUpdate::UserMessageChunk(chunk) => {
+                if let ContentBlock::Text(text) = chunk.content {
+                    self.sender
+                        .try_send(AgentEvent::MirroredPrompt { text: text.text });
+                }
+            }
             SessionUpdate::AgentThoughtChunk(chunk) => {
                 if let ContentBlock::Text(text) = chunk.content {
                     self.sender
@@ -736,6 +742,20 @@ mod tests {
         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
             text,
         ))))
+    }
+
+    #[test]
+    fn a_prompt_another_window_sent_becomes_a_user_bubble() {
+        let (mut translator, rx) = translator();
+
+        translator.update(SessionUpdate::UserMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new("why does it hang")),
+        )));
+
+        match drain(&rx).as_slice() {
+            [AgentEvent::MirroredPrompt { text }] => assert_eq!(text, "why does it hang"),
+            other => panic!("unexpected events: {other:?}"),
+        }
     }
 
     #[test]

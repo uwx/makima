@@ -327,13 +327,28 @@ impl SessionTap {
 
     fn publish(&self, message: &Value) {
         let mut state = self.state.lock().unwrap();
-        if state.log.len() == MAX_LOG_UPDATES {
-            state.log.pop_front();
-            state.truncated = true;
-        }
-        state.log.push_back(message.clone());
+        record(&mut state, message);
         for subscriber in &state.subscribers {
             let _ = subscriber.send(message.clone());
+        }
+    }
+
+    /// Records a message and shows it to the owner and every watcher except
+    /// {asker}, which already drew it.
+    pub fn publish_elsewhere(&self, message: &Value, asker: &Sender<Value>) {
+        {
+            let mut state = self.state.lock().unwrap();
+            record(&mut state, message);
+            for subscriber in &state.subscribers {
+                if !subscriber.same_channel(asker) {
+                    let _ = subscriber.send(message.clone());
+                }
+            }
+        }
+        if let Some(owner) = self.owner.lock().unwrap().clone()
+            && !owner.same_channel(asker)
+        {
+            let _ = owner.send(message.clone());
         }
     }
 
@@ -345,6 +360,14 @@ impl SessionTap {
             let _ = subscriber.send(message.clone());
         }
     }
+}
+
+fn record(state: &mut TapState, message: &Value) {
+    if state.log.len() == MAX_LOG_UPDATES {
+        state.log.pop_front();
+        state.truncated = true;
+    }
+    state.log.push_back(message.clone());
 }
 
 #[cfg(test)]
@@ -545,6 +568,26 @@ mod tests {
 
         assert_eq!(owner_rx.recv().unwrap()["params"]["running"], json!(true));
         assert!(owner_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_prompt_is_shown_to_everyone_but_the_one_who_asked() {
+        let tap = SessionTap::default();
+        let (asker, asker_rx) = flume::unbounded();
+        let (watcher, watcher_rx) = flume::unbounded();
+        let (owner, owner_rx) = flume::unbounded();
+        tap.set_owner(owner);
+        tap.set_controller(asker.clone());
+        tap.subscribe(watcher);
+
+        tap.publish_elsewhere(&update("s1", "one"), &asker);
+
+        assert!(asker_rx.try_recv().is_err(), "the asker drew it already");
+        assert!(watcher_rx.try_recv().is_ok());
+        assert!(owner_rx.try_recv().is_ok());
+
+        let (late, _late_rx) = flume::unbounded();
+        assert_eq!(tap.subscribe(late).0, 1, "a later watcher replays it");
     }
 
     #[test]

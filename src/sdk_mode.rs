@@ -1895,6 +1895,7 @@ impl EventPump {
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::MirroredPrompt { .. }
             | AgentEvent::ModelSwitched { .. }
             | AgentEvent::QueueSettled
             | AgentEvent::AutoCompacting { .. }

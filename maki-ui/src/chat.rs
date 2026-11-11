@@ -128,6 +128,7 @@ impl Chat {
                 self.messages_panel.clear_prompt_progress();
                 self.messages_panel.text_delta(&text);
             }
+            AgentEvent::MirroredPrompt { text } => self.show_user_message(text, Vec::new()),
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),
             AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
             AgentEvent::ToolExecutionStart { .. } => {}
