@@ -70,10 +70,10 @@ The window replays the session and then follows it live: streamed text,
 thinking, tool calls and token counts, the same as the machine that runs it. A
 turn another window starts appears here too, under a line saying where it runs.
 
-The composer sends a prompt to the machine that owns the session. Prompting
-takes control of the session when it is idle, so two windows never type into
-the same turn, and a busy session answers with the other window's turn still
-running.
+The composer sends a prompt to the machine that owns the session. Any window
+attached to a session may type into it, and the machine that runs the agent
+takes the prompts one at a time, so the phone, a terminal and a desktop can all
+talk to the same session without stepping on each other.
 
 Typing opens the system keyboard. A plain `NativeActivity` has no input
 connection to the keyboard, so the app asks for the keyboard itself, reads the

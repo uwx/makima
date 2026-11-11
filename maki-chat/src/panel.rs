@@ -62,8 +62,6 @@ const DOUBLE_TAP: Duration = Duration::from_millis(1500);
 const PICK_HINT: &str = "Enter";
 const YOLO_BADGE: &str = "[yolo]";
 const NORMAL_BADGE: &str = "[normal]";
-const READ_ONLY_BADGE: &str = "[read-only]";
-const TAKE_CONTROL_LABEL: &str = "Take control";
 const SHARE_LABEL: &str = "Share";
 const SHARE_STOP_LABEL: &str = "Stop sharing";
 const SHARE_LINK_LABEL: &str = "Copy link";
@@ -78,10 +76,6 @@ const CONNECT_USAGE: &str = "Usage: /connect lan://host:port <token>";
 pub const REMOTE_GROUP: &str = "Remote";
 pub const REMOTE_TOKEN_HINT: &str = "Type the token the sharing window shows, then press Enter";
 pub const DISCOVERY_WAIT: Duration = Duration::from_secs(2);
-const WATCHING_NOTICE: &str = "Watching a shared session; take control to type";
-const READ_ONLY_NOTICE: &str = "This shared session is read-only; take control to type";
-const CONTROL_TAKEN: &str = "You control this shared session";
-const CONTROL_LOST: &str = "Another window took control of this shared session";
 const THINKING_LABEL: &str = "thinking";
 const CLOCK_FORMAT: &str = "%H:%M";
 const THOUSAND: f64 = 1_000.0;
@@ -115,9 +109,6 @@ enum ChatView {
     },
     Tool(ToolCard),
     Notice(SharedString),
-    /// The transcript starts with how to start typing, when the session is
-    /// somebody else's. It goes away once this window takes control.
-    Watching,
 }
 
 struct ToolCard {
@@ -238,8 +229,6 @@ pub struct SessionPanel {
     views: Vec<ChatView>,
     scroll: ScrollHandle,
     busy: bool,
-    /// True while the session belongs to another window.
-    read_only: bool,
     /// Set while this window shares the session with other machines.
     share: Option<ShareInfo>,
     pending: Option<PendingPermission>,
@@ -288,7 +277,6 @@ impl SessionPanel {
             views: Vec::new(),
             scroll: ScrollHandle::new(),
             busy: false,
-            read_only: false,
             share: None,
             pending: None,
             pick: None,
@@ -315,11 +303,7 @@ impl SessionPanel {
         cx: &mut Context<Self>,
     ) {
         match started {
-            Ok(Started {
-                backend,
-                events,
-                read_only,
-            }) => {
+            Ok(Started { backend, events }) => {
                 // A panel that failed once gets a second chance, so the old
                 // error and its transcript must not linger under the replay.
                 self.failed = false;
@@ -327,10 +311,6 @@ impl SessionPanel {
                 self.busy = false;
                 self.pending = None;
                 self.views.clear();
-                self.read_only = read_only;
-                if read_only {
-                    self.views.push(ChatView::Watching);
-                }
                 self.status = session_status(&backend);
                 self.themes = backend.themes.names.clone();
                 self.theme = backend
@@ -402,11 +382,6 @@ impl SessionPanel {
             self.input.update(cx, |state, cx| state.clean(window, cx));
             self.slash = None;
             self.arguments = None;
-            cx.notify();
-            return;
-        }
-        if self.read_only {
-            self.notice(READ_ONLY_NOTICE.to_owned());
             cx.notify();
             return;
         }
@@ -483,16 +458,6 @@ impl SessionPanel {
         cx.notify();
     }
 
-    fn take_control(&mut self, cx: &mut Context<Self>) {
-        let Some(backend) = &self.backend else {
-            return;
-        };
-        if let Err(error) = backend.take_control() {
-            self.notice(error);
-        }
-        cx.notify();
-    }
-
     fn start_share(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = &self.backend else {
             return;
@@ -556,18 +521,6 @@ impl SessionPanel {
                 });
             }
             Event::Flash(text) => self.notice(text),
-            Event::Control(controller) => {
-                self.read_only = !controller;
-                self.views
-                    .retain(|view| !matches!(view, ChatView::Watching));
-                if controller {
-                    self.notice(CONTROL_TAKEN.to_owned());
-                } else {
-                    self.views.push(ChatView::Watching);
-                    self.notice(CONTROL_LOST.to_owned());
-                }
-                cx.notify();
-            }
             Event::Share(result) => {
                 match result {
                     Ok(share) => {
@@ -1420,21 +1373,6 @@ impl SessionPanel {
                 .text_color(cx.theme().muted_foreground)
                 .child(text.clone())
                 .into_any_element(),
-            ChatView::Watching => h_flex()
-                .w_full()
-                .items_center()
-                .gap_3()
-                .flex_wrap()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(WATCHING_NOTICE)
-                .child(
-                    Button::new("take-control-row")
-                        .label(TAKE_CONTROL_LABEL)
-                        .small()
-                        .on_click(cx.listener(|this, _, _, cx| this.take_control(cx))),
-                )
-                .into_any_element(),
         }
     }
 
@@ -1838,11 +1776,10 @@ impl SessionPanel {
         } else {
             NORMAL_BADGE
         };
-        let can_share = !self.read_only
-            && self
-                .backend
-                .as_ref()
-                .is_some_and(|backend| backend.can_share);
+        let can_share = self
+            .backend
+            .as_ref()
+            .is_some_and(|backend| backend.can_share);
 
         h_flex()
             .w_full()
@@ -1860,14 +1797,6 @@ impl SessionPanel {
             .children(thinking.filter(|_| !narrow))
             .when(!context.is_empty(), |this| this.child(context))
             .children(self.status.cost.clone())
-            .when(self.read_only, |this| {
-                this.child(div().text_xs().child(READ_ONLY_BADGE)).child(
-                    Button::new("take-control")
-                        .label(TAKE_CONTROL_LABEL)
-                        .small()
-                        .on_click(cx.listener(|this, _, _, cx| this.take_control(cx))),
-                )
-            })
             .when_some(self.share.clone(), |this, share| {
                 let (link, token) = (share.link.clone(), share.token.clone());
                 this.child(

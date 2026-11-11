@@ -61,7 +61,7 @@ The token comes from `--token`, then `MAKIMA_LAN_TOKEN`, then `lan-token` in the
 makima acp --share 0.0.0.0:7331
 ```
 
-The stdio connection owns the session, and watchers can attach and take control as below. Closing stdio ends the session and the process, and watchers see the connection end. `--share` and `--listen` are mutually exclusive: `--listen` serves TCP only, `--share` adds TCP beside stdio.
+The stdio connection owns the session, and other connections attach to it as below. Closing stdio ends the session and the process, and watchers see the connection end. `--share` and `--listen` are mutually exclusive: `--listen` serves TCP only, `--share` adds TCP beside stdio.
 
 A process serves one session at a time. Closing the connection that owns it ends it, like closing an agent's stdin; until then another connection that asks for a new session is refused with error code `-32011`, and can watch instead.
 
@@ -102,7 +102,7 @@ The announcement follows the listener. It appears when `--listen`, `--share` or 
 
 ### Watching a session
 
-While a connection owns a session, other connections can watch it read only. `maki/live` lists what this process serves:
+While a connection owns a session, other connections can attach to it. `maki/live` lists what this process serves:
 
 ```json
 {"sessions":[{"sessionId":"...","watchers":0}]}
@@ -117,12 +117,12 @@ Then send `maki/attach` with the session id:
 Makima first replays what the session already emitted, as the same `session/update` notifications a client already renders, then streams new ones. The reply follows the replay:
 
 ```json
-{"sessionId":"...","readOnly":true,"replayed":12,"truncated":false,"configOptions":[...]}
+{"sessionId":"...","readOnly":false,"replayed":12,"truncated":false,"configOptions":[...]}
 ```
 
-`replayed` counts the updates sent before the reply, `truncated` says the oldest ones were dropped because the session ran past the recording limit, and `configOptions` is the session's current option list, so a client can paint its status bar without asking. Several connections can watch one session.
+`replayed` counts the updates sent before the reply, `truncated` says the oldest ones were dropped because the session ran past the recording limit, and `configOptions` is the session's current option list, so a client can paint its status bar without asking. Several connections can attach to one session, and any of them may act on it.
 
-A watching connection that does not hold control cannot write: `session/prompt`, `session/new`, `session/load`, `session/set_mode`, `session/set_config_option` and `maki/rewind` answer with error code `-32010`. It can still initialize, list sessions, switch themes and complete arguments.
+`readOnly` is always false, and stays in the reply for clients that still read it. Any attached connection can prompt, cancel, answer a question, change options or rewind; the loop that owns the session takes those requests one at a time, so two windows never run two turns at once.
 
 ### Watching from a terminal
 
@@ -135,23 +135,15 @@ makima attach lan://192.168.2.4:60667 --token my-token
 makima attach 192.168.2.4:60667 --plain # line rendering instead
 ```
 
-With no link it waits a few seconds and lists the announced sessions to choose from. The chat then shows the turn you start: streamed text, thinking, tool calls, and the usual permission prompt. Each turn is a `session/prompt` sent to the machine that runs the agent, so the model, the tools and the files all stay there, and prompting a session you only watch takes control of it. A turn another window starts while you watch streams into the same transcript, under a line saying it runs in another window. Those rows are a view: they belong to the session on the machine that ran the turn, not to this window's own history, so a restart does not replay them. Messages from before you attached stay on that machine; `--plain` prints them in line mode.
+With no link it waits a few seconds and lists the announced sessions to choose from. The chat then shows the turn you start: streamed text, thinking, tool calls, and the usual permission prompt. Each turn is a `session/prompt` sent to the machine that runs the agent, so the model, the tools and the files all stay there, and typing is all it takes to act on a session another window is showing. A turn another window starts while you watch streams into the same transcript, under a line saying it runs in another window. Those rows are a view: they belong to the session on the machine that ran the turn, not to this window's own history, so a restart does not replay them. Messages from before you attached stay on that machine; `--plain` prints them in line mode.
 
-`--plain` keeps the line renderer for a terminal that cannot take the full screen, which is also what a pipe gets. There the session is watched read only until you type `/take`; `/cancel` stops a turn, `/quit` leaves, tool calls print as `→ title` and `✓ title`, and permissions and pickers take a number.
+`--plain` keeps the line renderer for a terminal that cannot take the full screen, which is also what a pipe gets. There `/cancel` stops a turn, `/quit` leaves, tool calls print as `→ title` and `✓ title`, and permissions and pickers take a number.
 
-### Taking control
+### Many windows, one session
 
-The connection that created or loaded the session controls it at first. To move control, any connection sends `maki/take_control`, and the reply says whether it now holds it:
+There is no driver. Every connection attached to a session may prompt, cancel, answer a permission question, change options or rewind, and the loop that owns the session takes those requests one at a time, so two windows never run two turns at once. A prompt that arrives while a turn runs joins or queues behind it like a prompt typed locally.
 
-```json
-{"controller":true}
-```
-
-Only an idle session changes hands. While a turn runs or a permission question is open, the request answers `-32012`, so no request is left without the connection that asked for it. The connection that loses control receives a notification:
-
-```json
-{"method":"maki/ui/control","params":{"controller":false}}
-```
+What the session asks goes to the window that asked for the work in flight: its permission questions, pickers and completions. If that window is gone, they go to the connection that owns the session. `maki/take_control` still answers `{"controller":true}` for older clients; nothing has to be taken.
 
 Every connection that shows the session, the owner's included, hears when a turn starts and ends, so it can label a turn another window runs and know whether Stop would do anything:
 
@@ -159,9 +151,9 @@ Every connection that shows the session, the owner's included, hears when a turn
 {"method":"maki/ui/turn","params":{"running":true}}
 ```
 
-The controller prompts, cancels, answers permission questions and rewinds. The owning connection can take control back the same way.
+A prompt another window sends arrives as a `user_message_chunk` update, so every window shows the question and not just the answer.
 
-The recording follows the session, not the connection: when the owner rewinds, watchers receive `maki/ui/rewind` and the recording starts over from the rewound transcript. When the owning connection ends, the session ends and watchers lose it.
+The recording follows the session, not the connection: when any window rewinds, the others receive `maki/ui/rewind` and the recording starts over from the rewound transcript. The session lives as long as the process that runs it; when the connection that owns it ends, the session ends and the others lose it.
 
 ## What works
 

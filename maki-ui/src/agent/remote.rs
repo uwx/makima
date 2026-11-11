@@ -84,18 +84,6 @@ impl AcpBackend {
         }
     }
 
-    /// Whoever types gets to act, as long as the session is idle: another
-    /// window may hold control, and this one takes it back by prompting.
-    fn claim(&self) -> Result<(), String> {
-        if self.client.controls_session() {
-            return Ok(());
-        }
-        match self.client.take_control() {
-            Ok(true) => Ok(()),
-            Ok(false) => Err("Another window controls this session".to_owned()),
-            Err(error) => Err(error),
-        }
-    }
 }
 
 impl ActorBackend for AcpBackend {
@@ -110,20 +98,6 @@ impl ActorBackend for AcpBackend {
             let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
             let sender = EventSender::with_identity(self.agent_tx.clone(), Some(context.work));
             context.output.set_terminal_sender(sender.clone());
-            if let Err(error) = self.claim() {
-                return BackendResult::EnteredRun(TurnOutcome::failed(
-                    context.agent_id,
-                    turn_id,
-                    TokenUsage::default(),
-                    0,
-                    TurnFailure {
-                        kind: TurnFailureKind::Internal,
-                        diagnostic: error.clone(),
-                        user_message: error,
-                        retryable: false,
-                    },
-                ));
-            }
             if input.prompt.is_some() {
                 return BackendResult::EnteredRun(TurnOutcome::failed(
                     context.agent_id,

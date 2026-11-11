@@ -9,7 +9,7 @@ use std::net::TcpStream;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
@@ -62,10 +62,8 @@ const SESSIONS_METHOD: &str = "maki/sessions";
 const SESSION_LOAD_METHOD: &str = "session/load";
 const LIVE_METHOD: &str = "maki/live";
 const ATTACH_METHOD: &str = "maki/attach";
-const TAKE_CONTROL_METHOD: &str = "maki/take_control";
 const SHARE_METHOD: &str = "maki/share";
 const UNSHARE_METHOD: &str = "maki/unshare";
-const CONTROL_METHOD: &str = "maki/ui/control";
 const TURN_METHOD: &str = "maki/ui/turn";
 const REWIND_METHOD: &str = "maki/rewind";
 const REWOUND_METHOD: &str = "maki/ui/rewind";
@@ -95,8 +93,6 @@ pub enum Event {
     RewindTurns(Result<Vec<RewindTurn>, String>),
     /// The agent rewound its history; the replay follows as updates.
     Rewound,
-    /// This window gained (true) or lost (false) control of the session.
-    Control(bool),
     /// The agent started sharing this session, or said why it could not.
     Share(Result<ShareInfo, String>),
     /// The agent stopped sharing this session, or said why it could not.
@@ -536,8 +532,6 @@ pub struct Connection {
     pub session: SessionId,
     pub model: String,
     pub themes: ThemeCatalog,
-    /// A shared session is watched, not owned, until this window takes control.
-    pub read_only: bool,
 }
 
 pub fn connect(target: &Target) -> Result<Connection, String> {
@@ -578,7 +572,6 @@ fn spawn_agent(
         pending: Mutex::new(HashMap::new()),
         events: events_tx,
         session: Mutex::new(None),
-        controller: AtomicBool::new(true),
     });
 
     spawn_writer(writer, out_rx)?;
@@ -609,7 +602,7 @@ fn open_session(
     } else {
         None
     };
-    let (session, model, options, read_only) = match live {
+    let (session, model, options) = match live {
         Some(id) => {
             let session = SessionId::new(id);
             let reply = client.attach(&session)?;
@@ -622,7 +615,7 @@ fn open_session(
             let options = session_options(&reply);
             let view = session_view(&options);
             let model = view.model.clone().unwrap_or_default();
-            (session, model, view, true)
+            (session, model, view)
         }
         None if attach_only => {
             return Err(format!(
@@ -631,17 +624,15 @@ fn open_session(
         }
         None => {
             let (session, model, options) = client.new_session(cwd)?;
-            (session, model, options, false)
+            (session, model, options)
         }
     };
-    client.set_controller(!read_only);
     Ok(Connection {
         client,
         events,
         session,
         model,
         options,
-        read_only,
         themes,
     })
 }
@@ -748,9 +739,6 @@ pub struct Client {
     pending: Mutex<HashMap<i64, Sender<Result<Value, String>>>>,
     events: Sender<Event>,
     session: Mutex<Option<SessionId>>,
-    /// Whether this connection is the one allowed to act on the session. A
-    /// session's owner starts with it; a watcher has to take it.
-    controller: AtomicBool,
 }
 
 impl Client {
@@ -875,23 +863,6 @@ impl Client {
         Ok(())
     }
 
-    /// Makes this window the one that may act on the session.
-    pub fn take_control(&self) -> Result<bool, String> {
-        let reply: Value = self.request(TAKE_CONTROL_METHOD, json!({}), Some(SESSION_TIMEOUT))?;
-        let controller = reply.get("controller").and_then(Value::as_bool) == Some(true);
-        self.controller.store(controller, Ordering::Release);
-        Ok(controller)
-    }
-
-    /// Whether this connection may prompt, change options or rewind.
-    pub fn controls_session(&self) -> bool {
-        self.controller.load(Ordering::Acquire)
-    }
-
-    fn set_controller(&self, controller: bool) {
-        self.controller.store(controller, Ordering::Release);
-    }
-
     pub fn prompt(&self, text: &str) -> Result<StopReason, String> {
         self.prompt_blocks(vec![ContentBlock::Text(TextContent::new(text.to_owned()))])
     }
@@ -1011,15 +982,6 @@ impl Client {
             TURN_METHOD => {
                 if let Some(running) = message.pointer("/params/running").and_then(Value::as_bool) {
                     let _ = self.emit(Event::Turn(running));
-                }
-            }
-            CONTROL_METHOD => {
-                if let Some(controller) = message
-                    .pointer("/params/controller")
-                    .and_then(Value::as_bool)
-                {
-                    self.set_controller(controller);
-                    let _ = self.emit(Event::Control(controller));
                 }
             }
             _ => {}
@@ -1460,7 +1422,6 @@ old
         let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
         let connection = super::connect(&target).unwrap();
         assert_eq!(&*connection.session.0, "sess-lan");
-        assert!(!connection.read_only);
         drop(connection);
         assert_eq!(
             server.join().unwrap(),
@@ -1502,7 +1463,6 @@ old
         let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
         let connection = super::connect(&target).unwrap();
         assert_eq!(&*connection.session.0, "sess-live");
-        assert!(connection.read_only);
         assert_eq!(connection.model, "openai/gpt-5");
         drop(connection);
         assert_eq!(

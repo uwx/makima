@@ -21,20 +21,13 @@ use maki_ui::{SharedSession, pick_shared_session};
 use crate::cli::Cli;
 use crate::cmd::tui;
 
-const TAKE_COMMAND: &str = "take";
 const CANCEL_COMMAND: &str = "cancel";
 const QUIT_COMMAND: &str = "quit";
 const HELP_COMMAND: &str = "help";
 const COMMAND_PREFIX: char = '/';
 const PROMPT_MARKER: &str = "> ";
 const ANSWER_MARKER: &str = "  ";
-const HELP: &str =
-    "/take controls this session, /cancel stops a turn, /quit leaves, /help repeats this";
-const WATCHING: &str = "watching read-only; /take to drive this session";
-const CONTROL_TAKEN: &str = "you control this session";
-const CONTROL_REFUSED: &str = "the session is busy; /take again when it is idle";
-const CONTROL_LOST: &str = "another window took control of this session";
-const READ_ONLY_PROMPT: &str = "read-only; /take before prompting";
+const HELP: &str = "/cancel stops a turn, /quit leaves, /help repeats this";
 const AGENT_GONE: &str = "the agent went away";
 const PERMISSION_QUESTION: &str = "Allow? Enter denies";
 const PICK_QUESTION: &str = "Choose? Enter closes";
@@ -76,10 +69,7 @@ pub fn run(
     }
     let mut session = Session::new(connection);
     match prompt {
-        Some(text) => {
-            session.take_control_if_watched();
-            session.turn(&text)
-        }
+        Some(text) => session.turn(&text),
         None => session.interactive(),
     }
 }
@@ -213,7 +203,6 @@ enum Command {
     Empty,
     Help,
     Quit,
-    Take,
     Cancel,
     Prompt(String),
 }
@@ -229,7 +218,6 @@ fn command(line: &str) -> Command {
         return Command::Prompt(text.to_owned());
     };
     match name.trim() {
-        TAKE_COMMAND => Command::Take,
         CANCEL_COMMAND => Command::Cancel,
         QUIT_COMMAND => Command::Quit,
         HELP_COMMAND => Command::Help,
@@ -240,7 +228,6 @@ fn command(line: &str) -> Command {
 struct Session {
     connection: Connection,
     printer: Printer,
-    read_only: bool,
 }
 
 impl Session {
@@ -254,12 +241,8 @@ impl Session {
             attached.push_str(&format!(" on {}", connection.model));
         }
         printer.line(&attached);
-        if connection.read_only {
-            printer.line(WATCHING);
-        }
         printer.line(HELP);
         Self {
-            read_only: connection.read_only,
             connection,
             printer,
         }
@@ -278,14 +261,7 @@ impl Session {
                 Command::Help => self.help(),
                 Command::Quit => return Ok(()),
                 Command::Cancel => self.connection.client.cancel(),
-                Command::Take => self.take_control(),
-                Command::Prompt(text) => {
-                    if self.read_only {
-                        self.printer.line(READ_ONLY_PROMPT);
-                        continue;
-                    }
-                    self.turn(&text)?;
-                }
+                Command::Prompt(text) => self.turn(&text)?,
             }
         }
     }
@@ -301,27 +277,6 @@ impl Session {
             self.on_event(event)?;
         }
         Ok(())
-    }
-
-    /// Makes this terminal the one that may prompt, when a window elsewhere is
-    /// not driving the session.
-    fn take_control_if_watched(&mut self) {
-        if self.read_only {
-            self.take_control();
-        }
-    }
-
-    fn take_control(&mut self) {
-        match self.connection.client.take_control() {
-            Ok(true) => {
-                self.read_only = false;
-                self.printer.line(CONTROL_TAKEN);
-            }
-            Ok(false) => self.printer.line(CONTROL_REFUSED),
-            Err(error) => self
-                .printer
-                .line(&format!("could not take control: {error}")),
-        }
     }
 
     /// Runs one prompt to its end, answering what the agent asks meanwhile.
@@ -366,14 +321,6 @@ impl Session {
             Event::Permission(prompt) => self.answer_permission(prompt)?,
             Event::Pick(prompt) => self.answer_pick(prompt)?,
             Event::Flash(text) => self.printer.line(&text),
-            Event::Control(controller) => {
-                self.read_only = !controller;
-                self.printer.line(if controller {
-                    CONTROL_TAKEN
-                } else {
-                    CONTROL_LOST
-                });
-            }
             Event::Closed(reason) => bail!(reason),
             _ => {}
         }
@@ -560,13 +507,11 @@ mod tests {
             Command::Empty => "empty",
             Command::Help => "help",
             Command::Quit => "quit",
-            Command::Take => "take",
-            Command::Cancel => "cancel",
+                    Command::Cancel => "cancel",
             Command::Prompt(_) => "prompt",
         }
     }
 
-    #[test_case("/take" => "take"; "take control")]
     #[test_case(" /quit " => "quit"; "surrounding space is ignored")]
     #[test_case("/help" => "help"; "help")]
     #[test_case("/cancel" => "cancel"; "cancel")]
