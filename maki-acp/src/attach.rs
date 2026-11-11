@@ -172,6 +172,9 @@ pub struct SessionTap {
     /// task still moves the flag.
     busy_probe: Mutex<Option<BusyProbe>>,
     controller: Mutex<Option<Sender<Value>>>,
+    /// The connection the session belongs to. It keeps showing the session
+    /// after another window takes control, so it still hears about turns.
+    owner: Mutex<Option<Sender<Value>>>,
     /// The session's config options, so an attach can paint its status bar
     /// without asking the owning loop.
     info: Mutex<Option<Value>>,
@@ -185,6 +188,7 @@ impl Default for SessionTap {
             busy: AtomicBool::new(false),
             busy_probe: Mutex::default(),
             controller: Mutex::default(),
+            owner: Mutex::default(),
             info: Mutex::default(),
             inbound: flume::unbounded(),
         }
@@ -274,6 +278,10 @@ impl SessionTap {
         *self.controller.lock().unwrap() = Some(controller);
     }
 
+    pub fn set_owner(&self, owner: Sender<Value>) {
+        *self.owner.lock().unwrap() = Some(owner);
+    }
+
     pub fn clear_controller(&self) {
         *self.controller.lock().unwrap() = None;
     }
@@ -290,12 +298,19 @@ impl SessionTap {
             .is_some_and(|controller| controller.same_channel(sender))
     }
 
-    /// Sends {message} to the controller and every watcher, without recording
-    /// it: control changes are not part of the transcript.
+    /// Sends {message} to the owner, the controller and every watcher, without
+    /// recording it: control changes are not part of the transcript.
     pub fn announce(&self, message: Value) {
         let mut targets: Vec<Sender<Value>> = self.state.lock().unwrap().subscribers.to_vec();
         if let Some(controller) = self.controller() {
             targets.push(controller);
+        }
+        if let Some(owner) = self.owner.lock().unwrap().clone()
+            && !targets
+                .iter()
+                .any(|target| target.same_channel(&owner))
+        {
+            targets.push(owner);
         }
         for target in targets {
             let _ = target.send(message.clone());
@@ -502,6 +517,34 @@ mod tests {
         tap.announce(json!({ "method": CONTROL_METHOD }));
         assert_eq!(controller_rx.recv().unwrap()["method"], CONTROL_METHOD);
         assert_eq!(watcher_rx.recv().unwrap()["method"], CONTROL_METHOD);
+    }
+
+    #[test]
+    fn the_owner_hears_about_turns_after_it_loses_control() {
+        let tap = SessionTap::default();
+        let (owner, owner_rx) = flume::unbounded();
+        let (phone, phone_rx) = flume::unbounded();
+        tap.set_owner(owner.clone());
+        tap.set_controller(owner);
+        tap.set_controller(phone);
+
+        tap.set_busy(true);
+
+        assert_eq!(owner_rx.recv().unwrap()["params"]["running"], json!(true));
+        assert_eq!(phone_rx.recv().unwrap()["params"]["running"], json!(true));
+    }
+
+    #[test]
+    fn the_owner_is_not_told_twice_while_it_still_controls_the_session() {
+        let tap = SessionTap::default();
+        let (owner, owner_rx) = flume::unbounded();
+        tap.set_owner(owner.clone());
+        tap.set_controller(owner);
+
+        tap.set_busy(true);
+
+        assert_eq!(owner_rx.recv().unwrap()["params"]["running"], json!(true));
+        assert!(owner_rx.try_recv().is_err());
     }
 
     #[test]

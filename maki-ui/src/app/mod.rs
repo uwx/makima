@@ -127,6 +127,10 @@ const CANCEL_MSG: &str = "Cancelled.";
 /// Presentation reserved for re-bake replies. They belong to no agent run, so
 /// the staleness filter skips them outright.
 pub(crate) const RESTORE_PRESENTATION: u64 = u64::MAX;
+/// Presentation reserved for rows another window's turn streamed in. They join
+/// no run this window tracks, so the staleness filter skips them and they never
+/// enter this window's history.
+pub(crate) const MIRROR_PRESENTATION: u64 = u64::MAX - 1;
 /// Presentation reserved for re-bake replies. It is not actor work, so it
 /// carries no work identity and bypasses the per-run staleness filter.
 const FLASH_CANCEL: &str = "Press esc again to stop...";
@@ -2636,6 +2640,22 @@ impl App {
         }
     }
 
+    /// Paints what another window's turn streamed. The turn ran against the
+    /// history on the side that drove it, so these rows stay display only:
+    /// nothing here joins the run this window tracks.
+    fn mirror_event(&mut self, event: AgentEvent) {
+        if let AgentEvent::Post(post) = event {
+            self.chats[0].push_post(&post);
+            return;
+        }
+        let plan_path = if self.root_mode() == Mode::Plan && !self.plan_submit_active() {
+            self.state.plan.path()
+        } else {
+            None
+        };
+        self.chats[0].handle_event(event, plan_path);
+    }
+
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
         // Re-bake replies belong to no run and arrive on the restore channel,
         // so they skip the staleness filter outright.
@@ -2660,6 +2680,12 @@ impl App {
                     chat.tool_snapshot(&id, snapshot.clone(), theme_gen);
                 }
             }
+            return vec![];
+        }
+        // Rows another window's turn streamed in: painted here, never adopted
+        // as work this window ran.
+        if envelope.presentation() == Some(MIRROR_PRESENTATION) {
+            self.mirror_event(envelope.event);
             return vec![];
         }
         // Posts belong to no run, so the stale-run filter below must not see them.

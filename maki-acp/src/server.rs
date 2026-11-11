@@ -1213,6 +1213,7 @@ async fn new_session(
     }
     srv.taps.register(&session_id, Arc::clone(&srv.own_tap));
     srv.own_tap.set_controller(srv.wire.clone());
+    srv.own_tap.set_owner(srv.wire.clone());
     let spec = params.model.spec();
     let persisted_options = Default::default();
     let snapshot = install_session(
@@ -1283,6 +1284,7 @@ async fn load_session(
     }
     srv.taps.register(&sid.0, Arc::clone(&srv.own_tap));
     srv.own_tap.set_controller(srv.wire.clone());
+    srv.own_tap.set_owner(srv.wire.clone());
     let home = maki_storage::paths::home();
     // A session imported from another tool can name a provider this machine
     // never logged in to; it then resumes on the model the server runs.

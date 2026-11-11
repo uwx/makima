@@ -862,6 +862,24 @@ fn assert_last_is_post(chat: &Chat) {
     );
 }
 
+const MIRROR_TEXT: &str = "answered from the other window";
+
+#[test]
+fn rows_another_window_streamed_are_painted_and_never_recorded() {
+    let mut app = test_app();
+    app.update(agent_msg_with_run_id(
+        AgentEvent::TextDelta {
+            text: MIRROR_TEXT.into(),
+        },
+        MIRROR_PRESENTATION,
+    ));
+    app.update(agent_msg_with_run_id(done(), MIRROR_PRESENTATION));
+
+    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.chats[0].last_message_text(), MIRROR_TEXT);
+    assert!(app.state.session.messages().is_empty());
+}
+
 #[test]
 fn main_chat_post_is_recorded_and_restored() {
     let mut app = test_app();

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use agent_client_protocol_schema::{
     ContentBlock, ImageContent, PermissionOption, PermissionOptionKind, SessionUpdate, StopReason,
@@ -16,28 +16,37 @@ use agent_client_protocol_schema::{
 };
 use flume::Receiver;
 use futures_lite::future::or;
-use maki_acp_client::{Client, Connection};
+use maki_acp_client::{Client, Connection, PermissionPrompt};
 use maki_agent::actor::{ActorBackend, BackendResult, ControlWork, TurnContext, WorkKind};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::{
-    AgentEvent, AgentInput, DoneReason, Envelope, EventSender, History, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    ActorWorkIdentity, ActorWorkKind, AgentEvent, AgentId, AgentInput, DoneReason, Envelope,
+    EventSender, History, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCancellationReason,
+    TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
 use maki_config::ToolKey;
+use maki_domain::{Post, PostLevel};
 use maki_providers::{Message, TokenUsage};
 use tracing::warn;
+
+use crate::app::MIRROR_PRESENTATION;
 
 const TOOL_UNAVAILABLE: &str = "This command only works on a session this window runs";
 const CONTROL_UNAVAILABLE: &str = "Compaction runs where the session lives, not in this window";
 const PERMISSION_PREFIX: &str = "remote-";
 const REMOTE_TOOL: &str = "unknown";
 const MCP_PROMPT_UNAVAILABLE: &str = "MCP prompts run where the session lives, not in this window";
+const MIRROR_LABEL: &str = "This turn is running in another window";
 
 pub(crate) struct AcpBackend {
     client: Arc<Client>,
-    events: Receiver<maki_acp_client::Event>,
+    /// The turn this window runs, if any. The reader hands it every event that
+    /// streams in and paints the rest into the transcript.
+    turn: SharedTurn,
+    /// Asks the reader to drain what already arrived, so a turn does not settle
+    /// before the last of its updates is rendered.
+    settle: flume::Sender<flume::Sender<()>>,
     agent_tx: flume::Sender<Envelope>,
-    answers: Arc<Mutex<Receiver<String>>>,
     model: String,
 }
 
@@ -47,23 +56,32 @@ impl AcpBackend {
         agent_tx: flume::Sender<Envelope>,
         answers: Receiver<String>,
     ) -> Self {
+        let turn = SharedTurn::default();
+        let permissions = Permissions::default();
+        let (settle, settled) = flume::unbounded();
+        let reader = Reader {
+            events: connection.events.clone(),
+            settled,
+            turn: turn.clone(),
+            mirror: Mirror::new(agent_tx.clone(), connection.model.clone()),
+            client: Arc::clone(&connection.client),
+            permissions: permissions.clone(),
+        };
+        smol::spawn(reader.run()).detach();
+        let client = Arc::clone(&connection.client);
+        smol::spawn(async move {
+            while let Ok(raw) = answers.recv_async().await {
+                permissions.answer(&client, &raw);
+            }
+        })
+        .detach();
         Self {
             client: Arc::clone(&connection.client),
-            events: connection.events.clone(),
+            turn,
+            settle,
             agent_tx,
-            answers: Arc::new(Mutex::new(answers)),
             model: connection.model.clone(),
         }
-    }
-
-    /// A watched session belongs to whoever controls it. Prompting is the
-    /// explicit act that claims it, and a refusal is reported as the turn's
-    /// failure instead of being silently retried.
-    /// Updates the agent sent before this window started a turn: the replay of
-    /// an attached session's history. The transcript here starts at the first
-    /// turn, so they are dropped rather than interleaved into it.
-    fn discard_replay(&self) {
-        while self.events.try_recv().is_ok() {}
     }
 
     /// Whoever types gets to act, as long as the session is idle: another
@@ -120,28 +138,14 @@ impl ActorBackend for AcpBackend {
                     },
                 ));
             }
-            self.discard_replay();
             let blocks = blocks(&input);
-            let answers = self
-                .answers
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone();
-            let turn = Pump {
-                translator: Translator {
-                    sender: sender.clone(),
-                    model: self.model.clone(),
-                    tools: HashMap::new(),
-                    usage: TokenUsage::default(),
-                    context_window: 0,
-                },
-                client: Arc::clone(&self.client),
-                answers,
-                pending: HashMap::new(),
-                next_permission: 0,
-            };
-            let (done_tx, done_rx) = flume::bounded(1);
-            let pump = smol::spawn(turn.run(self.events.clone(), done_rx));
+            self.turn.start(Translator {
+                sender,
+                model: self.model.clone(),
+                tools: HashMap::new(),
+                usage: TokenUsage::default(),
+                context_window: 0,
+            });
             let cancel = {
                 let client = Arc::clone(&self.client);
                 let cancel = context.cancel.clone();
@@ -153,9 +157,11 @@ impl ActorBackend for AcpBackend {
             let client = Arc::clone(&self.client);
             let stop = smol::unblock(move || client.prompt_blocks(blocks)).await;
             // Everything the agent said about this turn arrived before its
-            // response, so the pump drains the rest and settles last.
-            let _ = done_tx.try_send(());
-            pump.await;
+            // response, so the reader drains the rest before the turn settles.
+            let (ack_tx, ack_rx) = flume::bounded(1);
+            let _ = self.settle.send(ack_tx);
+            let _ = ack_rx.recv_async().await;
+            self.turn.finish();
             cancel.cancel().await;
             let outcome = match stop {
                 Ok(StopReason::Cancelled) => TurnOutcome::cancelled(
@@ -245,15 +251,237 @@ fn blocks(input: &AgentInput) -> Vec<ContentBlock> {
     blocks
 }
 
-/// One turn's view of the agent: the events it streams in, the answers the
-/// user gives to the questions inside them, and what the next `ToolDone` and
-/// `TurnComplete` need from earlier updates.
-struct Pump {
-    translator: Translator,
+/// The connection's one reader. It feeds the turn this window runs and, between
+/// turns, paints what another window's turn streams in, so an origin does not
+/// look idle while the session talks.
+struct Reader {
+    events: Receiver<maki_acp_client::Event>,
+    settled: Receiver<flume::Sender<()>>,
+    turn: SharedTurn,
+    mirror: Mirror,
     client: Arc<Client>,
-    answers: Receiver<String>,
-    pending: HashMap<String, Pending>,
-    next_permission: u32,
+    permissions: Permissions,
+}
+
+impl Reader {
+    async fn run(mut self) {
+        loop {
+            let next = or(
+                async { self.events.recv_async().await.ok().map(Next::Event) },
+                async { self.settled.recv_async().await.ok().map(Next::Settle) },
+            )
+            .await;
+            match next {
+                Some(Next::Event(event)) => self.event(event),
+                Some(Next::Settle(ack)) => {
+                    while let Ok(event) = self.events.try_recv() {
+                        self.event(event);
+                    }
+                    let _ = ack.send(());
+                }
+                None => return,
+            }
+        }
+    }
+
+    fn event(&mut self, event: maki_acp_client::Event) {
+        match event {
+            maki_acp_client::Event::Update(update) => {
+                if let Some(update) = self.turn.route(update) {
+                    self.mirror.update(*update);
+                }
+            }
+            maki_acp_client::Event::Permission(prompt) => match self.turn.sender() {
+                Some(sender) => self.permissions.ask(&sender, prompt),
+                // Between turns a question belongs to the window driving the
+                // turn; declining it keeps the agent from waiting on us.
+                None => self.client.answer(prompt.id, None),
+            },
+            maki_acp_client::Event::Turn(running) => {
+                if self.turn.is_running() {
+                    return;
+                }
+                if running {
+                    self.mirror.start();
+                } else {
+                    self.mirror.finish();
+                }
+            }
+            // A watcher attaching mid-turn follows the turn already running.
+            maki_acp_client::Event::Attached { busy: true } => self.mirror.start(),
+            _ => {}
+        }
+    }
+}
+
+enum Next {
+    Event(maki_acp_client::Event),
+    Settle(flume::Sender<()>),
+}
+
+/// The turn this window runs, if any.
+#[derive(Clone, Default)]
+struct SharedTurn(Arc<Mutex<Option<Translator>>>);
+
+impl SharedTurn {
+    fn start(&self, translator: Translator) {
+        *self.lock() = Some(translator);
+    }
+
+    fn finish(&self) {
+        *self.lock() = None;
+    }
+
+    fn is_running(&self) -> bool {
+        self.lock().is_some()
+    }
+
+    /// Hands the update to the turn running here, or gives it back.
+    fn route(&self, update: Box<SessionUpdate>) -> Option<Box<SessionUpdate>> {
+        match self.lock().as_mut() {
+            Some(translator) => {
+                translator.update(*update);
+                None
+            }
+            None => Some(update),
+        }
+    }
+
+    fn sender(&self) -> Option<EventSender> {
+        self.lock()
+            .as_ref()
+            .map(|translator| translator.sender.clone())
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Option<Translator>> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+/// Another window's turn, painted into the transcript this window shows. It
+/// joins no history here: the turn ran against the history on the other side,
+/// which is why every row it paints is display only.
+struct Mirror {
+    translator: Translator,
+    agent_id: AgentId,
+    running: bool,
+}
+
+impl Mirror {
+    fn new(agent_tx: flume::Sender<Envelope>, model: String) -> Self {
+        let agent_id = AgentId::generate();
+        let sender = EventSender::with_identity(
+            agent_tx,
+            Some(ActorWorkIdentity::new(
+                agent_id,
+                ActorWorkKind::Control { operation_id: 0 },
+                MIRROR_PRESENTATION,
+            )),
+        );
+        Self {
+            translator: Translator {
+                sender,
+                model,
+                tools: HashMap::new(),
+                usage: TokenUsage::default(),
+                context_window: 0,
+            },
+            agent_id,
+            running: false,
+        }
+    }
+
+    fn start(&mut self) {
+        if self.running {
+            return;
+        }
+        self.running = true;
+        self.translator.tools.clear();
+        self.translator.usage = TokenUsage::default();
+        self.translator.context_window = 0;
+        self.translator.sender.try_send(AgentEvent::Post(Post {
+            text: MIRROR_LABEL.to_owned(),
+            level: PostLevel::Info,
+            agent: None,
+        }));
+    }
+
+    fn finish(&mut self) {
+        if !self.running {
+            return;
+        }
+        self.running = false;
+        self.translator
+            .sender
+            .try_send(AgentEvent::TurnOutcome(TurnOutcome::completed(
+                self.agent_id,
+                TurnId::generate(),
+                TokenUsage::default(),
+                0,
+                DoneReason::EndTurn,
+            )));
+    }
+
+    fn update(&mut self, update: SessionUpdate) {
+        if self.running {
+            self.translator.update(update);
+        }
+    }
+}
+
+/// The questions this window was asked and has not answered yet.
+#[derive(Clone, Default)]
+struct Permissions {
+    state: Arc<Mutex<PendingState>>,
+}
+
+#[derive(Default)]
+struct PendingState {
+    next: u32,
+    requests: HashMap<String, Pending>,
+}
+
+impl Permissions {
+    fn ask(&self, sender: &EventSender, prompt: PermissionPrompt) {
+        let (tool, scopes) = permission_key(&prompt.title);
+        let id = {
+            let mut state = self.lock();
+            let id = format!("{PERMISSION_PREFIX}{}", state.next);
+            state.next += 1;
+            state.requests.insert(
+                id.clone(),
+                Pending {
+                    request: prompt.id,
+                    options: prompt.options,
+                },
+            );
+            id
+        };
+        if sender
+            .send(AgentEvent::PermissionRequest {
+                id: id.clone(),
+                tool,
+                scopes,
+            })
+            .is_err()
+        {
+            self.lock().requests.remove(&id);
+        }
+    }
+
+    fn answer(&self, client: &Client, raw: &str) {
+        let Some(TaggedAnswer { request_id, answer }) = TaggedAnswer::decode(raw) else {
+            return;
+        };
+        let Some(pending) = self.lock().requests.remove(&request_id) else {
+            return;
+        };
+        client.answer(pending.request, option_for(&answer, &pending.options));
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PendingState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
 }
 
 /// Turns session updates into the events the chat renders. A tool call's name
@@ -269,81 +497,6 @@ struct Translator {
 struct Pending {
     request: serde_json::Value,
     options: Vec<PermissionOption>,
-}
-
-enum Next {
-    Event(maki_acp_client::Event),
-    Answer(String),
-    Done,
-}
-
-impl Pump {
-    async fn run(mut self, events: Receiver<maki_acp_client::Event>, done: Receiver<()>) {
-        loop {
-            let next = or(
-                or(
-                    async { events.recv_async().await.map(Next::Event) },
-                    async { self.answers.recv_async().await.map(Next::Answer) },
-                ),
-                async { done.recv_async().await.map(|()| Next::Done) },
-            )
-            .await;
-            match next {
-                Ok(Next::Event(event)) => self.event(event),
-                Ok(Next::Answer(answer)) => self.answer(&answer),
-                Ok(Next::Done) => {
-                    while let Ok(event) = events.try_recv() {
-                        self.event(event);
-                    }
-                    return;
-                }
-                Err(_) => return,
-            }
-        }
-    }
-
-    fn event(&mut self, event: maki_acp_client::Event) {
-        match event {
-            maki_acp_client::Event::Update(update) => self.translator.update(*update),
-            maki_acp_client::Event::Permission(prompt) => {
-                let id = format!("{PERMISSION_PREFIX}{}", self.next_permission);
-                self.next_permission += 1;
-                let (tool, scopes) = permission_key(&prompt.title);
-                if self
-                    .translator
-                    .sender
-                    .send(AgentEvent::PermissionRequest {
-                        id: id.clone(),
-                        tool,
-                        scopes,
-                    })
-                    .is_err()
-                {
-                    self.client.answer(prompt.id, None);
-                    return;
-                }
-                self.pending.insert(
-                    id,
-                    Pending {
-                        request: prompt.id,
-                        options: prompt.options,
-                    },
-                );
-            }
-            _ => {}
-        }
-    }
-
-    fn answer(&mut self, raw: &str) {
-        let Some(TaggedAnswer { request_id, answer }) = TaggedAnswer::decode(raw) else {
-            return;
-        };
-        let Some(pending) = self.pending.remove(&request_id) else {
-            return;
-        };
-        self.client
-            .answer(pending.request, option_for(&answer, &pending.options));
-    }
 }
 
 impl Translator {
@@ -544,6 +697,45 @@ mod tests {
 
     fn drain(rx: &flume::Receiver<Envelope>) -> Vec<AgentEvent> {
         rx.try_iter().map(|envelope| envelope.event).collect()
+    }
+
+    #[test]
+    fn a_turn_announced_elsewhere_is_painted_and_a_replay_is_not() {
+        let (tx, rx) = flume::unbounded();
+        let mut mirror = Mirror::new(tx, MODEL.to_owned());
+
+        mirror.update(chunk("replay"));
+        assert!(rx.is_empty(), "a replayed transcript joins no turn");
+
+        mirror.start();
+        mirror.update(chunk("hello"));
+        mirror.finish();
+
+        let painted: Vec<_> = rx.try_iter().collect();
+        assert!(
+            painted
+                .iter()
+                .all(|envelope| envelope.presentation() == Some(MIRROR_PRESENTATION)),
+            "mirrored rows must bypass the run fence"
+        );
+        match painted
+            .iter()
+            .map(|envelope| &envelope.event)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [AgentEvent::Post(label), AgentEvent::TextDelta { text }, AgentEvent::TurnOutcome(_)] => {
+                assert_eq!(label.text, MIRROR_LABEL);
+                assert_eq!(text, "hello");
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
+    }
+
+    fn chunk(text: &str) -> SessionUpdate {
+        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
+            text,
+        ))))
     }
 
     #[test]
