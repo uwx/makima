@@ -1,26 +1,29 @@
 use std::io::{self, IsTerminal, Read};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use color_eyre::Result;
-use color_eyre::eyre::{Context, bail};
+use color_eyre::eyre::{Context, bail, eyre};
 use crossterm::style::Stylize;
 
+use maki_acp_client::Target;
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectDecision, TrustAnswer, policy_grant};
 use maki_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_lua::ui_sink::{HeadlessUi, HostUi};
+use maki_providers::login::is_configured;
 use maki_providers::model::{Model, ModelTier};
 use maki_providers::{ProviderRegistry, Timeouts};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use maki_storage::session_lock;
 use maki_storage::sessions::SESSIONS_DIR;
-use maki_ui::{AppSession, RunOutcome};
+use maki_ui::{AppSession, RemoteSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
 use crate::setup;
@@ -30,6 +33,8 @@ const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous 
 const PIPED_INPUT_SEPARATOR: &str = "\n\n";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 const PICKER_NEEDS_TUI_ERR: &str = "continuing without a session ID opens the session picker, which needs the TUI; run `makima sessions --json` to list session IDs";
+const SHARED_RESUME_UNSUPPORTED: &str =
+    "--share starts a new session where it runs; resuming one there is not supported yet";
 
 /// A project `.env` is loaded exactly once, when a folder that was not trusted
 /// becomes trusted. Every other rebuild must leave the process env alone.
@@ -234,19 +239,37 @@ fn build_stack(
     ))
 }
 
+/// The model a resumed session runs on. Its own model wins unless its provider
+/// reports no credentials, as an imported session can name a provider this
+/// machine never logged in to; then the startup model is used and a warning
+/// says so. Without credentials there is nothing to prepare, so the choice is
+/// made here rather than left to a failing request.
 fn restored_session_model(
     providers: &ProviderRegistry,
+    storage: &StateDir,
     startup: &Model,
     session: &AppSession,
     explicit_model: bool,
     model_policy: &ModelPolicy,
-) -> Model {
+) -> (Model, Option<String>) {
     if explicit_model || !model_policy.allows(&session.model) {
-        return startup.clone();
+        return (startup.clone(), None);
     }
-    providers
-        .model(&session.model)
-        .unwrap_or_else(|_| startup.clone())
+    if session.model == startup.spec() {
+        return (startup.clone(), None);
+    }
+    let Ok(model) = providers.model(&session.model) else {
+        return (startup.clone(), None);
+    };
+    if smol::block_on(is_configured(providers, storage, &model.provider)) {
+        return (model, None);
+    }
+    let warning = format!(
+        "the session's model {} has no provider credentials; using {}",
+        session.model,
+        startup.spec()
+    );
+    (startup.clone(), Some(warning))
 }
 
 fn resolve_session(
@@ -331,9 +354,46 @@ fn exit_resume_hint(id: &str, colored: bool) -> String {
 
 const ATTACHED_RELOAD: &str = "this window is attached to another machine; restart it to reload";
 
+/// Runs this window on a session an agent of its own owns, so other machines
+/// can watch it: the interface talks ACP to that agent, as `makima attach` does.
+fn hosted_session(
+    cwd: &Path,
+    address: SocketAddr,
+    token: Option<String>,
+    model: Option<String>,
+) -> Result<RemoteSession> {
+    let program = std::env::current_exe().context("find this program")?;
+    let mut extra = vec!["--share".to_owned(), address.to_string()];
+    if let Some(token) = token {
+        extra.push("--token".to_owned());
+        extra.push(token);
+    }
+    if let Some(model) = model {
+        extra.push("--model".to_owned());
+        extra.push(model);
+    }
+    let target = Target::local_with(cwd.to_path_buf(), &program.to_string_lossy(), extra).quiet();
+    let connection = maki_acp_client::connect(&target).map_err(|error| eyre!(error))?;
+    Ok(RemoteSession {
+        connection,
+        label: format!("this machine, shared on {address}"),
+    })
+}
+
 pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession>) -> Result<()> {
     if cli.print && session_picker_requested(&cli) {
         bail!(PICKER_NEEDS_TUI_ERR);
+    }
+    if cli.share.is_some() && (cli.last_session || cli.continue_session.is_some()) {
+        bail!(SHARED_RESUME_UNSUPPORTED);
+    }
+    if let (Some(address), None) = (cli.share, remote.as_ref()) {
+        remote = Some(hosted_session(
+            &cwd,
+            address,
+            cli.share_token.clone(),
+            cli.model.clone(),
+        )?);
     }
     let attached = remote.is_some();
     let explicit_model = cli.model.is_some();
@@ -475,13 +535,15 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
     let mut teardown = Teardown::default();
     loop {
         let focused_tab = &tabs[focused];
-        let model = restored_session_model(
+        let (model, warning) = restored_session_model(
             &stack.providers,
+            &storage,
             &stack.model,
             focused_tab,
             apply_explicit_model,
             &stack.config.provider.model_policy,
         );
+        warnings.extend(warning);
 
         let outcome = maki_ui::run(
             maki_ui::EventLoopParams {
@@ -685,8 +747,9 @@ mod tests {
         let startup = Model::from_spec("openai/gpt-5").unwrap();
         let session = AppSession::new("anthropic/claude-opus-4-6", "/tmp");
 
-        let resolved = restored_session_model(
-            &maki_providers::test_util::offline_ids(&["anthropic", "openai"]),
+        let (resolved, warning) = restored_session_model(
+            &maki_providers::test_util::configured_ids(&["anthropic", "openai"]),
+            &StateDir::from_path(PathBuf::from("/tmp")),
             &startup,
             &session,
             explicit_model,
@@ -694,6 +757,27 @@ mod tests {
         );
 
         assert_eq!(resolved.spec(), expected);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn tui_restored_model_without_credentials_falls_back_to_startup() {
+        let startup = Model::from_spec("openai/gpt-5").unwrap();
+        let session = AppSession::new("anthropic/claude-opus-4-6", "/tmp");
+
+        let (resolved, warning) = restored_session_model(
+            &maki_providers::test_util::offline_ids(&["anthropic", "openai"]),
+            &StateDir::from_path(PathBuf::from("/tmp")),
+            &startup,
+            &session,
+            false,
+            &ModelPolicy::default(),
+        );
+
+        assert_eq!(resolved.spec(), startup.spec());
+        let warning = warning.expect("an unconfigured session model warns");
+        assert!(warning.contains("anthropic/claude-opus-4-6"), "{warning}");
+        assert!(warning.contains(startup.spec().as_str()), "{warning}");
     }
 
     #[test]

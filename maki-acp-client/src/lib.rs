@@ -321,6 +321,9 @@ pub struct Target {
     lan: Option<Lan>,
     /// Whether the session must already exist there, as a copied link implies.
     attach_only: bool,
+    /// Whether the agent's stderr is dropped instead of shared with us, for a
+    /// frontend that owns the terminal.
+    quiet: bool,
 }
 
 struct Lan {
@@ -372,8 +375,16 @@ impl Target {
     }
 
     fn local(cwd: PathBuf, agent: &str, model: Option<&str>) -> Self {
-        let mut args = vec![ACP_SUBCOMMAND.to_owned()];
+        let mut args = Vec::new();
         push_model(&mut args, model);
+        Self::local_with(cwd, agent, args)
+    }
+
+    /// The agent this machine runs, with extra arguments for its `acp` command,
+    /// like `--share`.
+    pub fn local_with(cwd: PathBuf, agent: &str, extra: Vec<String>) -> Self {
+        let mut args = vec![ACP_SUBCOMMAND.to_owned()];
+        args.extend(extra);
         Self {
             label: "local".to_owned(),
             program: agent.to_owned(),
@@ -382,7 +393,14 @@ impl Target {
             session_cwd: cwd,
             lan: None,
             attach_only: false,
+            quiet: false,
         }
+    }
+
+    /// Keeps the agent's stderr out of ours, for a frontend drawing the terminal.
+    pub fn quiet(mut self) -> Self {
+        self.quiet = true;
+        self
     }
 
     /// `lan://host:port:/absolute/path`: the session runs on the machine that
@@ -416,6 +434,7 @@ impl Target {
             args: Vec::new(),
             process_cwd: None,
             attach_only,
+            quiet: false,
             session_cwd: path,
             lan: Some(Lan {
                 address: address.to_owned(),
@@ -449,6 +468,7 @@ impl Target {
             session_cwd: path,
             lan: None,
             attach_only: false,
+            quiet: false,
         })
     }
 
@@ -490,7 +510,11 @@ impl Target {
             .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(if self.quiet {
+                Stdio::null()
+            } else {
+                Stdio::inherit()
+            });
         if let Some(cwd) = &self.process_cwd {
             command.current_dir(cwd);
         }

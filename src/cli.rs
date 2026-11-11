@@ -108,6 +108,15 @@ pub struct Cli {
     #[arg(long)]
     pub exit_on_done: bool,
 
+    /// Run the interface on a session this process owns, and let other machines
+    /// watch it at this address, like 0.0.0.0:7331
+    #[arg(long, value_name = "ADDR", conflicts_with = "print")]
+    pub share: Option<SocketAddr>,
+
+    /// Token those machines must present. Defaults to $MAKIMA_LAN_TOKEN, then the stored token
+    #[arg(long, value_name = "TOKEN", requires = "share")]
+    pub share_token: Option<String>,
+
     /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
     #[arg(long, value_delimiter = ',', visible_alias = "allowedTools")]
     pub allowed_tools: Vec<String>,

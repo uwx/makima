@@ -154,6 +154,15 @@ makima --no-jit acp
 
 Starts an [ACP](/docs/acp/) server on stdio for editors like Zed, or over TCP with `--listen`, or both with `--share`, for [remote agents](/docs/acp/#remote-agents-over-tcp). Subcommand flags are `-m` / `--model`, `--yolo`, `--listen`, `--share` and `--token`. Global flags like `--no-jit` must come before the subcommand.
 
+### `makima --share`
+
+```bash
+makima --share 0.0.0.0:7331
+makima --share 0.0.0.0:7331 --share-token my-token
+```
+
+Runs the interface on a session this process owns, and lets other machines watch it. The interface talks ACP to an agent of its own, the way the desktop does, so what another window or a phone sees is the same session you are typing into. Watch it with `makima attach lan://<address>` or from the phone app. It starts a new session; resuming one with `-c` or `-l` is not supported there yet.
+
 ### `makima attach`
 
 ```bash
