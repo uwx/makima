@@ -135,7 +135,7 @@ makima attach lan://192.168.2.4:60667 --token my-token
 makima attach 192.168.2.4:60667 --plain # line rendering instead
 ```
 
-With no link it waits a few seconds and lists the announced sessions to choose from. The chat then shows the turn you start: streamed text, thinking, tool calls, and the usual permission prompt. Each turn is a `session/prompt` sent to the machine that runs the agent, so the model, the tools and the files all stay there, and prompting a session you only watch takes control of it. Messages from before you attached stay on that machine; `--plain` prints them in line mode.
+With no link it waits a few seconds and lists the announced sessions to choose from. The chat then shows the turn you start: streamed text, thinking, tool calls, and the usual permission prompt. Each turn is a `session/prompt` sent to the machine that runs the agent, so the model, the tools and the files all stay there, and prompting a session you only watch takes control of it. A turn another window starts while you watch streams into the same transcript, under a line saying it runs in another window. Those rows are a view: they belong to the session on the machine that ran the turn, not to this window's own history, so a restart does not replay them. Messages from before you attached stay on that machine; `--plain` prints them in line mode.
 
 `--plain` keeps the line renderer for a terminal that cannot take the full screen, which is also what a pipe gets. There the session is watched read only until you type `/take`; `/cancel` stops a turn, `/quit` leaves, tool calls print as `→ title` and `✓ title`, and permissions and pickers take a number.
 
@@ -151,6 +151,12 @@ Only an idle session changes hands. While a turn runs or a permission question i
 
 ```json
 {"method":"maki/ui/control","params":{"controller":false}}
+```
+
+Every connection that shows the session, the owner's included, hears when a turn starts and ends, so it can label a turn another window runs and know whether Stop would do anything:
+
+```json
+{"method":"maki/ui/turn","params":{"running":true}}
 ```
 
 The controller prompts, cancels, answers permission questions and rewinds. The owning connection can take control back the same way.

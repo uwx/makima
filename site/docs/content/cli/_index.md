@@ -161,7 +161,7 @@ makima --share 0.0.0.0:7331
 makima --share 0.0.0.0:7331 --share-token my-token
 ```
 
-Runs the interface on a session this process owns, and lets other machines watch it. The interface talks ACP to an agent of its own, the way the desktop does, so what another window or a phone sees is the same session you are typing into. Watch it with `makima attach lan://<address>` or from the phone app. It starts a new session; resuming one with `-c` or `-l` is not supported there yet.
+Runs the interface on a session this process owns, and lets other machines watch it. The interface talks ACP to an agent of its own, the way the desktop does, so what another window or a phone sees is the same session you are typing into, and a turn another window runs appears here too, under a line saying where it runs. Watch it with `makima attach lan://<address>` or from the phone app. It starts a new session; resuming one with `-c` or `-l` is not supported there yet, though the session it created can be reopened afterwards.
 
 ### `makima attach`
 
