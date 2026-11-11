@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::{
@@ -39,7 +38,6 @@ pub(crate) struct AcpBackend {
     events: Receiver<maki_acp_client::Event>,
     agent_tx: flume::Sender<Envelope>,
     answers: Arc<Mutex<Receiver<String>>>,
-    read_only: Arc<AtomicBool>,
     model: String,
 }
 
@@ -54,7 +52,6 @@ impl AcpBackend {
             events: connection.events.clone(),
             agent_tx,
             answers: Arc::new(Mutex::new(answers)),
-            read_only: Arc::new(AtomicBool::new(connection.read_only)),
             model: connection.model.clone(),
         }
     }
@@ -69,15 +66,17 @@ impl AcpBackend {
         while self.events.try_recv().is_ok() {}
     }
 
+    /// Whoever types gets to act, as long as the session is idle: another
+    /// window may hold control, and this one takes it back by prompting.
     fn claim(&self) -> Result<(), String> {
-        if !self.read_only.load(Ordering::Acquire) {
+        if self.client.controls_session() {
             return Ok(());
         }
-        if self.client.take_control()? {
-            self.read_only.store(false, Ordering::Release);
-            return Ok(());
+        match self.client.take_control() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("Another window controls this session".to_owned()),
+            Err(error) => Err(error),
         }
-        Err("Another window controls this session".to_owned())
     }
 }
 

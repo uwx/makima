@@ -9,7 +9,7 @@ use std::net::TcpStream;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
@@ -578,6 +578,7 @@ fn spawn_agent(
         pending: Mutex::new(HashMap::new()),
         events: events_tx,
         session: Mutex::new(None),
+        controller: AtomicBool::new(true),
     });
 
     spawn_writer(writer, out_rx)?;
@@ -633,6 +634,7 @@ fn open_session(
             (session, model, options, false)
         }
     };
+    client.set_controller(!read_only);
     Ok(Connection {
         client,
         events,
@@ -665,6 +667,14 @@ fn handshake(stream: &mut TcpStream, token: &str) -> Result<(), String> {
 
 /// Reads one line without buffering past it, so the same stream can be handed
 /// to the reader thread afterwards.
+/// The message an ACP error carries, without the JSON around it.
+fn error_message(error: &Value) -> String {
+    match error.get("message").and_then(Value::as_str) {
+        Some(message) => message.to_owned(),
+        None => error.to_string(),
+    }
+}
+
 fn read_line(stream: &mut TcpStream) -> Result<String, String> {
     let mut line = Vec::new();
     let mut byte = [0_u8; 1];
@@ -738,6 +748,9 @@ pub struct Client {
     pending: Mutex<HashMap<i64, Sender<Result<Value, String>>>>,
     events: Sender<Event>,
     session: Mutex<Option<SessionId>>,
+    /// Whether this connection is the one allowed to act on the session. A
+    /// session's owner starts with it; a watcher has to take it.
+    controller: AtomicBool,
 }
 
 impl Client {
@@ -865,7 +878,18 @@ impl Client {
     /// Makes this window the one that may act on the session.
     pub fn take_control(&self) -> Result<bool, String> {
         let reply: Value = self.request(TAKE_CONTROL_METHOD, json!({}), Some(SESSION_TIMEOUT))?;
-        Ok(reply.get("controller").and_then(Value::as_bool) == Some(true))
+        let controller = reply.get("controller").and_then(Value::as_bool) == Some(true);
+        self.controller.store(controller, Ordering::Release);
+        Ok(controller)
+    }
+
+    /// Whether this connection may prompt, change options or rewind.
+    pub fn controls_session(&self) -> bool {
+        self.controller.load(Ordering::Acquire)
+    }
+
+    fn set_controller(&self, controller: bool) {
+        self.controller.store(controller, Ordering::Release);
     }
 
     pub fn prompt(&self, text: &str) -> Result<StopReason, String> {
@@ -967,7 +991,7 @@ impl Client {
             return;
         };
         let result = match message.get("error") {
-            Some(error) => Err(error.to_string()),
+            Some(error) => Err(error_message(error)),
             None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
         };
         let _ = sender.send(result);
@@ -994,6 +1018,7 @@ impl Client {
                     .pointer("/params/controller")
                     .and_then(Value::as_bool)
                 {
+                    self.set_controller(controller);
                     let _ = self.emit(Event::Control(controller));
                 }
             }
@@ -1148,7 +1173,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        ACP_SUBCOMMAND, MODEL_FLAG, SSH_PROGRAM, Target, ThemePalette, diff_text, themes_from,
+        ACP_SUBCOMMAND, MODEL_FLAG, SSH_PROGRAM, Target, ThemePalette, diff_text, error_message,
+        themes_from,
     };
     use test_case::test_case;
 
@@ -1540,5 +1566,15 @@ old
                 "maki/unshare"
             ]
         );
+    }
+
+    #[test]
+    fn an_acp_error_reads_as_its_message() {
+        let error = serde_json::json!({
+            "code": -32010,
+            "message": "this connection is read-only",
+        });
+        assert_eq!(error_message(&error), "this connection is read-only");
+        assert_eq!(error_message(&serde_json::json!("plain")), "\"plain\"");
     }
 }
