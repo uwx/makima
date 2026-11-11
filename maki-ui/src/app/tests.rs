@@ -7383,6 +7383,38 @@ fn an_adopted_history_replaces_the_window_copy() {
     assert_eq!(app.chats[0].message_at(1).unwrap().text, "two");
 }
 
+#[test]
+fn another_windows_answer_closes_the_permission_prompt() {
+    let mut app = test_app();
+    app.permission_prompt.open_for_agent(
+        "remote-1".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+        None,
+    );
+    app.active_input = Some(InputKind::Permission);
+    app.input_queue.push_back(InputDemand {
+        kind: InputKind::Permission,
+        blocked_by_modal: false,
+        hold_until_submit: false,
+        perm: Some(PermissionPayload {
+            id: "remote-2".into(),
+            tool: maki_config::ToolKey::native("bash"),
+            scopes: vec!["execute".into()],
+            agent_id: None,
+        }),
+    });
+
+    app.dismiss_permission("remote-1");
+    assert_eq!(app.permission_prompt.request_id(), Some("remote-2"));
+
+    app.dismiss_permission("remote-2");
+    assert!(!app.permission_prompt.is_open());
+    assert!(app.active_input.is_none());
+    assert!(app.input_queue.is_empty());
+}
+
 fn build_rewind_app() -> App {
     let mut app = test_app();
 

@@ -65,7 +65,6 @@ impl AcpBackend {
             settled,
             turn: turn.clone(),
             mirror: Mirror::new(agent_tx.clone(), connection.model.clone()),
-            client: Arc::clone(&connection.client),
             permissions: permissions.clone(),
         };
         smol::spawn(reader.run()).detach();
@@ -233,7 +232,6 @@ struct Reader {
     settled: Receiver<flume::Sender<()>>,
     turn: SharedTurn,
     mirror: Mirror,
-    client: Arc<Client>,
     permissions: Permissions,
 }
 
@@ -265,12 +263,17 @@ impl Reader {
                     self.mirror.update(*update);
                 }
             }
-            maki_acp_client::Event::Permission(prompt) => match self.turn.sender() {
-                Some(sender) => self.permissions.ask(&sender, prompt),
-                // Between turns a question belongs to the window driving the
-                // turn; declining it keeps the agent from waiting on us.
-                None => self.client.answer(prompt.id, None),
-            },
+            maki_acp_client::Event::Permission(prompt) => {
+                // A question another window's turn asked is still shown here,
+                // so whichever window sees it can answer it.
+                let sender = self.turn.sender().unwrap_or_else(|| self.mirror.sender());
+                self.permissions.ask(&sender, prompt);
+            }
+            maki_acp_client::Event::PermissionDone { request } => {
+                if let Some(id) = self.permissions.dismiss(&request) {
+                    self.mirror.dismissed(id);
+                }
+            }
             maki_acp_client::Event::Turn(running) => {
                 if self.turn.is_running() {
                     return;
@@ -374,6 +377,10 @@ impl Mirror {
         }
     }
 
+    fn sender(&self) -> EventSender {
+        self.translator.sender.clone()
+    }
+
     fn start(&mut self) {
         if self.running {
             return;
@@ -409,6 +416,12 @@ impl Mirror {
         if self.running {
             self.translator.update(update);
         }
+    }
+
+    fn dismissed(&self, id: String) {
+        self.translator
+            .sender
+            .try_send(AgentEvent::PermissionDismissed { id });
     }
 
     fn committed(&self, messages: Vec<Value>, start: usize, replace: bool, compacted: bool) {
@@ -465,6 +478,19 @@ impl Permissions {
         {
             self.lock().requests.remove(&id);
         }
+    }
+
+    /// Removes the question another window answered, returning this window's
+    /// id for it so the prompt closes.
+    fn dismiss(&self, request: &Value) -> Option<String> {
+        let mut state = self.lock();
+        let id = state
+            .requests
+            .iter()
+            .find(|(_, pending)| pending.request == *request)
+            .map(|(id, _)| id.clone())?;
+        state.requests.remove(&id);
+        Some(id)
     }
 
     fn answer(&self, client: &Client, raw: &str) {

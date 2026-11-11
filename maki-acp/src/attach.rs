@@ -3,7 +3,7 @@
 //! The connection that owns the session keeps serializing its work; any
 //! watcher may ask for a turn, and the answers go back to the one that asked.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -30,6 +30,13 @@ pub const TURN_METHOD: &str = "maki/ui/turn";
 /// What the session added to its history, or the whole of it after a rewrite,
 /// so every window keeps the same transcript to resume, rewind or compact.
 pub const COMMITTED_METHOD: &str = "maki/ui/committed";
+/// The question another window answered, so every window closes it.
+pub const PERMISSION_DONE_METHOD: &str = "maki/ui/permission_done";
+/// Client to server: a window that did not ask answers the session's permission
+/// question. Forwarded to the connection that owns the session.
+pub const ANSWER_PERMISSION_METHOD: &str = "maki/ui/answer_permission";
+/// Server to client: the session asks a permission question.
+pub const PERMISSION_METHOD: &str = "session/request_permission";
 
 /// Answers `session/new` or `session/load` while another connection already
 /// owns the process's session.
@@ -196,6 +203,9 @@ pub struct SessionTap {
     announced: Mutex<Option<(u64, usize)>>,
     /// The id this tap was registered under, named in its announcements.
     session_id: Mutex<Option<String>>,
+    /// The permission questions the session asked and no window has answered.
+    /// Any window may answer one; the first answer ends it everywhere.
+    permissions: Mutex<HashSet<i64>>,
     /// The connection the session belongs to. It shows the session whether or
     /// not it is the one acting, so it hears about turns and resets.
     owner: Mutex<Option<Sender<Value>>>,
@@ -217,6 +227,7 @@ impl Default for SessionTap {
             history: Mutex::default(),
             announced: Mutex::default(),
             session_id: Mutex::default(),
+            permissions: Mutex::default(),
             owner: Mutex::default(),
             asker: Mutex::default(),
             info: Mutex::default(),
@@ -264,6 +275,43 @@ impl SessionTap {
 
     pub fn identify(&self, id: &str) {
         *self.session_id.lock().unwrap() = Some(id.to_owned());
+    }
+
+    /// Records a permission question every window received, so an answer from
+    /// any of them can be routed back.
+    pub fn expect_permission(&self, request: i64) {
+        self.permissions.lock().unwrap().insert(request);
+    }
+
+    pub fn expects_permission(&self, request: i64) -> bool {
+        self.permissions.lock().unwrap().contains(&request)
+    }
+
+    /// Ends a permission question here and in every window. False when another
+    /// window got there first.
+    pub fn permission_done(&self, request: i64) -> bool {
+        if !self.permissions.lock().unwrap().remove(&request) {
+            return false;
+        }
+        self.announce(json!({
+            "jsonrpc": "2.0",
+            "method": PERMISSION_DONE_METHOD,
+            "params": { "requestId": request },
+        }));
+        true
+    }
+
+    /// Ends every open permission question, for a turn that was cancelled or a
+    /// session going away.
+    pub fn clear_permissions(&self) {
+        let open = std::mem::take(&mut *self.permissions.lock().unwrap());
+        for request in open {
+            self.announce(json!({
+                "jsonrpc": "2.0",
+                "method": PERMISSION_DONE_METHOD,
+                "params": { "requestId": request },
+            }));
+        }
     }
 
     /// Asks the session whether a turn is running, announcing any change.
@@ -678,6 +726,45 @@ mod tests {
             .map(|message| message["params"]["running"].clone())
             .collect();
         assert_eq!(running, vec![json!(true), json!(false)]);
+    }
+
+    #[test]
+    fn a_permission_answer_ends_the_question_everywhere() {
+        let tap = SessionTap::default();
+        let (owner, owner_rx) = flume::unbounded();
+        let (watcher, watcher_rx) = flume::unbounded();
+        tap.set_owner(owner);
+        tap.subscribe(watcher);
+        tap.expect_permission(7);
+
+        assert!(tap.expects_permission(7));
+        assert!(tap.permission_done(7));
+
+        for rx in [owner_rx, watcher_rx] {
+            let message = rx.recv().unwrap();
+            assert_eq!(message["method"], PERMISSION_DONE_METHOD);
+            assert_eq!(message["params"]["requestId"], json!(7));
+        }
+        assert!(!tap.expects_permission(7));
+        assert!(!tap.permission_done(7), "a question ends once");
+    }
+
+    #[test]
+    fn clearing_permissions_tells_every_window() {
+        let tap = SessionTap::default();
+        let (out, rx) = flume::unbounded();
+        tap.subscribe(out);
+        tap.expect_permission(1);
+        tap.expect_permission(2);
+
+        tap.clear_permissions();
+
+        let mut answered: Vec<i64> = rx
+            .drain()
+            .map(|message| message["params"]["requestId"].as_i64().unwrap())
+            .collect();
+        answered.sort_unstable();
+        assert_eq!(answered, vec![1, 2]);
     }
 
     #[test]

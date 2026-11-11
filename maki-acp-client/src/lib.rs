@@ -66,6 +66,7 @@ const SHARE_METHOD: &str = "maki/share";
 const UNSHARE_METHOD: &str = "maki/unshare";
 const TURN_METHOD: &str = "maki/ui/turn";
 const COMMITTED_METHOD: &str = "maki/ui/committed";
+const PERMISSION_DONE_METHOD: &str = "maki/ui/permission_done";
 const REWIND_METHOD: &str = "maki/rewind";
 const REWOUND_METHOD: &str = "maki/ui/rewind";
 const SHORT_SESSION_CHARS: usize = 8;
@@ -81,6 +82,10 @@ const TRUNCATED_HISTORY: &str =
 pub enum Event {
     Update(Box<SessionUpdate>),
     Permission(PermissionPrompt),
+    /// Another window answered a permission question this one also shows.
+    PermissionDone {
+        request: Value,
+    },
     Flash(String),
     Pick(PickPrompt),
     /// Argument candidates for `text`, the composer content that asked.
@@ -676,6 +681,11 @@ fn error_message(error: &Value) -> String {
     }
 }
 
+fn permission_done_event(message: &Value) -> Option<Event> {
+    let request = message.pointer("/params/requestId")?.clone();
+    Some(Event::PermissionDone { request })
+}
+
 fn committed_event(message: &Value) -> Option<Event> {
     let params = message.get("params")?;
     let messages = params.get("messages")?.as_array()?.clone();
@@ -1006,6 +1016,11 @@ impl Client {
             REWOUND_METHOD => {
                 let _ = self.emit(Event::Rewound);
             }
+            PERMISSION_DONE_METHOD => {
+                if let Some(event) = permission_done_event(message) {
+                    let _ = self.emit(event);
+                }
+            }
             TURN_METHOD => {
                 if let Some(running) = message.pointer("/params/running").and_then(Value::as_bool) {
                     let _ = self.emit(Event::Turn(running));
@@ -1239,6 +1254,22 @@ old
             _ => panic!("no committed event"),
         }
         assert!(super::committed_event(&serde_json::json!({ "params": {} })).is_none());
+    }
+
+    #[test]
+    fn a_permission_done_names_the_question_it_ends() {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": super::PERMISSION_DONE_METHOD,
+            "params": { "requestId": 41 },
+        });
+        match super::permission_done_event(&message) {
+            Some(super::Event::PermissionDone { request }) => {
+                assert_eq!(request, serde_json::json!(41));
+            }
+            _ => panic!("no permission done event"),
+        }
+        assert!(super::permission_done_event(&serde_json::json!({ "params": {} })).is_none());
     }
 
     const HOST: &str = "buildbox";

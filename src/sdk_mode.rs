@@ -1910,6 +1910,7 @@ impl EventPump {
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::MirroredPrompt { .. }
             | AgentEvent::HistoryCommitted { .. }
+            | AgentEvent::PermissionDismissed { .. }
             | AgentEvent::ModelSwitched { .. }
             | AgentEvent::QueueSettled
             | AgentEvent::AutoCompacting { .. }

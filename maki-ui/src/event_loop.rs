@@ -2738,6 +2738,11 @@ impl<'t> EventLoop<'t> {
             self.adopt_history(idx, Arc::clone(messages), *start, *replace, *compacted);
             return;
         }
+        // Another window answered a permission question this one also shows.
+        if let AgentEvent::PermissionDismissed { id } = &envelope.event {
+            self.sessions[idx].app.dismiss_permission(id);
+            return;
+        }
         let rt = &mut self.sessions[idx];
         rt.app.adopt_actor_presentation(&envelope);
         if let AgentEvent::Post(post) = envelope.event {

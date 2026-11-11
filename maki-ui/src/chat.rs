@@ -132,6 +132,8 @@ impl Chat {
             // History arrives through the event loop; the transcript rows it
             // describes were streamed here already.
             AgentEvent::HistoryCommitted { .. } => {}
+            // A permission prompt this window did not show.
+            AgentEvent::PermissionDismissed { .. } => {}
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),
             AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
             AgentEvent::ToolExecutionStart { .. } => {}

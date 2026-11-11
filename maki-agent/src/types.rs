@@ -938,6 +938,11 @@ pub enum AgentEvent {
     ControlError {
         message: String,
     },
+    /// Another window answered a permission question this window also shows,
+    /// so it closes without answering.
+    PermissionDismissed {
+        id: String,
+    },
     PermissionRequest {
         id: String,
         tool: ToolKey,

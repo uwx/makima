@@ -620,6 +620,15 @@ async fn serve_connection(
         async move {
             while let Ok(msg) = out_rx.recv_async().await {
                 taps.observe(&msg);
+                // A permission question goes to every window, not only to the
+                // one that asked, so any of them can answer it.
+                if msg.get("method").and_then(Value::as_str) == Some(attach::PERMISSION_METHOD) {
+                    if let Some(request) = msg.get("id").and_then(Value::as_i64) {
+                        own_tap.expect_permission(request);
+                    }
+                    own_tap.announce(msg);
+                    continue;
+                }
                 // Answers and questions belong to the window that asked for
                 // what is running, which need not be the one that owns it.
                 if msg.get("id").is_some()
@@ -703,14 +712,14 @@ async fn serve_connection(
     }
 
     if let Some(session) = &server.session {
-        refuse_asks(session);
+        refuse_asks(session, &server.own_tap);
     }
     if let Some(dispatch) = server.dispatch.as_mut() {
         let dispatched = (&mut dispatch.future).await;
         respond_dispatch(&mut server, dispatched).await;
     }
     if let Some(session) = &server.session {
-        finish_in_flight(session).await;
+        finish_in_flight(session, &server.own_tap).await;
     }
     close_session(&mut server).await;
     if let Some(tap) = server.attached.take() {
@@ -977,6 +986,11 @@ async fn handle_request(
                 srv.reply(),
                 Response::new(id, Ok::<Value, AcpError>(result)),
             );
+            return;
+        }
+        attach::ANSWER_PERMISSION_METHOD => {
+            let result = answer_forwarded_permission(srv, raw);
+            send(srv.reply(), Response::new(id, result));
             return;
         }
         // Older clients ask before acting; every connection may act now, so
@@ -1455,7 +1469,7 @@ async fn start_mcp(
 
 /// The client closed its input, so the asks it can no longer answer are
 /// refused, now and from here on.
-fn refuse_asks(session: &SessionState) {
+fn refuse_asks(session: &SessionState, tap: &SessionTap) {
     let (permission_answers, elicitation) = {
         let mut pending = session.pending.lock().unwrap();
         pending.input_closed = true;
@@ -1464,6 +1478,7 @@ fn refuse_asks(session: &SessionState) {
             pending.elicitation.take(),
         )
     };
+    tap.clear_permissions();
     answer_cancelled_requests(&session.handle, permission_answers, elicitation);
 }
 
@@ -1471,8 +1486,8 @@ fn refuse_asks(session: &SessionState) {
 /// flight runs to its end and reports, background subagents and the turns
 /// their results start included, while the asks it can no longer get
 /// answered are refused.
-async fn finish_in_flight(session: &SessionState) {
-    refuse_asks(session);
+async fn finish_in_flight(session: &SessionState, tap: &SessionTap) {
+    refuse_asks(session, tap);
     loop {
         let settled = {
             let pending = session.pending.lock().unwrap();
@@ -1504,6 +1519,7 @@ async fn close_session(srv: &mut Server) {
     srv.lua_event_handle.clear_orchestration_services();
     // The event pump dies with the session, so the requests it owed answers to
     // have to be answered here or the client waits on them forever.
+    srv.own_tap.clear_permissions();
     let (operations, permission_answers, elicitation) = {
         let mut pending = state.pending.lock().unwrap();
         (
@@ -2904,6 +2920,9 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                     let elicitation = pending.elicitation.take();
                     (cancellations, permission_answers, elicitation)
                 };
+                if let Some(tap) = srv.session_tap() {
+                    tap.clear_permissions();
+                }
                 answer_cancelled_requests(&session.handle, permission_answers, elicitation);
                 for cancellation in cancellations {
                     cancellation.cancel();
@@ -2926,6 +2945,25 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
     {
         return;
     }
+    // A window that did not ask may answer a permission question the session
+    // broadcast. Its own loop does not hold the question, so the answer goes
+    // to the connection that owns the session.
+    if let Some(id) = id_num
+        && let Some(tap) = srv.attached.as_ref()
+        && tap.expects_permission(id)
+    {
+        let (reply, _) = flume::unbounded();
+        tap.forward(
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": attach::ANSWER_PERMISSION_METHOD,
+                "params": { "requestId": id, "response": raw },
+            }),
+            reply,
+        );
+        return;
+    }
     let Some(session) = &srv.session else { return };
     let answer = {
         let mut pending = session.pending.lock().unwrap();
@@ -2935,11 +2973,16 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
                 .take_if(|pending| *pending == id)
                 .is_some()
         {
-            Some((session.handle.answer_tx.clone(), elicitation_answer(raw)))
+            Some((
+                None,
+                session.handle.answer_tx.clone(),
+                elicitation_answer(raw),
+            ))
         } else if let Some(id) = id_num
             && let Some((request_id, answer_tx)) = pending.permissions.remove(&id)
         {
             Some((
+                Some(id),
                 answer_tx,
                 TaggedAnswer::new(request_id, permission_answer(raw)).encode(),
             ))
@@ -2948,9 +2991,47 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
             None
         }
     };
-    if let Some((answer_tx, answer)) = answer {
+    if let Some((permission, answer_tx, answer)) = answer {
         let _ = answer_tx.send(answer);
+        if let Some(id) = permission
+            && let Some(tap) = srv.session_tap()
+        {
+            tap.permission_done(id);
+        }
     }
+}
+
+/// A window that did not ask answered a permission question: the question's
+/// owner resolves it and tells every window it is settled.
+fn answer_forwarded_permission(srv: &Server, raw: &Value) -> Result<Value, AcpError> {
+    let request = raw
+        .pointer("/params/requestId")
+        .and_then(Value::as_i64)
+        .ok_or_else(AcpError::invalid_params)?;
+    let response = raw
+        .pointer("/params/response")
+        .ok_or_else(AcpError::invalid_params)?;
+    let session = srv.session.as_ref().ok_or_else(no_session)?;
+    let answer = {
+        let mut pending = session.pending.lock().unwrap();
+        pending
+            .permissions
+            .remove(&request)
+            .map(|(tool_id, answer_tx)| {
+                (
+                    answer_tx,
+                    TaggedAnswer::new(tool_id, permission_answer(response)).encode(),
+                )
+            })
+    };
+    let Some((answer_tx, answer)) = answer else {
+        return Ok(json!({ "answered": false }));
+    };
+    let _ = answer_tx.send(answer);
+    if let Some(tap) = srv.session_tap() {
+        tap.permission_done(request);
+    }
+    Ok(json!({ "answered": true }))
 }
 
 /// A response we cannot read still has to answer the tool, or it waits on an
@@ -5065,6 +5146,74 @@ mod tests {
     }
 
     #[test]
+    fn a_watching_window_forwards_its_answer_to_the_owner() {
+        let tap = Arc::new(attach::SessionTap::default());
+        tap.expect_permission(ANSWERED_ID);
+        let (out_tx, _out_rx) = flume::unbounded();
+        let (wire, _wire_rx) = flume::unbounded();
+        let srv = Server {
+            out_tx,
+            wire,
+            taps: Arc::default(),
+            attached: Some(Arc::clone(&tap)),
+            own_tap: Arc::default(),
+            origin: None,
+            catalog: ModelCatalog::default(),
+            session: None,
+            elicitation: false,
+            supports_boolean: false,
+            lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
+            ui: UiBridge::default(),
+            dispatch: None,
+        };
+
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+
+        let forwarded = tap.inbox().recv().unwrap();
+        assert_eq!(
+            forwarded.message["method"],
+            attach::ANSWER_PERMISSION_METHOD
+        );
+        assert_eq!(
+            forwarded.message["params"]["requestId"],
+            serde_json::json!(ANSWERED_ID)
+        );
+        assert!(
+            tap.expects_permission(ANSWERED_ID),
+            "the owner settles the question, not this window"
+        );
+    }
+
+    #[test]
+    fn a_window_that_did_not_ask_can_answer_the_question() {
+        let (srv, answer_rx, ..) = server_awaiting_answer();
+        let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+        srv.taps.register(&session_id, Arc::clone(&srv.own_tap));
+        srv.own_tap.expect_permission(ANSWERED_ID);
+
+        let result = answer_forwarded_permission(
+            &srv,
+            &serde_json::json!({
+                "params": {
+                    "requestId": ANSWERED_ID,
+                    "response": allow_once(ANSWERED_ID),
+                }
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result, serde_json::json!({ "answered": true }));
+        assert_eq!(
+            answer_rx.try_recv().ok(),
+            Some(TaggedAnswer::new("toolu_1", PermissionAnswer::AllowOnce).encode())
+        );
+        assert!(
+            !srv.own_tap.expects_permission(ANSWERED_ID),
+            "the question is settled everywhere"
+        );
+    }
+
+    #[test]
     fn only_the_outstanding_request_id_is_answered() {
         let (srv, answer_rx, ..) = server_awaiting_answer();
 
@@ -5887,7 +6036,7 @@ mod tests {
             .unwrap();
             turns.next().await;
             let session = srv.session.as_ref().unwrap();
-            let mut finishing = Box::pin(finish_in_flight(session));
+            let mut finishing = Box::pin(finish_in_flight(session, &srv.own_tap));
             assert!(smol::future::poll_once(&mut finishing).await.is_none());
             assert_eq!(
                 answer_rx.try_recv().unwrap(),

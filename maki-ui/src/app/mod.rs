@@ -1236,6 +1236,18 @@ impl App {
         }
     }
 
+    /// Another window answered this question: close it here without answering.
+    pub(crate) fn dismiss_permission(&mut self, id: &str) {
+        self.input_queue
+            .retain(|demand| demand.perm.as_ref().is_none_or(|perm| perm.id != id));
+        if self.permission_prompt.request_id() == Some(id) {
+            self.permission_prompt.close();
+        }
+        self.reconcile_active();
+        let dirty = self.promote_deferred_if_ready();
+        self.pending_dirty |= dirty;
+    }
+
     fn answer_permission(&mut self, answer: maki_agent::permissions::PermissionAnswer) {
         let agent_id = self.permission_prompt.agent_id();
         let request_id = self.permission_prompt.request_id().unwrap_or_default();

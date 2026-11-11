@@ -520,6 +520,16 @@ impl SessionPanel {
                     diff: prompt.diff,
                 });
             }
+            Event::PermissionDone { request } => {
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.request == request)
+                {
+                    self.pending = None;
+                    cx.notify();
+                }
+            }
             Event::Flash(text) => self.notice(text),
             Event::Share(result) => {
                 match result {

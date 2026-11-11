@@ -143,7 +143,13 @@ With no link it waits a few seconds and lists the announced sessions to choose f
 
 There is no driver. Every connection attached to a session may prompt, cancel, answer a permission question, change options or rewind, and the loop that owns the session takes those requests one at a time, so two windows never run two turns at once. A prompt that arrives while a turn runs joins or queues behind it like a prompt typed locally.
 
-What the session asks goes to the window that asked for the work in flight: its permission questions, pickers and completions. If that window is gone, they go to the connection that owns the session. `maki/take_control` still answers `{"controller":true}` for older clients; nothing has to be taken.
+A permission question goes to every window, so the person nearest any of them can answer it. Every window receives the same `session/request_permission` request, and each answers with the ACP response it already knows; the connection that owns the session takes the first answer and tells the others the question is settled:
+
+```json
+{"method":"maki/ui/permission_done","params":{"requestId":41}}
+```
+
+A window that receives it closes the question without answering. Pickers and completions still go to the window that asked for the work in flight; if that window is gone, they go to the connection that owns the session. `maki/take_control` still answers `{"controller":true}` for older clients; nothing has to be taken.
 
 Every connection that shows the session, the owner's included, hears when a turn starts and ends, so it can label a turn another window runs and know whether Stop would do anything:
 
