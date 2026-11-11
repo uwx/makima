@@ -55,6 +55,33 @@ use std::sync::{Arc, OnceLock};
 
 use super::{host, AndroidKeyEvent, Bounds, DevicePixels, Pixels, Point, Size, TouchPoint};
 
+/// The focused input handler, for the key and touch callbacks.
+///
+/// The handler is not `Send`, but every callback `AndroidWindow` registers runs
+/// on the main thread, which is where it lives.
+struct UiHandler(Rc<RefCell<Option<gpui::PlatformInputHandler>>>);
+
+// SAFETY: the callbacks that touch this are only ever run on the main thread.
+unsafe impl Send for UiHandler {}
+
+impl UiHandler {
+    fn commit(&self, text: &str) -> bool {
+        super::text_input::commit_text(&self.0, text)
+    }
+}
+
+/// The text a printable key event types, if it types any. Control and alt
+/// shortcuts keep going to bindings.
+fn printable_key_text(key_event: &AndroidKeyEvent) -> Option<String> {
+    const META_ALT_ON: i32 = 0x02;
+    const META_CTRL_ON: i32 = 0x1000;
+    if key_event.meta_state & (META_ALT_ON | META_CTRL_ON) != 0 {
+        return None;
+    }
+    let character = char::from_u32(key_event.unicode_char)?;
+    (!character.is_control()).then(|| character.to_string())
+}
+
 /// A touch that ends within this distance of where it started is a tap, not a drag.
 fn is_tap_distance(start: gpui::Point<gpui::Pixels>, end: gpui::Point<gpui::Pixels>) -> bool {
     const SLOP: f32 = 10.;
@@ -1859,30 +1886,27 @@ impl PlatformWindow for AndroidPlatformWindow {
         // ── Key events → PlatformInput ───────────────────────────────────
         {
             let cb = Arc::clone(&input_cb);
+            let key_input_handler = UiHandler(Rc::clone(&self.input_handler));
             self.window.on_key_event(move |key_event| {
                 use crate::android::keyboard::{
                     android_key_to_keystroke, AKEY_EVENT_ACTION_DOWN, AKEY_EVENT_ACTION_UP,
                 };
 
-                // On KeyDown, dispatch text through the global callback so
-                // custom TextInput components (PENDING_TEXT) receive it.
+                // On KeyDown, dispatch the editing keys through the global
+                // callback so custom TextInput components (PENDING_TEXT) hear
+                // them; printable keys are typed after GPUI sees the event.
                 if key_event.action == AKEY_EVENT_ACTION_DOWN {
-                    match key_event.key_code {
-                        67 => crate::dispatch_text_input("\x08"), // KEYCODE_DEL (backspace)
-                        21 => crate::dispatch_text_input("\x1b[D"), // DPAD_LEFT
-                        22 => crate::dispatch_text_input("\x1b[C"), // DPAD_RIGHT
-                        122 => crate::dispatch_text_input("\x1b[H"), // MOVE_HOME
-                        123 => crate::dispatch_text_input("\x1b[F"), // MOVE_END
-                        _ => {
-                            if key_event.unicode_char != 0 {
-                                if let Some(c) = char::from_u32(key_event.unicode_char) {
-                                    let s = c.to_string();
-                                    crate::dispatch_text_input(&s);
-                                }
-                            }
-                            false
-                        }
+                    let sentinel = match key_event.key_code {
+                        67 => Some("\x08"),    // KEYCODE_DEL (backspace)
+                        21 => Some("\x1b[D"),  // DPAD_LEFT
+                        22 => Some("\x1b[C"),  // DPAD_RIGHT
+                        122 => Some("\x1b[H"), // MOVE_HOME
+                        123 => Some("\x1b[F"), // MOVE_END
+                        _ => None,
                     };
+                    if let Some(sentinel) = sentinel {
+                        crate::dispatch_text_input(sentinel);
+                    }
                 }
 
                 let keystroke = match android_key_to_keystroke(
@@ -1906,8 +1930,20 @@ impl PlatformWindow for AndroidPlatformWindow {
                     return; // ACTION_MULTIPLE or unknown
                 };
 
-                let mut guard = cb.lock();
-                let _ = guard(event);
+                let result = {
+                    let mut guard = cb.lock();
+                    guard(event)
+                };
+                // GPUI leaves typed characters to the platform's text services,
+                // and Android has none here, so an unhandled printable key is
+                // typed into the focused input by hand.
+                if key_event.action == AKEY_EVENT_ACTION_DOWN && result.propagate {
+                    if let Some(text) = printable_key_text(&key_event) {
+                        if !key_input_handler.commit(&text) {
+                            crate::dispatch_text_input(&text);
+                        }
+                    }
+                }
             });
         }
     }

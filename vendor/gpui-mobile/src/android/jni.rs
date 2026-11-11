@@ -60,6 +60,10 @@ const DISPLAY_CUTOUT_TYPE: i32 = 0x80;
 const IME_TYPE: i32 = 0x8;
 /// How long the keyboard takes to be laid out before its inset is readable.
 const IME_SETTLE: Duration = Duration::from_millis(300);
+/// How often the keyboard's height is re-read while it may be up.
+const IME_POLL: Duration = Duration::from_millis(250);
+/// How long to keep polling for a keyboard that never shows up.
+const IME_APPEAR_WAIT: Duration = Duration::from_secs(5);
 
 /// Whether the deferred init-window callback has already been invoked.
 ///
@@ -1540,6 +1544,46 @@ fn refresh_safe_area(win: &super::AndroidWindow, app: &AndroidApp) {
     win.set_ime_inset(ime_inset().unwrap_or(0.0));
 }
 
+/// Follows the keyboard's height until it is gone.
+///
+/// The system says nothing when the user dismisses the keyboard with its own
+/// gesture, and the window keeps its size, so nothing else would notice that
+/// the keyboard is down and the content could grow back.
+fn watch_ime_inset() {
+    static WATCHING: AtomicBool = AtomicBool::new(false);
+    if WATCHING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("maki-ime".into())
+        .spawn(|| {
+            let started = std::time::Instant::now();
+            let mut last = f32::NAN;
+            let mut was_up = false;
+            loop {
+                std::thread::sleep(IME_POLL);
+                let Some(ime) = ime_inset() else {
+                    break;
+                };
+                let Some(win) = PLATFORM.get().and_then(|platform| platform.primary_window())
+                else {
+                    break;
+                };
+                if !last.eq(&ime) {
+                    last = ime;
+                    win.set_ime_inset(ime);
+                    win.notify_insets_changed();
+                }
+                if ime > 0.0 {
+                    was_up = true;
+                } else if was_up || started.elapsed() > IME_APPEAR_WAIT {
+                    break;
+                }
+            }
+            WATCHING.store(false, Ordering::Release);
+        });
+}
+
 /// Reads the insets again once the keyboard has settled.
 ///
 /// A NativeActivity gets no insets callback when the keyboard opens and keeps its
@@ -1745,7 +1789,7 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
         // keyboard and sends the keystrokes as key events, which we already handle.
         if let Some(app) = android_app() {
             app.show_soft_input(true);
-            refresh_insets_later();
+            watch_ime_inset();
         }
     }
 }

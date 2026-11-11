@@ -112,6 +112,27 @@ pub(super) fn drain(
     }
 }
 
+/// Types `text` into the focused input.
+///
+/// For keyboards that send key events instead of IME commits: nothing else puts
+/// a character into an input, since GPUI leaves that to the platform's text
+/// services and Android has none without an `InputConnection`.
+pub(super) fn commit_text(
+    slot: &Rc<RefCell<Option<PlatformInputHandler>>>,
+    text: &str,
+) -> bool {
+    let Some(mut handler) = slot.borrow_mut().take() else {
+        return false;
+    };
+    handler.replace_text_in_range(None, text);
+    handler.unmark_text();
+    let mut current = slot.borrow_mut();
+    if current.is_none() {
+        *current = Some(handler);
+    }
+    true
+}
+
 pub(super) fn finish_composition(slot: &Rc<RefCell<Option<PlatformInputHandler>>>) {
     if !COMPOSING.swap(false, Ordering::AcqRel) {
         return;
