@@ -533,6 +533,12 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
     let mut focused = 0;
     let mut warnings = startup_warnings;
     let mut teardown = Teardown::default();
+    // A shared session lives in the agent this window started; the local
+    // transcript is only a view of it, so the resume hint must name that one.
+    let shared_session = remote
+        .as_ref()
+        .filter(|_| cli.share.is_some())
+        .map(|remote| remote.connection.session.0.to_string());
     loop {
         let focused_tab = &tabs[focused];
         let (model, warning) = restored_session_model(
@@ -590,9 +596,12 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
 
         match outcome {
             RunOutcome::Exit { session_id, code } => {
-                if let Some(session_id) = session_id {
+                let resume = shared_session
+                    .clone()
+                    .or_else(|| session_id.map(|id| id.to_string()));
+                if let Some(id) = resume {
                     let colored = io::stderr().is_terminal();
-                    eprintln!("{}", exit_resume_hint(&session_id.to_string(), colored));
+                    eprintln!("{}", exit_resume_hint(&id, colored));
                 }
                 let started = Instant::now();
                 drop(stack);
