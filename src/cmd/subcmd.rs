@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn registered_status_and_logout_use_the_shared_functions() {
         let state = TempDir::new().unwrap();
-        maki_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+        maki_storage::paths::init_shared_for_test();
         let storage = StateDir::from_path(state.path().to_path_buf());
         let host = PluginHost::with_session_provider_preparer(
             Arc::new(ToolRegistry::new()),
