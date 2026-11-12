@@ -116,6 +116,9 @@ fn load_config(
     let automode_on = cli.automode || config.always_automode;
     super::seed_automode(&mut config, automode_on);
     cli.apply_tool_filters(&mut config)?;
+    if cli.no_rtk {
+        config.agent.rtk = false;
+    }
     config.validate()?;
     Ok(config)
 }
@@ -409,6 +412,7 @@ fn agent_flags(cli: &Cli) -> Vec<String> {
         ("--no-commands", cli.no_commands),
         ("--no-plugins", cli.no_plugins),
         ("--no-jit", cli.no_jit),
+        ("--no-rtk", cli.no_rtk),
     ] {
         if set {
             flags.push(flag.to_owned());
@@ -1216,6 +1220,7 @@ mod tests {
             "--no-commands",
             "--no-plugins",
             "--no-jit",
+            "--no-rtk",
             "--allowed-tools",
             "bash,read",
             "--disallowed-tools",
@@ -1245,6 +1250,7 @@ mod tests {
                 "--no-commands",
                 "--no-plugins",
                 "--no-jit",
+                "--no-rtk",
             ]
         );
     }

@@ -35,8 +35,8 @@ use maki_agent::headless::default_model_preparer;
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session_coordinator::{
-    ModelPreparer, PreparedSessionCoordinator, SessionCoordinatorHandle, SessionCoordinatorParams,
-    builtin_option_definitions, canonical_directory, publication_claim,
+    ModelPreparer, PreparedSessionCoordinator, SessionCheckpoint, SessionCoordinatorHandle,
+    SessionCoordinatorParams, builtin_option_definitions, canonical_directory, publication_claim,
 };
 use maki_agent::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, MODEL_OPTION_ID, SessionOptionOwner,
@@ -72,7 +72,7 @@ use maki_providers::{
 };
 use maki_storage::StateDir;
 use maki_storage::StorageError;
-use maki_storage::checkpoint::CheckpointPublication;
+use maki_storage::checkpoint::{CheckpointPublication, CheckpointWriter, ClaimingWriter};
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::session_lock::{self, ClaimedSessionLock};
 use maki_storage::sessions::{HistorySnapshot, SESSIONS_DIR, SessionError, normalize_title};
@@ -223,6 +223,13 @@ pub struct RemoteSession {
     pub owned: bool,
     /// Whether that agent is listening for other machines right now.
     pub sharing: bool,
+}
+
+/// The id of the session the agent behind {remote} serves. It is the id that
+/// will be resumed, so a window that follows the agent shows that one and
+/// never invents an id of its own for the same conversation.
+fn followed_session_id(remote: &RemoteSession) -> Option<MakiId> {
+    remote.connection.session.0.parse().ok()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -939,7 +946,8 @@ struct PreparedSessionRuntime {
     handles: PreparedAgentHandles,
     model_slot: Arc<ProviderSlot>,
     coordinator: PreparedSessionCoordinator,
-    checkpoint: Arc<CoordinatorCheckpointWriter>,
+    /// Absent when the window only follows the session: its agent keeps it.
+    checkpoint: Option<Arc<CoordinatorCheckpointWriter>>,
     prepare_provider: ModelPreparer,
     provider: Option<PreparedProvider>,
     shell_tx: flume::Sender<ShellEvent>,
@@ -992,10 +1000,12 @@ impl PreparedSessionRuntime {
             checkpoint,
             prepare_provider,
         } = self;
-        checkpoint.bind(match &session_lock {
-            Some(SessionLockState::Held(lock)) => Some(lock.publication_guard()),
-            _ => None,
-        });
+        if let Some(checkpoint) = &checkpoint {
+            checkpoint.bind(match &session_lock {
+                Some(SessionLockState::Held(lock)) => Some(lock.publication_guard()),
+                _ => None,
+            });
+        }
         let coordinator = match coordinator.activate() {
             Ok(coordinator) => coordinator,
             Err(error) => {
@@ -1071,10 +1081,12 @@ impl PreparedSessionRuntime {
             checkpoint,
             prepare_provider,
         } = self;
-        checkpoint.bind(match &session_lock {
-            Some(SessionLockState::Held(lock)) => Some(lock.publication_guard()),
-            _ => None,
-        });
+        if let Some(checkpoint) = &checkpoint {
+            checkpoint.bind(match &session_lock {
+                Some(SessionLockState::Held(lock)) => Some(lock.publication_guard()),
+                _ => None,
+            });
+        }
         let session_id = app.session_id();
         let activated = if session_id == current.read().session_id() {
             coordinator.activate_replacing(current)
@@ -1403,7 +1415,8 @@ struct SpawnCtx {
 struct CoordinatorDeps {
     catalog: maki_agent::session_coordinator::SessionOptionCatalog,
     model_policy: Arc<ModelPolicy>,
-    checkpoint: Arc<CoordinatorCheckpointWriter>,
+    /// Absent when the window only follows the session: its agent keeps it.
+    checkpoint: Option<Arc<CoordinatorCheckpointWriter>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1433,7 +1446,10 @@ fn prepare_coordinator(
         definitions,
         persisted_options: session.meta.session_options.clone(),
         model_policy: Arc::clone(&deps.model_policy),
-        checkpoint: deps.checkpoint.clone(),
+        checkpoint: match &deps.checkpoint {
+            Some(writer) => Arc::clone(writer) as Arc<dyn CheckpointWriter<SessionCheckpoint>>,
+            None => ClaimingWriter::accept_all(),
+        },
         mailbox,
     })
     .map_err(|error| eyre!(error))
@@ -1444,7 +1460,10 @@ impl SpawnCtx {
         CoordinatorDeps {
             catalog: self.lua_event_handle.session_option_catalog(),
             model_policy: Arc::clone(&self.model_policy),
-            checkpoint: self.storage_writer.coordinator_checkpoint(),
+            checkpoint: self
+                .remote
+                .is_none()
+                .then(|| self.storage_writer.coordinator_checkpoint()),
         }
     }
 
@@ -1531,6 +1550,12 @@ impl SpawnCtx {
         effective_config: Option<maki_agent::EffectiveAgentConfig>,
         offload: Option<Arc<OffloadStore>>,
     ) -> Result<PreparedSessionRuntime> {
+        // A window that follows an agent shows the session that agent serves,
+        // under the agent's id: the picker offers one row for it, and the exit
+        // hint names the file the agent writes.
+        if let Some(id) = self.remote.as_ref().and_then(followed_session_id) {
+            session.id = id;
+        }
         let resumed = session_has_content(&session);
         let session_id = session.id;
         let offload = offload.or_else(|| {
@@ -1634,6 +1659,7 @@ impl SpawnCtx {
         let seed_snapshot =
             seed_snapshot.then(|| (Arc::clone(&self.storage_writer), Arc::new(session.clone())));
         app.app.trust_question = self.trust_question.clone();
+        app.app.writes_session = self.remote.is_none();
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         Ok(PreparedSessionRuntime {
             storage_writer: Arc::clone(&self.storage_writer),
@@ -1677,11 +1703,16 @@ impl SpawnCtx {
         provider: Option<PreparedProvider>,
     ) -> Result<SessionRuntime> {
         let id = session.id;
+        // A window that follows an agent holds no lock here: the agent runs
+        // the session, and the lock in this data directory is already its own.
+        let session_lock = match self.remote {
+            Some(_) => None,
+            None => Some(SessionLockState::Held(claim_lock(&self.sessions_dir, &id)?)),
+        };
         let prepared = self.prepare_runtime_with_provider(session, provider)?;
-        let session_lock = claim_lock(&self.sessions_dir, &id)?;
         prepared.seed_storage();
         let mut runtime = prepared
-            .activate(&self.model_slot, Some(SessionLockState::Held(session_lock)))
+            .activate(&self.model_slot, session_lock)
             .map_err(|error| eyre!(error))?;
         runtime.activate_deferred();
         Ok(runtime)
@@ -1765,7 +1796,8 @@ enum InternalEvent {
         runtime: Arc<()>,
         shadow: Box<AppSession>,
         kind: SessionReplacementKind,
-        result: Result<(), String>,
+        /// The session the agent started, so this window follows that one.
+        result: Result<maki_acp_client::SessionId, String>,
     },
     Unshared(Result<(), String>),
 }
@@ -2562,14 +2594,22 @@ impl<'t> EventLoop<'t> {
                     return;
                 };
                 match result {
-                    Ok(()) => self.bring_up(
-                        RuntimeTarget::Replace {
-                            runtime,
-                            kind: Some(kind),
-                            reply: None,
-                        },
-                        *shadow,
-                    ),
+                    Ok(session) => {
+                        // The agent renamed the session it serves, and this
+                        // window follows it: both the served id and the shadow
+                        // move to it, so nothing keeps pointing at the old one.
+                        if let Some(remote) = self.ctx.remote.as_mut() {
+                            remote.connection.session = session;
+                        }
+                        self.bring_up(
+                            RuntimeTarget::Replace {
+                                runtime,
+                                kind: Some(kind),
+                                reply: None,
+                            },
+                            *shadow,
+                        );
+                    }
                     Err(error) => self.sessions[idx]
                         .app
                         .flash(format!("new session: {error}")),
@@ -3698,19 +3738,42 @@ impl<'t> EventLoop<'t> {
             }
             SessionRequest::SetTitle { id, title } => {
                 let title = normalize_title(&title);
-                let reply = (|| {
-                    let id = parse_session_id(&id)?;
-                    if let Some(i) = self.position(id) {
-                        self.sessions[i].app.state.session_mut().set_title(title);
-                    } else {
+                let id = match parse_session_id(&id) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        let _ = reply_tx.send(Err(error));
+                        return;
+                    }
+                };
+                let Some(i) = self.position(id) else {
+                    let reply = (|| {
                         let mut session =
                             AppSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
                         session.set_title(title);
                         self.ctx.storage_writer.send(Arc::new(session));
-                    }
-                    Ok(json!(true))
-                })();
-                let _ = reply_tx.send(reply);
+                        Ok(json!(true))
+                    })();
+                    let _ = reply_tx.send(reply);
+                    return;
+                };
+                self.sessions[i]
+                    .app
+                    .state
+                    .session_mut()
+                    .set_title(title.clone());
+                let Some(remote) = &self.ctx.remote else {
+                    let _ = reply_tx.send(Ok(json!(true)));
+                    return;
+                };
+                // The file belongs to the agent this window follows, so the
+                // name goes there: this window keeps no copy of the session
+                // to write it into.
+                let client = Arc::clone(&remote.connection.client);
+                smol::spawn(async move {
+                    let result = smol::unblock(move || client.rename_session(&title)).await;
+                    let _ = reply_tx.send(result.map(|()| json!(true)));
+                })
+                .detach();
             }
         }
     }
@@ -4112,11 +4175,11 @@ impl<'t> EventLoop<'t> {
         let cwd = PathBuf::from(&shadow.cwd);
         smol::spawn(async move {
             let result = smol::unblock(move || {
-                client.new_session(&cwd)?;
+                let session = client.new_session(&cwd)?.0;
                 for (option, value) in options {
                     client.set_config_option(&option, &value)?;
                 }
-                Ok(())
+                Ok(session)
             })
             .await;
             let _ = internal_tx.send(InternalEvent::SessionReplaced {
@@ -5443,8 +5506,11 @@ impl<'t> EventLoop<'t> {
     /// conversation lives, so a reopened window resumes it and the exit hint
     /// names it.
     fn hosted_session(&self) -> Option<MakiId> {
-        let remote = self.ctx.remote.as_ref().filter(|remote| remote.owned)?;
-        remote.connection.session.0.parse().ok()
+        self.ctx
+            .remote
+            .as_ref()
+            .filter(|remote| remote.owned)
+            .and_then(followed_session_id)
     }
 
     fn shutdown(mut self) -> ShutdownReport {
@@ -5903,7 +5969,6 @@ mod tests {
     use super::*;
     use maki_domain::ThinkingConfig as DomainThinkingConfig;
     use maki_providers::{Invocation, RequestDelivery};
-    use maki_storage::checkpoint::ClaimingWriter;
 
     #[test_case(0, 0, 2, 2 ; "an empty copy takes the whole announcement")]
     #[test_case(0, 1, 2, 1 ; "the part the copy already has is skipped")]
@@ -7403,7 +7468,7 @@ mod tests {
                 pending.clear();
                 let method = request["method"].as_str().unwrap_or_default().to_owned();
                 let result = if method == NEW_SESSION_METHOD {
-                    serde_json::json!({ "sessionId": format!("agent-{}", methods.len()) })
+                    serde_json::json!({ "sessionId": MakiId::generate().to_string() })
                 } else if method == "initialize" {
                     serde_json::json!({ "protocolVersion": 1, "agentCapabilities": {} })
                 } else {
@@ -7445,6 +7510,76 @@ mod tests {
         harness
     }
 
+    /// A window that follows an agent is a client of the session, not its
+    /// owner: it shows the id the agent serves, takes no lock for it and keeps
+    /// no copy of it, so the picker offers one row for the conversation.
+    #[test]
+    fn a_following_window_owns_nothing_of_the_session_it_follows() {
+        let (stop, script, connection) = scripted_agent();
+        let served = connection.session.0.to_string();
+        let harness = hosted_harness(connection, true);
+        let sessions_dir = harness.ctx().sessions_dir.clone();
+        let stop_after = Arc::clone(&stop);
+        run_event_loop(
+            harness,
+            |harness| harness.runtime(harness.session()),
+            move |event_loop| {
+                assert_eq!(event_loop.sessions[0].id().to_string(), served);
+                assert!(
+                    !event_loop.sessions[0].app.writes_session,
+                    "the agent keeps the session, not this window"
+                );
+                assert!(event_loop.sessions[0].session_lock.is_none());
+                assert_eq!(
+                    std::fs::read_dir(&sessions_dir).unwrap().count(),
+                    0,
+                    "the agent's sessions are not this window's to write"
+                );
+                stop_after.store(true, Ordering::Release);
+            },
+        );
+        script.join().unwrap();
+    }
+
+    /// `/rename` in a window that follows an agent has to reach the file the
+    /// agent writes, and the window reports success only once the agent
+    /// answered.
+    #[test]
+    fn a_hosted_window_renames_the_session_where_it_lives() {
+        const RENAME_METHOD: &str = "maki/rename";
+        const TITLE: &str = "fix the parser";
+
+        let (stop, script, connection) = scripted_agent();
+        let harness = hosted_harness(connection, true);
+        let stop_after = Arc::clone(&stop);
+        run_event_loop(
+            harness,
+            |harness| harness.runtime(harness.session()),
+            move |event_loop| {
+                let id = event_loop.sessions[0].id();
+                let (reply_tx, reply_rx) = flume::bounded(1);
+                event_loop.handle_session_request(
+                    SessionRequest::SetTitle {
+                        id: id.to_string(),
+                        title: TITLE.to_owned(),
+                    },
+                    reply_tx,
+                );
+                assert_eq!(
+                    reply_rx.recv_timeout(PUMP_TIMEOUT).unwrap().unwrap(),
+                    json!(true)
+                );
+                assert_eq!(event_loop.sessions[0].app.state.session.title, TITLE);
+                stop_after.store(true, Ordering::Release);
+            },
+        );
+        let methods = script.join().unwrap();
+        assert!(
+            methods.iter().any(|method| method == RENAME_METHOD),
+            "the agent stores the name: {methods:?}"
+        );
+    }
+
     /// `/new` in a window that follows another agent: the agent starts the
     /// session and its choices follow, so the window only replaces its shadow
     /// once the agent has agreed.
@@ -7455,13 +7590,12 @@ mod tests {
 
         let (stop, script, connection) = scripted_agent();
         let harness = hosted_harness(connection, true);
-        let session = harness.session();
-        let ended_id = session.id;
         let stop_after = Arc::clone(&stop);
         run_event_loop(
             harness,
-            move |harness| harness.runtime(session),
+            |harness| harness.runtime(harness.session()),
             move |event_loop| {
+                let ended_id = event_loop.sessions[0].id();
                 event_loop.request_replacement(
                     0,
                     SessionReplacementRequest {
@@ -7472,6 +7606,19 @@ mod tests {
                 pump_until(event_loop, |event_loop| {
                     event_loop.sessions[0].id() != ended_id
                 });
+                assert_eq!(
+                    event_loop.sessions[0].id().to_string(),
+                    event_loop
+                        .ctx
+                        .remote
+                        .as_ref()
+                        .unwrap()
+                        .connection
+                        .session
+                        .0
+                        .to_string(),
+                    "the window follows the session the agent started"
+                );
                 stop_after.store(true, Ordering::Release);
             },
         );

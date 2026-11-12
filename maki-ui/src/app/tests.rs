@@ -11076,6 +11076,25 @@ fn deleting_the_draft_takes_the_session_off_disk() {
     assert!(AppSession::load(id, &dir).is_err());
 }
 
+/// A window that follows an agent keeps no copy of the session: the agent
+/// writes it, and a second file would offer the same conversation twice in the
+/// picker, once without the usage the agent recorded.
+#[test]
+fn a_following_window_writes_no_copy_of_its_session() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.writes_session = false;
+    let id = app.state.session.id;
+    app.state
+        .session_mut()
+        .push_message(Message::user("prompt".into()));
+
+    app.checkpoint_now();
+
+    assert!(app.last_sent.is_none(), "nothing was handed to the writer");
+    drain_writer(app, writer);
+    assert!(AppSession::load(id, &dir).is_err());
+}
+
 /// The second result goes through the append cursor the first one opened, so a
 /// stale cursor would quietly drop or duplicate it.
 #[test]

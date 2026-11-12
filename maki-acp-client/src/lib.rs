@@ -81,6 +81,7 @@ const REWIND_METHOD: &str = "maki/rewind";
 const COMPACT_METHOD: &str = "maki/compact";
 const CHDIR_METHOD: &str = "maki/chdir";
 const MCP_METHOD: &str = "maki/mcp";
+const RENAME_METHOD: &str = "maki/rename";
 const PREAMBLE_KEY: &str = "maki";
 const PREAMBLE_FIELD: &str = "preamble";
 const REWOUND_METHOD: &str = "maki/ui/rewind";
@@ -484,12 +485,6 @@ impl Target {
 
     /// The agent this machine runs, with extra arguments for its `acp` command,
     /// like `--share`.
-    /// The agent this machine runs, under `acp`, with the flags this run was
-    /// given so the agent it starts behaves like one it ran itself.
-    pub fn hosted(cwd: PathBuf, agent: &str, flags: Vec<String>) -> Self {
-        Self::local_with(cwd, agent, flags)
-    }
-
     pub fn local_with(cwd: PathBuf, agent: &str, extra: Vec<String>) -> Self {
         let mut args = vec![ACP_SUBCOMMAND.to_owned()];
         args.extend(extra);
@@ -1257,6 +1252,23 @@ impl Client {
         Ok(response.stop_reason)
     }
 
+    /// Renames the session where it lives. A window that follows a session
+    /// keeps no copy of it, so `/rename` reaches the agent's file.
+    pub fn rename_session(&self, title: &str) -> Result<(), String> {
+        let session = self
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no active session".to_owned())?;
+        let _: Value = self.request(
+            RENAME_METHOD,
+            json!({ "sessionId": session, "title": title }),
+            Some(SESSION_TIMEOUT),
+        )?;
+        Ok(())
+    }
+
     /// Moves the working directory the session's tools run in, where the
     /// session lives, and returns the path the agent resolved.
     pub fn change_directory(&self, path: &Path) -> Result<PathBuf, String> {
@@ -1910,6 +1922,44 @@ old
             methods
         });
         (address, server)
+    }
+
+    /// A window that follows a session keeps no copy of it, so a rename has to
+    /// travel to the agent that owns the file.
+    #[test]
+    fn rename_reaches_the_agent_that_owns_the_session() {
+        use agent_client_protocol_schema::{NewSessionResponse, SessionId};
+        use serde_json::json;
+        use std::sync::{Arc, Mutex};
+
+        const TITLE: &str = "fix the parser";
+        let renamed = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&renamed);
+        let (address, server) = fake_agent(4, move |method, request| match method {
+            "initialize" => initialized(method),
+            "maki/live" => Some(json!({ "sessions": [] })),
+            "session/new" => Some(
+                serde_json::to_value(NewSessionResponse::new(SessionId::new("sess-rename")))
+                    .unwrap(),
+            ),
+            "maki/rename" => {
+                seen.lock().unwrap().push(request["params"].clone());
+                Some(json!(true))
+            }
+            _ => None,
+        });
+        let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
+        let connection = super::connect(&target).unwrap();
+        connection.client.rename_session(TITLE).unwrap();
+        drop(connection);
+        assert_eq!(
+            server.join().unwrap(),
+            ["initialize", "maki/live", "session/new", "maki/rename"]
+        );
+        assert_eq!(
+            renamed.lock().unwrap().as_slice(),
+            [json!({ "sessionId": "sess-rename", "title": TITLE })]
+        );
     }
 
     fn initialized(method: &str) -> Option<Value> {

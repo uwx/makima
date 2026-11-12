@@ -121,6 +121,9 @@ pub fn run(
     let automode_on = automode || cli.automode || config.always_automode;
     super::seed_automode(&mut config, automode_on);
     cli.apply_tool_filters(&mut config)?;
+    if cli.no_rtk {
+        config.agent.rtk = false;
+    }
     config.validate()?;
 
     let timeouts = maki_providers::Timeouts::from(&config.provider);

@@ -84,6 +84,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_jit: bool,
 
+    /// Do not rewrite bash commands with rtk, even when it is installed
+    #[arg(long, global = true)]
+    pub no_rtk: bool,
+
     /// Skip all permission prompts (allow everything)
     #[arg(long, alias = "dangerously-skip-permissions")]
     pub yolo: bool,
@@ -484,6 +488,7 @@ mod tests {
             "--automode",
             "--no-plugins",
             "--no-jit",
+            "--no-rtk",
             "--no-commands",
             "--no-project",
             "--allowed-tools",
@@ -497,7 +502,7 @@ mod tests {
         ]);
 
         assert!(matches!(cli.command, Some(Command::Acp { .. })));
-        assert!(cli.no_plugins && cli.no_jit && cli.no_commands);
+        assert!(cli.no_plugins && cli.no_jit && cli.no_rtk && cli.no_commands);
         assert!(cli.no_project);
         assert_eq!(cli.trust_mode(), TrustMode::Ignore);
         assert_eq!(cli.allowed_tools, ["bash", "read"]);

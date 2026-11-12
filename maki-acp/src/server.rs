@@ -54,7 +54,9 @@ use maki_storage::StateDir;
 use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, StoredTokenUsage, read_prefs};
+use maki_storage::sessions::{
+    SESSIONS_DIR, Session, SessionMeta, StoredTokenUsage, normalize_title, read_prefs,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use smol::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -92,6 +94,8 @@ const COMPACT_METHOD: &str = "maki/compact";
 const CWD_CHANGE_METHOD: &str = "maki/chdir";
 /// Lists the session's MCP servers, or toggles one, where they run.
 const MCP_METHOD: &str = "maki/mcp";
+/// Client to server: rename the session where it lives, with the new `title`.
+const RENAME_METHOD: &str = "maki/rename";
 /// Where a prompt's `_meta` carries the messages the client showed the user
 /// rather than typed, such as the output of a `!shell` command.
 const PREAMBLE_META: [&str; 2] = ["maki", "preamble"];
@@ -1088,6 +1092,11 @@ async fn handle_request(
             send(srv.reply(), Response::new(id, result));
             return;
         }
+        RENAME_METHOD => {
+            let result = rename_session(srv, raw).await;
+            send(srv.reply(), Response::new(id, result));
+            return;
+        }
         SESSIONS_METHOD => {
             if !srv.ui.enabled() {
                 respond_request(srv, method, id, Err(AcpError::method_not_found()));
@@ -1993,6 +2002,29 @@ async fn change_directory(srv: &mut Server, raw: &Value) -> Result<Value, AcpErr
         .map_err(|error| AcpError::invalid_params().data(json_str(&error)))?;
     announce_cwd(&srv.out_tx, session, cwd.clone());
     Ok(json!({ "cwd": cwd }))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenameParams {
+    session_id: SessionId,
+    title: String,
+}
+
+/// Renames the session in the file its process writes. A window that follows
+/// the session keeps no copy of it, so `maki.session.set_title` has to land
+/// here for the name to survive a restart.
+async fn rename_session(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
+    let req: RenameParams = parse_params(raw)?;
+    let session = validate_session(srv, req.session_id.0.as_ref())?;
+    let Some(checkpoint) = session.checkpoint.as_ref() else {
+        return Err(no_session());
+    };
+    checkpoint
+        .rename(normalize_title(&req.title))
+        .await
+        .map_err(|error| AcpError::new(-32603, error.to_string()))?;
+    Ok(json!(true))
 }
 
 #[derive(serde::Deserialize)]

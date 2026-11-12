@@ -94,7 +94,6 @@ impl App {
     }
 
     pub(super) fn checkpoint_with(&mut self, soft_delay: Duration) {
-        self.sync_live_children();
         let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
         let meta = self.build_meta();
         AppSession::checkpoint(
@@ -103,6 +102,13 @@ impl App {
             meta,
             self.state.token_usage,
         );
+        // A window that follows an agent keeps no copy of the session it
+        // follows: writing one would put the same conversation in the picker
+        // twice, once without the usage the agent's file carries.
+        if !self.writes_session {
+            return;
+        }
+        self.sync_live_children();
 
         if !self.has_content() {
             // A draft typed and then deleted is already on disk, and a file with

@@ -459,6 +459,9 @@ pub struct App {
     pub(crate) available_models: Arc<ArcSwapOption<Vec<String>>>,
     model_picker_models: Arc<ArcSwapOption<Vec<String>>>,
     pub(crate) shared_history: Option<SharedMessages>,
+    /// Whether this window keeps the session on disk. A window that follows an
+    /// agent does not: the process that runs the conversation owns its file.
+    pub(crate) writes_session: bool,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
@@ -670,6 +673,7 @@ impl App {
             available_models,
             model_picker_models,
             shared_history: None,
+            writes_session: true,
             btw_system: None,
             image_paste_rx: vec![],
             storage_writer,

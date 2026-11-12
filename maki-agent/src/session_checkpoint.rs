@@ -174,6 +174,36 @@ impl SessionLogCheckpoint {
         self.submit(|_, _, _| Ok(())).await
     }
 
+    /// Renames the session where it is stored. A window that follows an agent
+    /// keeps no copy of the transcript, so the name has to land in the file
+    /// the agent writes.
+    pub async fn rename(&self, title: String) -> Result<(), CheckpointError> {
+        let session_id = self.session_id;
+        self.submit(move |dir, session, guard| {
+            let mut candidate = lock(session).session.clone();
+            candidate.set_title(title);
+            let saved = match guard {
+                Some(guard) => guard
+                    .publish(|| candidate.save(dir))
+                    .map_err(|error| CheckpointError::Save {
+                        session_id,
+                        message: Arc::from(error.to_string()),
+                    })?
+                    .ok_or(CheckpointError::Closed(session_id))?,
+                None => candidate.save(dir),
+            };
+            if let Err(error) = saved {
+                return Err(CheckpointError::Save {
+                    session_id,
+                    message: Arc::from(error.to_string()),
+                });
+            }
+            lock(session).session = candidate;
+            Ok(())
+        })
+        .await
+    }
+
     fn save(
         dir: &StateDir,
         session: &Mutex<RetainedSession>,
@@ -639,6 +669,30 @@ mod tests {
             let loaded = StoredSession::load(id, &dir).unwrap();
             assert!(loaded.subagents()[0].ambiguous);
             assert_eq!(loaded.subagents()[0].agent_id, None);
+        });
+    }
+
+    /// A window that follows the session keeps no copy of it, so a rename has
+    /// to land in the agent's file and survive the checkpoints that follow.
+    #[test]
+    fn rename_persists_through_later_checkpoints() {
+        const RENAMED: &str = "fix the parser";
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let dir = StateDir::from_path(tmp.path().to_path_buf());
+            let id = MakiId::generate();
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
+            writer.rename(RENAMED.into()).await.unwrap();
+            assert_eq!(StoredSession::load(id, &dir).unwrap().title, RENAMED);
+
+            writer
+                .checkpoint_child(
+                    child(CHILD_KEY),
+                    HistorySnapshot::new(vec![Message::user(TERMINAL.into())]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(StoredSession::load(id, &dir).unwrap().title, RENAMED);
         });
     }
 

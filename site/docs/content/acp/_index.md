@@ -15,7 +15,7 @@ makima acp
 
 ## The window runs its session on an agent
 
-The terminal interface is an ACP client. Plain `makima` starts `makima acp` in a child process, passes it the flags of this run (model, project trust, `--yolo`, `--automode`, tool filters, system prompt), and talks to it over stdio, the way `makima attach` talks to an agent on another machine. The child owns the session: it runs the tools, loads MCP servers and writes the transcript.
+The terminal interface is an ACP client. Plain `makima` starts `makima acp` in a child process, passes it the flags of this run (model, project trust, `--yolo`, `--automode`, tool filters, system prompt), and talks to it over stdio, the way `makima attach` talks to an agent on another machine. The child owns the session: it runs the tools, loads MCP servers and writes the transcript. The window keeps no copy of its own, so a conversation appears once in `/sessions`, and a name typed with `/rename` travels to the agent that stores it.
 
 ```
 makima            makima acp
@@ -248,6 +248,14 @@ The reply carries the `cwd` the agent resolved, which is canonical and may not b
 A window follows it: its status bar, its file completions and its own shells use that directory. The session records the last one, so a window that attaches later gets it in the `maki/attach` reply as `cwd` and starts in the right place. A `/cd` typed as a prompt reaches every window the same way, from the loop that ran the command.
 
 A window that follows another process's session starts a new conversation where that session lives. `/new` and `/clear` send ACP's own `session/new`, and only once the agent answers does the window replace the transcript it shows, so the next prompt lands in the new conversation. The choices the window displays (model, thinking, fast, workflow, yolo) go with it as `session/set_config_option` calls, the same way a change made here reaches the agent.
+
+`/rename` also runs where the session lives, because the file it edits is the agent's:
+
+```json
+{"jsonrpc":"2.0","id":14,"method":"maki/rename","params":{"sessionId":"...","title":"fix the parser"}}
+```
+
+The window asks and reports the agent's answer, so a name that cannot be saved is an error there instead of one this window pretends to keep.
 
 Picking another stored session in `/sessions` reopens the window on it. The agent serves one session at a time, so the window ends and a new agent starts on the session you picked, the way it starts one when you share. A window attached to another machine's agent cannot restart that process, so there it says so instead.
 
