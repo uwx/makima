@@ -633,7 +633,14 @@ fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
     }
 }
 
-/// Commits mode `id` on `target` and reports it as one session op.
+/// The mode one window wants a session in, and the plan file it keeps when the
+/// session already drafts into one.
+struct ModeRequest {
+    id: String,
+    kept_plan: Option<PathBuf>,
+}
+
+/// Commits `request` on `target` and reports it as one session op.
 fn dispatch_mode_commit(
     runtime: &SessionRuntime,
     target: Result<AgentRef, String>,
@@ -641,7 +648,7 @@ fn dispatch_mode_commit(
     modes: Arc<maki_agent::ModeRegistry>,
     services: Option<Arc<AgentOrchestration>>,
     internal_tx: flume::Sender<InternalEvent>,
-    id: String,
+    request: ModeRequest,
 ) {
     let session = runtime.id();
     let identity = runtime.handles.identity();
@@ -653,9 +660,14 @@ fn dispatch_mode_commit(
     smol::spawn(async move {
         let result = match reservation {
             Ok((target, reservation)) => reservation
-                .commit_mode(&target, &modes, &id, &storage, None, async |_, _| {
-                    Ok(publication_claim())
-                })
+                .commit_mode(
+                    &target,
+                    &modes,
+                    &request.id,
+                    &storage,
+                    request.kept_plan.as_deref(),
+                    async |_, _| Ok(publication_claim()),
+                )
                 .await
                 .map(|_| ()),
             Err(error) => Err(error),
@@ -2905,6 +2917,14 @@ impl<'t> EventLoop<'t> {
     }
 
     fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
+        // The session switched mode where its tools run. This window's shadow
+        // actor commits the same mode, keeping the plan file the session
+        // drafts into, so the toolbar, the plan form and a plan approval all
+        // point at one place whoever asked for the switch.
+        if let AgentEvent::ModeChanged { mode, plan } = &envelope.event {
+            self.follow_mode(idx, mode, plan.clone());
+            return;
+        }
         // The agent moved the directory its tools run in. This window's shadow
         // actor still runs shells and resolves paths, so it follows through its
         // own coordinator; reading the move off the stream keeps the two the
@@ -4117,15 +4137,26 @@ impl<'t> EventLoop<'t> {
                 let target = self.selected_target(idx);
                 self.dispatch_model_selection(idx, target, selection, None);
             }
-            Action::ChangeMode(mode) => dispatch_mode_commit(
-                &self.sessions[idx],
-                selected_agent(&self.sessions[idx]).ok_or_else(|| CLOSED_TARGET_ERR.to_owned()),
-                &self.ctx.storage,
-                self.ctx.lua_event_handle.mode_registry(),
-                Some(Arc::clone(&self.orchestration)),
-                self.internal_tx.clone(),
-                mode,
-            ),
+            Action::ChangeMode(mode) => {
+                // A hosted session decides its own mode; this window projects
+                // the answer when it comes back, plan file and all.
+                if self.ctx.remote.is_some() {
+                    self.forward_mode(idx, &mode);
+                    return;
+                }
+                dispatch_mode_commit(
+                    &self.sessions[idx],
+                    selected_agent(&self.sessions[idx]).ok_or_else(|| CLOSED_TARGET_ERR.to_owned()),
+                    &self.ctx.storage,
+                    self.ctx.lua_event_handle.mode_registry(),
+                    Some(Arc::clone(&self.orchestration)),
+                    self.internal_tx.clone(),
+                    ModeRequest {
+                        id: mode,
+                        kept_plan: None,
+                    },
+                )
+            }
             Action::ApprovePlan {
                 clear_context,
                 selection,
@@ -4342,6 +4373,27 @@ impl<'t> EventLoop<'t> {
         smol::spawn(async move {
             let result = smol::unblock(move || client.rewind(offset)).await;
             let _ = internal_tx.send(InternalEvent::Rewound { session, result });
+        })
+        .detach();
+    }
+
+    /// Switches the mode of the session this window follows, so plan and
+    /// build mean the same where the tools run.
+    fn forward_mode(&mut self, idx: usize, mode: &str) {
+        let Some(remote) = &self.ctx.remote else {
+            return;
+        };
+        let client = Arc::clone(&remote.connection.client);
+        let internal_tx = self.internal_tx.clone();
+        let session = self.sessions[idx].id();
+        let mode = mode.to_owned();
+        smol::spawn(async move {
+            if let Err(error) = smol::unblock(move || client.set_mode(&mode)).await {
+                let _ = internal_tx.send(InternalEvent::OptionForwardFailed {
+                    session,
+                    error: format!("mode: {error}"),
+                });
+            }
         })
         .detach();
     }
@@ -4648,6 +4700,27 @@ impl<'t> EventLoop<'t> {
         })
         .detach();
         Ok(())
+    }
+
+    fn follow_mode(&mut self, idx: usize, mode: &str, plan: Option<PathBuf>) {
+        if self.sessions[idx].app.focused_mode().id_key() == mode
+            && self.sessions[idx].app.focused_plan_path() == plan
+        {
+            return;
+        }
+        let (manager, root) = self.sessions[idx].handles.manager_and_root();
+        dispatch_mode_commit(
+            &self.sessions[idx],
+            manager.lookup(root).map_err(|error| error.to_string()),
+            &self.ctx.storage,
+            self.ctx.lua_event_handle.mode_registry(),
+            Some(Arc::clone(&self.orchestration)),
+            self.internal_tx.clone(),
+            ModeRequest {
+                id: mode.to_owned(),
+                kept_plan: plan,
+            },
+        );
     }
 
     fn dispatch_target_directory(
@@ -5753,6 +5826,52 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_announced_by_the_session_commits_its_plan_file_here() {
+        with_event_loop(|event_loop| {
+            smol::block_on(async {
+                let plan = PathBuf::from("/plans/announced.md");
+                event_loop.handle_agent(
+                    0,
+                    Box::new(Envelope {
+                        event: AgentEvent::ModeChanged {
+                            mode: "plan".to_owned(),
+                            plan: Some(plan.clone()),
+                        },
+                        subagent: None,
+                        identity: None,
+                    }),
+                );
+
+                let commit = loop {
+                    let event = event_loop
+                        .internal_rx
+                        .recv_timeout(SESSION_OP_TIMEOUT)
+                        .expect("the window commits the mode it was told about");
+                    if let InternalEvent::SessionOp { kind, result, .. } = &event {
+                        assert!(matches!(kind, SessionOpKind::ModeChanged));
+                        result.as_ref().unwrap();
+                        break "SessionOp";
+                    }
+                    event_loop.handle_internal(event);
+                };
+                assert_eq!(commit, "SessionOp");
+                let config = event_loop.sessions[0].app.root_config();
+                assert_eq!(config.mode, maki_agent::AgentMode::Plan(plan));
+                let committed = event_loop.sessions[0]
+                    .config_commits
+                    .recv_timeout(SESSION_OP_TIMEOUT)
+                    .unwrap();
+                assert!(event_loop.sessions[0].project_config(&committed));
+                assert_eq!(event_loop.sessions[0].app.root_mode().id_key(), "plan");
+                assert_eq!(
+                    event_loop.sessions[0].app.focused_plan_path(),
+                    Some(PathBuf::from("/plans/announced.md"))
+                );
+            })
+        });
+    }
+
+    #[test]
     fn reserved_mode_change_waits_for_predecessor_before_committing() {
         smol::block_on(async {
             let runtime = test_runtime(model_named("test-model"));
@@ -5770,7 +5889,10 @@ mod tests {
                 EventHandle::disconnected_for_test().mode_registry(),
                 None,
                 internal_tx,
-                "plan".into(),
+                ModeRequest {
+                    id: "plan".into(),
+                    kept_plan: None,
+                },
             );
 
             assert_eq!(runtime.app.root_config().mode, initial_mode);
@@ -6201,7 +6323,10 @@ mod tests {
             event_loop.ctx.lua_event_handle.mode_registry(),
             None,
             event_loop.internal_tx.clone(),
-            "plan".into(),
+            ModeRequest {
+                id: "plan".into(),
+                kept_plan: None,
+            },
         );
     }
 

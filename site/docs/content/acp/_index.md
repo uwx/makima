@@ -231,6 +231,22 @@ A window follows it: its status bar, its file completions and its own shells use
 
 A window that follows another process's session cannot start a new conversation there, so `/new` is not in its command list and answers with guidance when typed. `/tasks`, `/mcp` and `/login` behave the same way: tasks, MCP servers and credentials belong to the process that runs the session.
 
+### Switching the mode
+
+Build and plan mode decide what the session may write, so a switch runs where the session lives. A window asks for it with ACP's own method:
+
+```json
+{"jsonrpc":"2.0","id":12,"method":"session/set_mode","params":{"sessionId":"...","modeId":"plan"}}
+```
+
+The session announces the new mode as `current_mode_update`, and every window follows that announcement instead of assuming its request worked:
+
+```json
+{"method":"session/update","params":{"sessionId":"...","update":{"sessionUpdate":"current_mode_update","currentModeId":"plan","_meta":{"maki":{"plan":"/home/you/project/.makima/plans/fix-the-parser.md"}}}}}
+```
+
+Plan mode carries the file the session drafts into, under the `maki` metadata key, because that file belongs to the session and not to a window. A window that sees the path uses the session's plan in its own plan view; Build mode announces no plan. Because the announcement is the session's, it can also arrive between turns, so a window listens for it on the connection rather than inside a turn. Modes saved with a resumed session arrive the same way.
+
 ### When the link drops
 
 A client attached over TCP reconnects on its own. It retries with backoff (from 250 ms, capped at 5 s), runs `initialize` again, asks `maki/live` for the sessions the agent serves, and attaches the one it was watching. The reattach replays the session's updates and its committed history, so the transcript the client missed comes back in order, and a turn that ran while it was away shows up too.

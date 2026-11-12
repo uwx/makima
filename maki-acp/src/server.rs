@@ -11,13 +11,13 @@ use std::time::Duration;
 use agent_client_protocol_schema::{
     AgentNotification, AgentRequest, AgentResponse, AvailableCommand, AvailableCommandInput,
     AvailableCommandsUpdate, ConfigOptionUpdate, ContentBlock, ContentChunk,
-    CreateElicitationResponse, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError,
-    ImageContent, InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer, Meta,
-    NewSessionRequest, Notification, PromptRequest, PromptResponse, Request, RequestId,
-    RequestPermissionRequest, RequestPermissionResponse, Response, SessionConfigOptionValue,
-    SessionId, SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCallStatus, UnstructuredCommandInput,
+    CreateElicitationResponse, EmbeddedResourceResource, Error as AcpError, ImageContent,
+    InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer, Meta, NewSessionRequest,
+    Notification, PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
+    RequestPermissionResponse, Response, SessionConfigOptionValue, SessionId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCallStatus,
+    UnstructuredCommandInput,
 };
 use event_listener::Event;
 use flume::{Receiver, Sender};
@@ -33,7 +33,7 @@ use maki_agent::session_defaults;
 use maki_agent::session_options::SessionOptionError;
 use maki_agent::tools::QuestionMode;
 use maki_agent::types::AgentEvent;
-use maki_agent::{AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
+use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, ModeError};
 use maki_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
     CompletionInput, CompletionKind, CompletionProviders, CompletionResult, FrontendFeedback,
@@ -243,6 +243,26 @@ impl OptionProjection {
     }
 }
 
+/// The mode every window shows. A commit moves it from any side: a window's
+/// `/mode`, a plugin, a resumed session's saved mode. Each move is announced
+/// with the plan file the session drafts into, so no window picks its own.
+struct ModeProjection {
+    out_tx: Sender<Value>,
+    session_id: SessionId,
+    announced: Mutex<Option<AgentMode>>,
+}
+
+impl ModeProjection {
+    fn announce(&self, mode: &AgentMode) {
+        let mut announced = self.announced.lock().unwrap();
+        if announced.as_ref() == Some(mode) {
+            return;
+        }
+        *announced = Some(mode.clone());
+        session_update(&self.out_tx, &self.session_id, attach::mode_update(mode));
+    }
+}
+
 struct SessionState {
     handle: InteractiveHandle,
     coordinator: Option<maki_agent::session_coordinator::SessionCoordinatorHandle>,
@@ -258,6 +278,7 @@ struct SessionState {
     event_pump: EventPump,
     option_projection: Option<Arc<OptionProjection>>,
     option_projection_task: smol::Task<()>,
+    mode_projection_task: smol::Task<()>,
     /// Plugin UI actions belong to the connection that owns the session, so
     /// this starts with the session and stops with it.
     ui_forward: smol::Task<()>,
@@ -1581,6 +1602,7 @@ async fn close_session(srv: &mut Server) {
     state.command_projection_task.cancel().await;
     state.event_pump.finish().await;
     state.option_projection_task.cancel().await;
+    state.mode_projection_task.cancel().await;
     state.ui_forward.cancel().await;
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
@@ -1767,7 +1789,7 @@ async fn install_session_with_lock(
     let option_snapshot = coordinator.read().options();
     let option_projection = Arc::new(OptionProjection {
         out_tx: srv.out_tx.clone(),
-        session_id,
+        session_id: session_id.clone(),
         read: coordinator.read(),
         supports_boolean: srv.supports_boolean,
         emitted_version: Mutex::new(option_snapshot.version),
@@ -1776,6 +1798,13 @@ async fn install_session_with_lock(
         Arc::clone(&option_projection),
         coordinator.read().subscribe(),
     );
+    let mode_projection = Arc::new(ModeProjection {
+        out_tx: srv.out_tx.clone(),
+        session_id: session_id.clone(),
+        announced: Mutex::new(None),
+    });
+
+    let mode_projection_task = watch_mode(Arc::clone(&mode_projection), &trusted_root.target);
     let ui_forward = smol::spawn({
         let out_tx = srv.out_tx.clone();
         let events = params.ui.events.clone();
@@ -1798,6 +1827,7 @@ async fn install_session_with_lock(
         event_pump,
         option_projection: Some(option_projection),
         option_projection_task,
+        mode_projection_task,
         ui_forward,
         lock: Some(lock),
     });
@@ -2233,6 +2263,18 @@ fn watch_config_options(
         loop {
             let snapshot = subscription.changed().await;
             projection.emit(&snapshot);
+        }
+    })
+}
+
+fn watch_mode(projection: Arc<ModeProjection>, target: &maki_agent::AgentRef) -> smol::Task<()> {
+    let Ok(actor) = target.actor() else {
+        return smol::spawn(async {});
+    };
+    let commits = actor.subscribe_config_commits();
+    smol::spawn(async move {
+        while let Ok(commit) = commits.recv_async().await {
+            projection.announce(&commit.config.mode);
         }
     })
 }
@@ -2931,12 +2973,6 @@ async fn handle_set_mode(
     )
     .await
     .map_err(config_error)?;
-    let sid = SessionId::from(session.handle.session_id.to_string());
-    session_update(
-        &srv.out_tx,
-        &sid,
-        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(SessionModeId::from(mode_str))),
-    );
     Ok(AgentResponse::SetSessionModeResponse(
         SetSessionModeResponse::new(),
     ))
@@ -4610,6 +4646,7 @@ mod tests {
                 .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
             ),
         );
+        let session_id_string = handle.session_id.to_string();
         let server = Server {
             wire: out_tx.clone(),
             out_tx: out_tx.clone(),
@@ -4621,7 +4658,7 @@ mod tests {
             session: Some(SessionState {
                 option_projection: Some(Arc::new(OptionProjection {
                     out_tx: out_tx.clone(),
-                    session_id: SessionId::from(handle.session_id.to_string()),
+                    session_id: SessionId::from(session_id_string.clone()),
                     read: coordinator.read(),
                     supports_boolean: false,
                     emitted_version: Mutex::new(coordinator.read().options().version),
@@ -4640,6 +4677,7 @@ mod tests {
                 command_projection_task: smol::spawn(async {}),
                 event_pump: EventPump::idle(),
                 option_projection_task: smol::spawn(async {}),
+                mode_projection_task: smol::spawn(async {}),
                 ui_forward: smol::spawn(async {}),
                 lock: None,
             }),
@@ -5496,6 +5534,67 @@ mod tests {
             } else {
                 assert_eq!(config.mode, maki_agent::AgentMode::Build);
             }
+            close_session(&mut srv).await;
+        });
+    }
+
+    #[test]
+    fn a_mode_switch_reaches_every_window_with_its_plan_file() {
+        configure_test_paths();
+        smol::block_on(async {
+            let cwd = TempDir::new().unwrap();
+            let params = test_params(test_model(SPAWN_TEST_SPEC), cwd.path().to_path_buf());
+            let (out_tx, out_rx) = flume::unbounded();
+            let mut srv = Server {
+                wire: out_tx.clone(),
+                out_tx,
+                taps: Arc::default(),
+                attached: None,
+                own_tap: Arc::default(),
+                origin: None,
+                catalog: ModelCatalog::default(),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: params.lua_event_handle.clone(),
+                ui: Default::default(),
+                dispatch: None,
+            };
+            new_session(
+                &mut srv,
+                &serde_json::json!({ "params": { "cwd": cwd.path(), "mcpServers": [] } }),
+                &params,
+            )
+            .await
+            .unwrap();
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            handle_set_mode(
+                &mut srv,
+                &serde_json::json!({ "params": { "sessionId": session_id, "modeId": "plan" } }),
+                &params,
+            )
+            .await
+            .unwrap();
+
+            let mut announced = None;
+            while let Ok(message) = out_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                if message.pointer("/params/update/sessionUpdate")
+                    == Some(&serde_json::json!("current_mode_update"))
+                {
+                    announced = Some(message);
+                    break;
+                }
+            }
+            let announced = announced.expect("every window hears the mode the session committed");
+            assert_eq!(
+                announced.pointer("/params/update/currentModeId"),
+                Some(&serde_json::json!("plan"))
+            );
+            let plan = announced
+                .pointer("/params/update/_meta/maki/plan")
+                .and_then(Value::as_str)
+                .expect("a window in plan mode drafts into the session's plan file");
+            assert!(Path::new(plan).starts_with(cwd.path().join(maki_storage::plans::PLANS_DIR)));
             close_session(&mut srv).await;
         });
     }

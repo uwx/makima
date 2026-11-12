@@ -21,9 +21,10 @@ pub use agent_client_protocol_schema::{
     PromptResponse, ProtocolVersion, Request, RequestId, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
     SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
-    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    SessionConfigOptionValue, SessionId, SessionModeId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, TextContent, ToolCallContent, ToolCallId, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields,
 };
 use flume::{Receiver, Sender};
 use serde::de::DeserializeOwned;
@@ -67,6 +68,7 @@ const THEME_METHOD: &str = "maki/theme";
 const SESSIONS_METHOD: &str = "maki/sessions";
 const SESSION_LOAD_METHOD: &str = "session/load";
 const SET_CONFIG_OPTION_METHOD: &str = "session/set_config_option";
+const SET_MODE_METHOD: &str = "session/set_mode";
 const LIVE_METHOD: &str = "maki/live";
 const ATTACH_METHOD: &str = "maki/attach";
 const SHARE_METHOD: &str = "maki/share";
@@ -1108,6 +1110,21 @@ impl Client {
         Ok(())
     }
 
+    /// Switches the session's mode where the session lives, so plan and build
+    /// mean the same on both sides.
+    pub fn set_mode(&self, mode: &str) -> Result<(), String> {
+        let session = self
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no active session".to_owned())?;
+        let request = SetSessionModeRequest::new(session, SessionModeId::new(mode.to_owned()));
+        let _: SetSessionModeResponse =
+            self.request(SET_MODE_METHOD, request, Some(SESSION_TIMEOUT))?;
+        Ok(())
+    }
+
     pub fn prompt(&self, text: &str) -> Result<StopReason, String> {
         self.prompt_blocks(
             vec![ContentBlock::Text(TextContent::new(text.to_owned()))],
@@ -1899,6 +1916,33 @@ old
                 "session/new",
                 "session/set_config_option"
             ]
+        );
+    }
+
+    #[test]
+    fn switching_the_mode_names_the_session_and_the_mode() {
+        use agent_client_protocol_schema::{NewSessionResponse, SessionId};
+
+        let (address, server) = fake_agent(4, |method, request| match method {
+            "initialize" => initialized(method),
+            "maki/live" => Some(serde_json::json!({ "sessions": [] })),
+            "session/new" => Some(
+                serde_json::to_value(NewSessionResponse::new(SessionId::new("sess-mode"))).unwrap(),
+            ),
+            "session/set_mode" => {
+                assert_eq!(request["params"]["sessionId"], "sess-mode");
+                assert_eq!(request["params"]["modeId"], "plan");
+                Some(serde_json::json!({}))
+            }
+            _ => None,
+        });
+        let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
+        let connection = super::connect(&target).unwrap();
+        connection.client.set_mode("plan").unwrap();
+        drop(connection);
+        assert_eq!(
+            server.join().unwrap(),
+            ["initialize", "maki/live", "session/new", "session/set_mode"]
         );
     }
 

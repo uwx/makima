@@ -880,6 +880,12 @@ pub enum AgentEvent {
     ThinkingDelta {
         text: String,
     },
+    /// The session changed mode where it lives, with the plan file it drafts
+    /// into while in plan mode, so every window shows the same mode.
+    ModeChanged {
+        mode: String,
+        plan: Option<PathBuf>,
+    },
     /// The current reasoning block is complete; the next `ThinkingDelta`
     /// belongs to a new block.
     ThinkingBlockEnd,

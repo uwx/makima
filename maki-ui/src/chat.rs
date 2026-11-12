@@ -131,7 +131,9 @@ impl Chat {
             AgentEvent::MirroredPrompt { text } => self.show_user_message(text, Vec::new()),
             // History arrives through the event loop; the transcript rows it
             // describes were streamed here already.
-            AgentEvent::HistoryCommitted { .. } | AgentEvent::CwdChanged { .. } => {}
+            AgentEvent::HistoryCommitted { .. }
+            | AgentEvent::CwdChanged { .. }
+            | AgentEvent::ModeChanged { .. } => {}
             // A permission prompt this window did not show.
             AgentEvent::PermissionDismissed { .. } => {}
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),

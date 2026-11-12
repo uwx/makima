@@ -12,8 +12,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use agent_client_protocol_schema::{
-    ContentBlock, ImageContent, PermissionOption, PermissionOptionKind, SessionUpdate, StopReason,
-    TextContent, ToolCall, ToolCallContent, ToolCallUpdate, UsageUpdate,
+    ContentBlock, CurrentModeUpdate, ImageContent, PermissionOption, PermissionOptionKind,
+    SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallUpdate, UsageUpdate,
 };
 use flume::Receiver;
 use futures_lite::future::or;
@@ -38,6 +38,8 @@ const PERMISSION_PREFIX: &str = "remote-";
 const REMOTE_TOOL: &str = "unknown";
 const MCP_PROMPT_UNAVAILABLE: &str = "MCP prompts run where the session lives, not in this window";
 const MIRROR_LABEL: &str = "This turn is running in another window";
+/// Where the agent names the plan file a window in plan mode drafts into.
+const MODE_META: [&str; 2] = ["maki", "plan"];
 
 pub(crate) struct AcpBackend {
     client: Arc<Client>,
@@ -304,6 +306,12 @@ impl Reader {
     fn event(&mut self, event: maki_acp_client::Event) {
         match event {
             maki_acp_client::Event::Update(update) => {
+                // The session's mode belongs to the session, not to a turn, so
+                // a change that lands between turns still reaches this window.
+                if let SessionUpdate::CurrentModeUpdate(update) = *update {
+                    self.mirror.mode(update);
+                    return;
+                }
                 if let Some(update) = self.turn.route(update) {
                     self.mirror.update(*update);
                 }
@@ -470,6 +478,20 @@ impl Mirror {
         self.translator
             .sender
             .try_send(AgentEvent::CwdChanged { cwd });
+    }
+
+    fn mode(&self, update: CurrentModeUpdate) {
+        let plan = update
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(MODE_META[0]))
+            .and_then(|maki| maki.get(MODE_META[1]))
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        self.translator.sender.try_send(AgentEvent::ModeChanged {
+            mode: update.current_mode_id.0.to_string(),
+            plan,
+        });
     }
 
     fn dismissed(&self, id: String) {
@@ -815,6 +837,53 @@ mod tests {
             ] => {
                 assert_eq!(label.text, MIRROR_LABEL);
                 assert_eq!(text, "hello");
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
+    }
+
+    use agent_client_protocol_schema::{Meta, SessionModeId};
+
+    #[test]
+    fn a_mode_announced_between_turns_names_the_plan_the_session_drafts_into() {
+        let (tx, rx) = flume::unbounded();
+        let mirror = Mirror::new(tx, MODEL.to_owned());
+        let plan = PathBuf::from("/plans/session.md");
+        let mut meta = Meta::new();
+        meta.insert(
+            MODE_META[0].to_owned(),
+            serde_json::json!({ MODE_META[1]: plan }),
+        );
+
+        mirror.mode(CurrentModeUpdate::new(SessionModeId::from("plan".to_owned())).meta(meta));
+
+        match drain(&rx).as_slice() {
+            [
+                AgentEvent::ModeChanged {
+                    mode,
+                    plan: announced,
+                },
+            ] => {
+                assert_eq!(mode, "plan");
+                assert_eq!(announced.as_deref(), Some(plan.as_path()));
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_build_mode_announcement_carries_no_plan() {
+        let (tx, rx) = flume::unbounded();
+        let mirror = Mirror::new(tx, MODEL.to_owned());
+
+        mirror.mode(CurrentModeUpdate::new(SessionModeId::from(
+            "build".to_owned(),
+        )));
+
+        match drain(&rx).as_slice() {
+            [AgentEvent::ModeChanged { mode, plan }] => {
+                assert_eq!(mode, "build");
+                assert!(plan.is_none());
             }
             other => panic!("unexpected events: {other:?}"),
         }

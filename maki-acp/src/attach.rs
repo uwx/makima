@@ -4,13 +4,15 @@
 //! watcher may ask for a turn, and the answers go back to the one that asked.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
+use agent_client_protocol_schema::{CurrentModeUpdate, Meta, SessionModeId, SessionUpdate};
 use flume::Sender;
+use maki_agent::AgentMode;
 use maki_providers::Message;
 use maki_storage::sessions::HistorySnapshot;
 use serde_json::{Value, json};
@@ -49,6 +51,8 @@ pub const BUSY_MESSAGE: &str = "this listener already serves a session; attach t
 
 const SESSION_UPDATE: &str = "session/update";
 const CONFIG_OPTION_UPDATE: &str = "config_option_update";
+/// Where a mode update names the plan file a window in plan mode drafts into.
+const MODE_PLAN_META: [&str; 2] = ["maki", "plan"];
 /// Older updates than this are dropped, and the attach says so.
 const MAX_LOG_UPDATES: usize = 4000;
 
@@ -537,6 +541,25 @@ fn record(state: &mut TapState, message: &Value) {
         state.truncated = true;
     }
     state.log.push_back(message.clone());
+}
+
+/// The update that tells every window which mode the session committed, and
+/// the plan file it drafts into while in plan mode, so no window picks one of
+/// its own.
+pub fn mode_update(mode: &AgentMode) -> SessionUpdate {
+    let update = CurrentModeUpdate::new(SessionModeId::from(mode.id().key().to_owned()));
+    SessionUpdate::CurrentModeUpdate(match mode.plan_path() {
+        Some(plan) => update.meta(mode_meta(plan)),
+        None => update,
+    })
+}
+
+fn mode_meta(plan: &Path) -> Meta {
+    let mut inner = serde_json::Map::new();
+    inner.insert(MODE_PLAN_META[1].to_owned(), json!(plan.to_string_lossy()));
+    let mut meta = Meta::new();
+    meta.insert(MODE_PLAN_META[0].to_owned(), Value::Object(inner));
+    meta
 }
 
 #[cfg(test)]
