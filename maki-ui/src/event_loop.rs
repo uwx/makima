@@ -160,6 +160,8 @@ const HOSTED_MCP_GUIDANCE: &str =
     "MCP servers belong to the session's own window; configure them where it runs";
 const HOSTED_LOGIN_GUIDANCE: &str =
     "credentials belong to the machine that runs the session; log in there";
+const HOSTED_ONE_SESSION_ERR: &str =
+    "this window follows one session another process runs; open another session in its own window";
 const CHILD_HISTORY_IDENTITY_ERR: &str = "child history storage identity is unavailable";
 const LOCK_LOST_MSG: &str = "Session lock lost to another process; stopping without saving";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
@@ -3532,6 +3534,10 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(reply);
             }
             SessionRequest::New { prompt, focus } => {
+                if self.ctx.remote.is_some() {
+                    self.new_hosted_session(prompt, reply_tx);
+                    return;
+                }
                 let (session, provider) =
                     new_session_from_slot(self.focused_model_slot(), &self.session_cwd);
                 let mut runtime = match self
@@ -3558,6 +3564,9 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(Ok(json!(id)));
             }
             SessionRequest::Focus { id } => match parse_session_id(&id) {
+                Ok(_) if self.ctx.remote.is_some() => {
+                    let _ = reply_tx.send(Err(HOSTED_ONE_SESSION_ERR.into()));
+                }
                 Ok(id) => self.focus_session(id, reply_tx),
                 Err(error) => {
                     let _ = reply_tx.send(Err(error));
@@ -4013,6 +4022,25 @@ impl<'t> EventLoop<'t> {
         if let Err(error) = self.request_focus(id, reply.clone()) {
             let _ = reply.send(Err(error));
         }
+    }
+
+    /// A new session where this window's agent runs, for `maki.session.new`
+    /// from a plugin: the same reset `/new` asks for, minus a typed command.
+    fn new_hosted_session(&mut self, prompt: Option<String>, reply: flume::Sender<UiReply>) {
+        if prompt.is_some() {
+            let _ = reply.send(Err(HOSTED_ONE_SESSION_ERR.into()));
+            return;
+        }
+        let (session, _) = new_session_from_slot(self.focused_model_slot(), &self.session_cwd);
+        let idx = self.focused;
+        self.replace_hosted_session(
+            idx,
+            session,
+            SessionReplacementKind::Reset {
+                ended_id: self.sessions[idx].id(),
+            },
+        );
+        let _ = reply.send(Ok(json!(true)));
     }
 
     fn request_focus(&mut self, id: MakiId, reply: flume::Sender<UiReply>) -> Result<(), String> {
@@ -7062,18 +7090,20 @@ mod tests {
         event_loop.sync_orchestration();
     }
 
-    /// `/new` in a window that follows another agent: the agent starts the
-    /// session and its choices follow, so the window only replaces its shadow
-    /// once the agent has agreed.
-    #[test]
-    fn a_hosted_window_starts_its_new_session_where_the_session_lives() {
+    /// An agent at the other end of a loopback connection that answers like
+    /// `makima acp` does for the little this window asks. The stop flag ends
+    /// its poll loop, so a test can join it after the connection is gone.
+    fn scripted_agent() -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<Vec<String>>,
+        maki_acp_client::Connection,
+    ) {
         use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
         use std::sync::atomic::AtomicBool;
 
-        const NEW_SESSION_METHOD: &str = "session/new";
-        const OPTION_METHOD: &str = "session/set_config_option";
         const READ_POLL: Duration = Duration::from_millis(50);
+        const NEW_SESSION_METHOD: &str = "session/new";
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let local = listener.local_addr().unwrap();
@@ -7136,19 +7166,35 @@ mod tests {
             }
             methods
         });
-
         let connection = maki_acp_client::connect_streams(
             client.try_clone().unwrap(),
             client,
             Path::new("/tmp"),
         )
         .unwrap();
+        (stop, script, connection)
+    }
 
+    /// A window that follows the scripted agent behind {connection}.
+    fn hosted_harness(connection: maki_acp_client::Connection) -> RuntimeHarness {
         let mut harness = RuntimeHarness::new();
         harness.ctx.as_mut().unwrap().remote = Some(RemoteSession {
             connection,
             label: "agent".to_owned(),
         });
+        harness
+    }
+
+    /// `/new` in a window that follows another agent: the agent starts the
+    /// session and its choices follow, so the window only replaces its shadow
+    /// once the agent has agreed.
+    #[test]
+    fn a_hosted_window_starts_its_new_session_where_the_session_lives() {
+        const NEW_SESSION_METHOD: &str = "session/new";
+        const OPTION_METHOD: &str = "session/set_config_option";
+
+        let (stop, script, connection) = scripted_agent();
+        let harness = hosted_harness(connection);
         let session = harness.session();
         let ended_id = session.id;
         let stop_after = Arc::clone(&stop);
@@ -7180,6 +7226,38 @@ mod tests {
             methods.iter().any(|m| m == OPTION_METHOD),
             "the choices the window shows follow the session: {methods:?}"
         );
+    }
+
+    /// A window follows one session, so a second one cannot share its
+    /// connection: it must refuse instead of opening a tab that would eat the
+    /// other tab's updates.
+    #[test]
+    fn a_hosted_window_refuses_to_open_a_second_session() {
+        let (stop, script, connection) = scripted_agent();
+        let harness = hosted_harness(connection);
+        let mut other = AppSession::new("test-model", &harness.session().cwd);
+        other.save(&harness.ctx().storage).unwrap();
+        let stop_after = Arc::clone(&stop);
+        run_event_loop(
+            harness,
+            |harness| harness.runtime(harness.session()),
+            move |event_loop| {
+                let (reply_tx, reply_rx) = flume::bounded(1);
+                event_loop.handle_session_request(
+                    SessionRequest::Focus {
+                        id: other.id.to_string(),
+                    },
+                    reply_tx,
+                );
+                assert_eq!(
+                    reply_rx.try_recv().unwrap().unwrap_err(),
+                    HOSTED_ONE_SESSION_ERR
+                );
+                assert_eq!(event_loop.sessions.len(), 1);
+                stop_after.store(true, Ordering::Release);
+            },
+        );
+        script.join().unwrap();
     }
 
     #[test_case(false; "bare_model")]

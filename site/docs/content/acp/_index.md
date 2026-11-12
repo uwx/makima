@@ -231,6 +231,8 @@ A window follows it: its status bar, its file completions and its own shells use
 
 A window that follows another process's session starts a new conversation where that session lives. `/new` and `/clear` send ACP's own `session/new`, and only once the agent answers does the window replace the transcript it shows, so the next prompt lands in the new conversation. The choices the window displays (model, thinking, fast, workflow, yolo) go with it as `session/set_config_option` calls, the same way a change made here reaches the agent.
 
+Picking a different stored session in `/sessions` is refused: a window follows one session, and a second tab cannot share its connection. Open the other session in its own window.
+
 `/tasks`, `/mcp` and `/login` still belong to the process that runs the session: tasks, MCP servers and credentials live there. They stay out of the command list in a window that does not run it, and answer with guidance when typed.
 
 `/reload` rebuilds the window's plugins and config where you typed it. A window that also serves its session starts the agent again on the same session, so the agent reloads too. A window attached to another machine's agent cannot reload that process, so it asks you to restart.
