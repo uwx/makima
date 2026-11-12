@@ -62,6 +62,8 @@ fn required_session(opts: Option<&Table>) -> LuaResult<Result<MakiId, String>> {
 /// background scan, so a slow disk never blocks the UI. `open_elsewhere` is
 /// true while another makima instance has the session open. `message_count`
 /// counts main transcript messages only and excludes subagent histories.
+/// A window that follows an agent over ACP asks that agent, and the agent's
+/// sessions carry no `cwd`.
 ///
 /// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 /// @example

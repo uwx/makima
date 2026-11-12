@@ -3573,6 +3573,33 @@ impl<'t> EventLoop<'t> {
     fn handle_session_request(&mut self, req: SessionRequest, reply_tx: flume::Sender<UiReply>) {
         match req {
             SessionRequest::List => {
+                // The stored sessions a window that follows an agent can reopen
+                // live with that agent, not on this machine's disk.
+                if let Some(remote) = &self.ctx.remote {
+                    let client = Arc::clone(&remote.connection.client);
+                    smol::spawn(async move {
+                        let reply =
+                            smol::unblock(move || client.list_sessions(""))
+                                .await
+                                .map(|entries| {
+                                    json!(
+                                        entries
+                                            .into_iter()
+                                            .map(|entry| json!({
+                                                "id": entry.id,
+                                                "title": entry.title,
+                                                "updated_at": entry.updated_at,
+                                                "message_count": entry.messages,
+                                                "open_elsewhere": entry.open_elsewhere,
+                                            }))
+                                            .collect::<Vec<_>>()
+                                    )
+                                });
+                        let _ = reply_tx.send(reply);
+                    })
+                    .detach();
+                    return;
+                }
                 let storage = self.ctx.storage.clone();
                 let cwd = self.session_cwd.clone();
                 smol::unblock(move || {
@@ -7413,6 +7440,10 @@ mod tests {
         event_loop.sync_orchestration();
     }
 
+    const SCRIPTED_SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
+    const SCRIPTED_SESSION_TITLE: &str = "the agent's session";
+    const SESSIONS_METHOD: &str = "maki/sessions";
+
     /// An agent at the other end of a loopback connection that answers like
     /// `makima acp` does for the little this window asks. The stop flag ends
     /// its poll loop, so a test can join it after the connection is gone.
@@ -7469,6 +7500,15 @@ mod tests {
                 let method = request["method"].as_str().unwrap_or_default().to_owned();
                 let result = if method == NEW_SESSION_METHOD {
                     serde_json::json!({ "sessionId": MakiId::generate().to_string() })
+                } else if method == SESSIONS_METHOD {
+                    serde_json::json!({ "sessions": [{
+                        "id": SCRIPTED_SESSION_ID,
+                        "title": SCRIPTED_SESSION_TITLE,
+                        "updatedAt": 5,
+                        "messages": 7,
+                        "openElsewhere": false,
+                        "current": true,
+                    }] })
                 } else if method == "initialize" {
                     serde_json::json!({ "protocolVersion": 1, "agentCapabilities": {} })
                 } else {
@@ -7539,6 +7579,42 @@ mod tests {
             },
         );
         script.join().unwrap();
+    }
+
+    /// `/sessions` in a window that follows an agent lists what that agent can
+    /// reopen, not this machine's own sessions directory.
+    #[test]
+    fn a_following_window_lists_the_sessions_the_agent_holds() {
+        let (stop, script, connection) = scripted_agent();
+        let harness = hosted_harness(connection, true);
+        let stop_after = Arc::clone(&stop);
+        run_event_loop(
+            harness,
+            |harness| harness.runtime(harness.session()),
+            move |event_loop| {
+                let (reply_tx, reply_rx) = flume::bounded(1);
+                event_loop.handle_session_request(SessionRequest::List, reply_tx);
+                let entries = reply_rx
+                    .recv_timeout(PUMP_TIMEOUT)
+                    .unwrap()
+                    .unwrap()
+                    .as_array()
+                    .cloned()
+                    .unwrap();
+                assert_eq!(entries.len(), 1, "the agent's sessions, not the disk");
+                assert_eq!(entries[0]["id"], SCRIPTED_SESSION_ID);
+                assert_eq!(entries[0]["title"], SCRIPTED_SESSION_TITLE);
+                assert_eq!(entries[0]["updated_at"], 5);
+                assert_eq!(entries[0]["message_count"], 7);
+                assert_eq!(entries[0]["open_elsewhere"], false);
+                stop_after.store(true, Ordering::Release);
+            },
+        );
+        let methods = script.join().unwrap();
+        assert!(
+            methods.iter().any(|method| method == SESSIONS_METHOD),
+            "the window lists the agent's sessions: {methods:?}"
+        );
     }
 
     /// `/rename` in a window that follows an agent has to reach the file the
