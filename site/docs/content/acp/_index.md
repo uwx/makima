@@ -233,7 +233,7 @@ A window that follows another process's session starts a new conversation where 
 
 Picking another stored session in `/sessions` reopens the window on it. The agent serves one session at a time, so the window ends and a new agent starts on the session you picked, the way it starts one when you share. A window attached to another machine's agent cannot restart that process, so there it says so instead.
 
-`/tasks` and `/mcp` belong to the process that runs the session: tasks and MCP servers live there, so they stay out of the command list in a window that does not run it and answer with guidance when typed. `/login` is different: credentials belong to a machine, so a window whose agent runs here can log in and the agent uses the new key straight away. A window attached to another machine asks you to log in there.
+`/tasks` works anywhere: a window that follows the session still keeps a chat for each subagent, filled from the updates above. `/mcp` belongs to the process that runs the session, so it stays out of the command list in a window that does not run it and answers with guidance when typed. `/login` is different: credentials belong to a machine, so a window whose agent runs here can log in and the agent uses the new key straight away. A window attached to another machine asks you to log in there.
 
 `/reload` rebuilds the window's plugins and config where you typed it. A window that also serves its session starts the agent again on the same session, so the agent reloads too. A window attached to another machine's agent cannot reload that process, so it asks you to restart.
 

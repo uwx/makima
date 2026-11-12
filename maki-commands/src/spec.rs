@@ -374,7 +374,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
-        OWNED_UI,
+        INTERACTIVE,
     ),
     builtin!(
         Compact,

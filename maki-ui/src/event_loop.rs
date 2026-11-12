@@ -152,10 +152,9 @@ const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
 const UNKNOWN_PROVIDER: &str = "Unknown";
 const RUNTIME_GONE_ERR: &str = "session closed while its model was preparing";
-/// Commands that act on a session this window runs, refused when it follows
-/// another process's session.
-const HOSTED_TASKS_GUIDANCE: &str =
-    "tasks belong to the session's own window; they are not visible from here";
+/// What only the process that runs a session can do. A window that follows it
+/// says where the command belongs instead of hiding it: a typed command that
+/// vanished reads as a bug.
 const HOSTED_MCP_GUIDANCE: &str =
     "MCP servers belong to the session's own window; configure them where it runs";
 const HOSTED_LOGIN_GUIDANCE: &str =
@@ -5722,7 +5721,6 @@ where
 /// that vanished reads as a bug.
 fn hosted_guidance(operation: &BuiltinOperation, owned: bool) -> Option<&'static str> {
     match operation {
-        BuiltinOperation::OpenTasks => Some(HOSTED_TASKS_GUIDANCE),
         BuiltinOperation::OpenMcpPicker => Some(HOSTED_MCP_GUIDANCE),
         BuiltinOperation::OpenLoginPicker if !owned => Some(HOSTED_LOGIN_GUIDANCE),
         _ => None,
@@ -7408,6 +7406,51 @@ mod tests {
             },
         );
         script.join().unwrap();
+    }
+
+    /// A subagent this window follows over the connection still gets its own
+    /// chat, reachable from `/tasks`, and finishes when the session says so.
+    #[test]
+    fn a_followed_subagent_gets_its_own_chat() {
+        with_event_loop(|event_loop| {
+            let agent_id = maki_agent::AgentId::generate();
+            let info = SubagentInfo {
+                agent_id,
+                parent_agent_id: None,
+                parent_tool_use_id: "tool-1".to_owned(),
+                name: "research".to_owned(),
+                prompt: None,
+                model: None,
+                opts: None,
+                answer_tx: None,
+                cancel: None,
+            };
+            event_loop.handle_agent(
+                0,
+                Box::new(Envelope {
+                    event: AgentEvent::TextDelta {
+                        text: "digging".to_owned(),
+                    },
+                    subagent: Some(info.clone()),
+                    identity: None,
+                }),
+            );
+            let chat_idx = event_loop.sessions[0].app.live_chat_index[&agent_id];
+            assert!(
+                !event_loop.sessions[0].app.chats[chat_idx].streaming_text_is_empty(),
+                "the child's text streamed into its own chat"
+            );
+
+            event_loop.handle_agent(
+                0,
+                Box::new(Envelope {
+                    event: AgentEvent::SubagentClosed,
+                    subagent: Some(info),
+                    identity: None,
+                }),
+            );
+            assert!(event_loop.sessions[0].app.chats[chat_idx].is_finished());
+        });
     }
 
     /// Credentials belong to a machine: only a window whose agent runs here
