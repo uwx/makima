@@ -183,23 +183,33 @@ impl CommandRuntime {
             .map(|admission| admission.target)
     }
 
-    pub(crate) fn prepare_target(&self) -> PreparedCommandTarget {
+    /// A target that can run `capabilities` but only offers the commands that
+    /// also fit `presented`, so a session this window does not own keeps `/new`
+    /// typed-but-not-listed until the window can answer it itself.
+    pub(crate) fn prepare_target(
+        &self,
+        capabilities: TargetCapabilities,
+        presented: TargetCapabilities,
+    ) -> PreparedCommandTarget {
         let host = Arc::new(UiCommandHost {
             target: std::sync::OnceLock::new(),
             tx: self.event_tx.clone(),
             admissions: self.admissions.clone(),
         });
         PreparedCommandTarget {
-            target: self
-                .registry
-                .prepare_target(TargetCapabilities::ALL, host.clone()),
+            target: self.registry.prepare_target_with_presentation(
+                capabilities,
+                presented,
+                host.clone(),
+            ),
             host,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn bind_target(&self) -> TargetHandle {
-        self.prepare_target().activate()
+        self.prepare_target(TargetCapabilities::ALL, TargetCapabilities::ALL)
+            .activate()
     }
 
     pub(crate) fn dispatch_command(

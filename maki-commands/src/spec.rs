@@ -35,6 +35,9 @@ pub enum TargetCapability {
     ApplicationLifecycle,
     Reload,
     UiActions,
+    /// The command acts on a session this process runs: its tasks, its MCP
+    /// servers. A window following someone else's session cannot.
+    SessionOwnership,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -54,6 +57,7 @@ impl TargetCapabilities {
         TargetCapability::ApplicationLifecycle,
         TargetCapability::Reload,
         TargetCapability::UiActions,
+        TargetCapability::SessionOwnership,
     ]);
 
     pub const fn from_capability(capability: TargetCapability) -> Self {
@@ -80,6 +84,10 @@ impl TargetCapabilities {
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    pub const fn without(self, capability: TargetCapability) -> Self {
+        Self(self.0 & !Self::from_capability(capability).0)
     }
 }
 
@@ -272,6 +280,9 @@ pub struct BuiltinDefinition {
 
 const INTERACTIVE: TargetCapabilities =
     TargetCapabilities::from_capability(TargetCapability::InteractiveUi);
+const OWNED_UI: TargetCapabilities = INTERACTIVE.union(TargetCapabilities::from_capability(
+    TargetCapability::SessionOwnership,
+));
 const COMPACTION: TargetCapabilities =
     TargetCapabilities::from_capability(TargetCapability::HistoryCompaction);
 const SESSION_REPLACEMENT: TargetCapabilities =
@@ -356,7 +367,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
-        INTERACTIVE,
+        OWNED_UI,
     ),
     builtin!(
         Compact,
@@ -425,7 +436,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
-        INTERACTIVE,
+        OWNED_UI,
     ),
     builtin!(
         Login,
@@ -435,7 +446,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
-        INTERACTIVE,
+        OWNED_UI,
     ),
     builtin!(
         Cd,

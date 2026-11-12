@@ -47,7 +47,9 @@ use maki_agent::{
     AgentConfig, AgentEvent, AgentRef, CancelToken, Envelope, McpCommand, McpConfigErrors,
     McpHandle, McpSnapshotReader, mcp,
 };
-use maki_commands::{BuiltinOperation, CommandError, HostResponse};
+use maki_commands::{
+    BuiltinOperation, CommandError, HostResponse, TargetCapabilities, TargetCapability,
+};
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults, UiConfig};
 use maki_lua::orchestration::{
@@ -150,6 +152,16 @@ const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
 const UNKNOWN_PROVIDER: &str = "Unknown";
 const RUNTIME_GONE_ERR: &str = "session closed while its model was preparing";
+/// Commands that act on a session this window runs, refused when it follows
+/// another process's session.
+const HOSTED_NEW_GUIDANCE: &str =
+    "this window follows a session another process runs; start a new conversation there";
+const HOSTED_TASKS_GUIDANCE: &str =
+    "tasks belong to the session's own window; they are not visible from here";
+const HOSTED_MCP_GUIDANCE: &str =
+    "MCP servers belong to the session's own window; configure them where it runs";
+const HOSTED_LOGIN_GUIDANCE: &str =
+    "credentials belong to the machine that runs the session; log in there";
 const CHILD_HISTORY_IDENTITY_ERR: &str = "child history storage identity is unavailable";
 const LOCK_LOST_MSG: &str = "Session lock lost to another process; stopping without saving";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
@@ -1510,6 +1522,7 @@ impl SpawnCtx {
             crate::theme::default_provider().clone(),
             Arc::clone(&self.command_runtime),
             Arc::clone(&self.model_capabilities),
+            self.command_capabilities(),
         );
         let handles = AgentHandles::prepare(
             &model_slot,
@@ -1561,6 +1574,21 @@ impl SpawnCtx {
     #[cfg(test)]
     fn spawn_runtime(&self, session: AppSession) -> Result<SessionRuntime> {
         self.spawn_runtime_with_provider(session, None)
+    }
+
+    /// What the session's commands may do here. A window that runs its own
+    /// session replaces it outright; one attached to another machine's session
+    /// cannot, because its turn would come back to the same transcript.
+    fn command_capabilities(&self) -> (TargetCapabilities, TargetCapabilities) {
+        match self.remote {
+            Some(_) => (
+                TargetCapabilities::ALL,
+                TargetCapabilities::ALL
+                    .without(TargetCapability::SessionReplacement)
+                    .without(TargetCapability::SessionOwnership),
+            ),
+            None => (TargetCapabilities::ALL, TargetCapabilities::ALL),
+        }
     }
 
     fn spawn_runtime_with_provider(
@@ -1627,6 +1655,11 @@ enum InternalEvent {
     Shared(Result<maki_acp_client::ShareInfo, String>),
     /// The agent refused a session option this window had already applied.
     OptionForwardFailed {
+        session: MakiId,
+        error: String,
+    },
+    /// `/cd` over the agent failed; say why where it was typed.
+    DirectoryRefused {
         session: MakiId,
         error: String,
     },
@@ -2373,6 +2406,11 @@ impl<'t> EventLoop<'t> {
                         .flash(format!("the agent refused this change: {error}"));
                 }
             }
+            InternalEvent::DirectoryRefused { session, error } => {
+                if let Some(idx) = self.position(session) {
+                    self.sessions[idx].app.flash(format!("cd: {error}"));
+                }
+            }
             InternalEvent::Rewound { session, result } => {
                 if let Some(idx) = self.position(session) {
                     match result {
@@ -2625,6 +2663,34 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                 }
+                if let maki_commands::HostRequest::Builtin(operation) = &request
+                    && self.ctx.remote.is_some()
+                    && let Some(guidance) = hosted_guidance(operation)
+                {
+                    self.sessions[index].app.flash(guidance.to_owned());
+                    let _ = reply.send(Ok(HostResponse::Completed));
+                    return;
+                }
+                if let maki_commands::HostRequest::Builtin(BuiltinOperation::ChangeDirectory {
+                    path,
+                }) = &request
+                    && let Some(remote) = &self.ctx.remote
+                {
+                    let client = Arc::clone(&remote.connection.client);
+                    let path = path.clone();
+                    let internal = self.internal_tx.clone();
+                    let session = self.sessions[index].id();
+                    smol::spawn(async move {
+                        let result = smol::unblock(move || client.change_directory(&path)).await;
+                        if let Err(error) = result {
+                            let _ =
+                                internal.send(InternalEvent::DirectoryRefused { session, error });
+                        }
+                    })
+                    .detach();
+                    let _ = reply.send(Ok(HostResponse::Completed));
+                    return;
+                }
                 if let maki_commands::HostRequest::Builtin(BuiltinOperation::ChangeDirectory {
                     path,
                 }) = &request
@@ -2839,6 +2905,25 @@ impl<'t> EventLoop<'t> {
     }
 
     fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
+        // The agent moved the directory its tools run in. This window's shadow
+        // actor still runs shells and resolves paths, so it follows through its
+        // own coordinator; reading the move off the stream keeps the two the
+        // same whoever asked for it.
+        if let AgentEvent::CwdChanged { cwd } = &envelope.event {
+            if self.sessions[idx].app.focused_cwd() == *cwd {
+                return;
+            }
+            let (manager, root) = self.sessions[idx].handles.manager_and_root();
+            let followed = manager
+                .lookup(root)
+                .map_err(|error| error.to_string())
+                .and_then(|root| self.dispatch_target_directory(idx, &root, cwd.clone()));
+            if let Err(error) = followed {
+                warn!(%error, "the window could not follow the session's directory");
+                self.sessions[idx].app.apply_directory_change(cwd.clone());
+            }
+            return;
+        }
         // A shared session told this window what it committed: the transcript
         // the local actor, the window's own copy, has to match. The rows are
         // the same ones the stream painted, and the ones an attach missed.
@@ -5329,6 +5414,19 @@ where
         Err(SESSION_OP_TIMEOUT_ERR.to_owned())
     })
     .await
+}
+
+/// What a command that only works on the session's own window says when this
+/// window follows someone else's session instead of hiding it: a typed command
+/// that vanished reads as a bug.
+fn hosted_guidance(operation: &BuiltinOperation) -> Option<&'static str> {
+    match operation {
+        BuiltinOperation::ResetSession => Some(HOSTED_NEW_GUIDANCE),
+        BuiltinOperation::OpenTasks => Some(HOSTED_TASKS_GUIDANCE),
+        BuiltinOperation::OpenMcpPicker => Some(HOSTED_MCP_GUIDANCE),
+        BuiltinOperation::OpenLoginPicker => Some(HOSTED_LOGIN_GUIDANCE),
+        _ => None,
+    }
 }
 
 fn dispatch_option_toggle(

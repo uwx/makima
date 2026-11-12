@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::fmt::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -861,6 +861,11 @@ pub enum AgentEvent {
     /// transcript reads like the one that typed it.
     MirroredPrompt {
         text: String,
+    },
+    /// Where the session's tools run moved, here or in another window, so
+    /// every window shows the same directory and resolves paths against it.
+    CwdChanged {
+        cwd: PathBuf,
     },
     /// The session committed this much history. A window keeping its own copy
     /// appends these messages, or starts the transcript over when `replace`

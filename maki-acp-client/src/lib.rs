@@ -76,9 +76,11 @@ const COMMITTED_METHOD: &str = "maki/ui/committed";
 const PERMISSION_DONE_METHOD: &str = "maki/ui/permission_done";
 const REWIND_METHOD: &str = "maki/rewind";
 const COMPACT_METHOD: &str = "maki/compact";
+const CHDIR_METHOD: &str = "maki/chdir";
 const PREAMBLE_KEY: &str = "maki";
 const PREAMBLE_FIELD: &str = "preamble";
 const REWOUND_METHOD: &str = "maki/ui/rewind";
+const CWD_METHOD: &str = "maki/ui/cwd";
 const SHORT_SESSION_CHARS: usize = 8;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -109,6 +111,8 @@ pub enum Event {
     RewindTurns(Result<Vec<RewindTurn>, String>),
     /// The agent rewound its history; the replay follows as updates.
     Rewound,
+    /// The session's working directory moved, here or in another window.
+    Cwd(PathBuf),
     /// The agent started sharing this session, or said why it could not.
     Share(Result<ShareInfo, String>),
     /// The agent stopped sharing this session, or said why it could not.
@@ -192,6 +196,11 @@ struct RewindTurns {
 #[derive(Deserialize)]
 struct RewindResult {
     draft: String,
+}
+
+#[derive(Deserialize)]
+struct ChangeDirectoryResult {
+    cwd: PathBuf,
 }
 
 /// The session the agent switched to, with the config the status bar shows.
@@ -676,6 +685,9 @@ fn open_session(
             // Queued behind the replay, so a watcher knows where history ends.
             let busy = reply.get("busy").and_then(Value::as_bool) == Some(true);
             let _ = client.emit(Event::Attached { busy });
+            if let Some(cwd) = reply.get("cwd").and_then(Value::as_str) {
+                let _ = client.emit(Event::Cwd(PathBuf::from(cwd)));
+            }
             let options = session_options(&reply);
             let view = session_view(&options);
             let model = view.model.clone().unwrap_or_default();
@@ -1120,6 +1132,23 @@ impl Client {
         Ok(response.stop_reason)
     }
 
+    /// Moves the working directory the session's tools run in, where the
+    /// session lives, and returns the path the agent resolved.
+    pub fn change_directory(&self, path: &Path) -> Result<PathBuf, String> {
+        let session = self
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no active session".to_owned())?;
+        let response: ChangeDirectoryResult = self.request(
+            CHDIR_METHOD,
+            json!({ "sessionId": session.0, "path": path }),
+            Some(SESSION_TIMEOUT),
+        )?;
+        Ok(response.cwd)
+    }
+
     /// Sends a turn. `preamble` is what the window showed the user rather than
     /// typed, as stored messages, which the agent reads before the prompt.
     pub fn prompt_blocks(
@@ -1242,6 +1271,11 @@ impl Client {
             }
             REWOUND_METHOD => {
                 let _ = self.emit(Event::Rewound);
+            }
+            CWD_METHOD => {
+                if let Some(path) = message.pointer("/params/cwd").and_then(Value::as_str) {
+                    let _ = self.emit(Event::Cwd(PathBuf::from(path)));
+                }
             }
             PERMISSION_DONE_METHOD => {
                 if let Some(event) = permission_done_event(message) {

@@ -1218,6 +1218,34 @@ fn builtin_argument_descriptors_carry_completion_metadata() {
 }
 
 #[test]
+fn commands_that_act_on_the_session_need_its_own_window() {
+    let owned = TargetCapabilities::from_capability(TargetCapability::SessionOwnership).union(
+        TargetCapabilities::from_capability(TargetCapability::InteractiveUi),
+    );
+    for id in [BuiltinId::Tasks, BuiltinId::Mcp, BuiltinId::Login] {
+        let builtin = BUILTIN_COMMANDS
+            .iter()
+            .find(|command| command.id == id)
+            .unwrap();
+        assert!(
+            builtin.required_capabilities.contains_all(owned),
+            "{} has to ask for the session it acts on",
+            builtin.name
+        );
+    }
+    let registry = CommandRegistry::new();
+    let producer = registry.create_producer(ProducerPrecedence::Builtin);
+    producer
+        .replace(vec![registration("/tasks", owned)])
+        .unwrap();
+    let follower = registry.bind_target(
+        owned.without(TargetCapability::SessionOwnership),
+        Arc::new(Host),
+    );
+    assert!(registry.presented_commands(&follower).unwrap().is_empty());
+}
+
+#[test]
 fn typed_usage_hint_fallback_preserves_explicit_hints() {
     let typed = CommandSpec {
         name: Arc::from("/typed"),

@@ -213,6 +213,24 @@ A rewind works the same way, for the same reason:
 
 The reply carries the `draft` the rewound turn started from, which the window puts back in its input box. The others hear `maki/ui/rewind` and rebuild from the transcript that follows.
 
+### Moving the session's directory
+
+`/cd` changes where the session's tools run, so it runs where the session lives, and every window is told:
+
+```json
+{"jsonrpc":"2.0","id":11,"method":"maki/chdir","params":{"sessionId":"...","path":"../other-project"}}
+```
+
+The reply carries the `cwd` the agent resolved, which is canonical and may not be the path that was typed. The session then sends what every window shows:
+
+```json
+{"method":"maki/ui/cwd","params":{"sessionId":"...","cwd":"/home/you/other-project"}}
+```
+
+A window follows it: its status bar, its file completions and its own shells use that directory. The session records the last one, so a window that attaches later gets it in the `maki/attach` reply as `cwd` and starts in the right place. A `/cd` typed as a prompt reaches every window the same way, from the loop that ran the command.
+
+A window that follows another process's session cannot start a new conversation there, so `/new` is not in its command list and answers with guidance when typed. `/tasks`, `/mcp` and `/login` behave the same way: tasks, MCP servers and credentials belong to the process that runs the session.
+
 ### When the link drops
 
 A client attached over TCP reconnects on its own. It retries with backoff (from 250 ms, capped at 5 s), runs `initialize` again, asks `maki/live` for the sessions the agent serves, and attaches the one it was watching. The reattach replays the session's updates and its committed history, so the transcript the client missed comes back in order, and a turn that ran while it was away shows up too.
@@ -237,7 +255,7 @@ The client clears what it draws before the replay, so the transcript is the sess
 
 ACP maps the target-scoped central registry to ACP command metadata. Commands that require TUI capabilities are omitted from ACP's advertised command list. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`). ACP hides `/new` and `/clear` because the ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference, reset model history, or mutate the active session. Custom Markdown commands, MCP prompts, and portable Lua commands use the same registry and collision rules as the TUI. See [Commands](/docs/commands/).
 
-ACP cannot remove messages from the editor's visible transcript or change the editor's displayed session directory. `/compact` changes only the model context. `/cd` changes Makima's canonical working directory and reports it in the transcript, but the editor can continue to display its original directory field.
+ACP itself cannot remove messages from the editor's visible transcript or change the editor's displayed session directory. `/compact` changes only the model context. `/cd` changes Makima's canonical working directory, reports it in the transcript, and announces it as `maki/ui/cwd`; Makima's own windows follow that, but an editor that only speaks ACP can keep displaying its original directory field.
 
 Authentication, providers, and permissions come from your normal Makima config. Set up [providers](/docs/providers/) first and ACP sessions just work.
 

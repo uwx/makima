@@ -318,6 +318,9 @@ impl Session {
     fn on_event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Update(update) => self.printer.update(&update),
+            Event::Cwd(cwd) => self
+                .printer
+                .line(&format!("Working directory: {}", cwd.display())),
             Event::Permission(prompt) => self.answer_permission(prompt)?,
             Event::Pick(prompt) => self.answer_pick(prompt)?,
             Event::Flash(text) => self.printer.line(&text),

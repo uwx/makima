@@ -7,6 +7,7 @@
 //! outcome path all stay exactly what they are for a local session.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -330,6 +331,9 @@ impl Reader {
             }
             // A watcher attaching mid-turn follows the turn already running.
             maki_acp_client::Event::Attached { busy: true } => self.mirror.start(),
+            // The session's tools run somewhere else now: this window follows
+            // it, whoever asked for the change.
+            maki_acp_client::Event::Cwd(cwd) => self.mirror.cwd(cwd),
             // The session committed history. The rows are already on screen;
             // this is what gives the local actor the same transcript to
             // resume, rewind or compact from.
@@ -460,6 +464,12 @@ impl Mirror {
         if self.running {
             self.translator.update(update);
         }
+    }
+
+    fn cwd(&self, cwd: PathBuf) {
+        self.translator
+            .sender
+            .try_send(AgentEvent::CwdChanged { cwd });
     }
 
     fn dismissed(&self, id: String) {

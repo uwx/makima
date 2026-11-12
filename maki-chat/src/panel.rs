@@ -620,6 +620,13 @@ impl SessionPanel {
                 }
             }
             Event::Attached { busy } => self.busy = busy,
+            // `/cd` moved the session, here or in another window: the label
+            // and completions follow where the agent now runs.
+            Event::Cwd(cwd) => {
+                if let Some(backend) = &mut self.backend {
+                    backend.cwd = cwd;
+                }
+            }
             Event::Turn(running) => self.busy = running,
             Event::Reconnecting => self.notice("Connection lost; reconnecting...".to_owned()),
             Event::Reconnected => self.notice("Reconnected".to_owned()),

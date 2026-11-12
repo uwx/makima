@@ -36,8 +36,8 @@ use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
 use maki_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
-    CompletionInput, CompletionKind, CompletionProviders, CompletionResult, InputDispatch,
-    PresentedCommand, TargetCapabilities, TargetCapability, TargetHandle,
+    CompletionInput, CompletionKind, CompletionProviders, CompletionResult, FrontendFeedback,
+    InputDispatch, PresentedCommand, TargetCapabilities, TargetCapability, TargetHandle,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{
@@ -63,7 +63,7 @@ use tracing::{debug, info, warn};
 
 use crate::share;
 
-use crate::attach::{self, SessionTap, Taps};
+use crate::attach::{self, CWD_METHOD, SessionTap, Taps};
 use crate::ui::{COMPLETE_METHOD, REWOUND_METHOD, UI_CAPABILITY_PATH, UiBridge};
 use crate::{AcpParams, THEME_METHOD, ThemeParams, methods, permissions, translate};
 
@@ -87,6 +87,9 @@ const REWIND_STALE: &str = "that turn is gone; open the rewind picker again";
 /// Client to server: compact the transcript where the session lives, with the
 /// optional guidance in `instructions`.
 const COMPACT_METHOD: &str = "maki/compact";
+/// Client to server: move the session's working directory, with the path in
+/// `path`.
+const CWD_CHANGE_METHOD: &str = "maki/chdir";
 /// Where a prompt's `_meta` carries the messages the client showed the user
 /// rather than typed, such as the output of a `!shell` command.
 const PREAMBLE_META: [&str; 2] = ["maki", "preamble"];
@@ -811,6 +814,9 @@ fn publish_session_info(srv: &Server) {
     if let Ok(options) = serde_json::to_value(options) {
         srv.own_tap.set_info(options);
     }
+    if let Some(cwd) = coordinator.read().cwd() {
+        srv.own_tap.set_cwd(cwd);
+    }
 }
 
 /// Methods a watching connection answers itself. Everything else is session
@@ -934,6 +940,7 @@ fn attach_session(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
         .get(id)
         .ok_or_else(|| AcpError::resource_not_found(Some(format!("session/{id}"))))?;
     let config = tap.info().unwrap_or(Value::Null);
+    let cwd = tap.cwd();
     if let Some(previous) = srv.attached.take() {
         previous.detach(&srv.wire);
     }
@@ -950,6 +957,9 @@ fn attach_session(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
         "truncated": truncated,
         "busy": busy,
         "configOptions": config,
+        // Where the session's tools run, which need not be where this window
+        // started, so its paths resolve against the same directory.
+        "cwd": cwd,
     }))
 }
 
@@ -1034,6 +1044,11 @@ async fn handle_request(
             Ok(()) => return,
             Err(error) => Err(error),
         },
+        CWD_CHANGE_METHOD => {
+            let result = change_directory(srv, raw).await;
+            send(srv.reply(), Response::new(id, result));
+            return;
+        }
         SESSIONS_METHOD => {
             if !srv.ui.enabled() {
                 respond_request(srv, method, id, Err(AcpError::method_not_found()));
@@ -1910,6 +1925,43 @@ async fn start_compaction(srv: &mut Server, raw: &Value, id: &RequestId) -> Resu
     send_manual_compaction(session, &srv.out_tx, id, req.instructions).await
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangeDirectoryParams {
+    session_id: SessionId,
+    path: PathBuf,
+}
+
+/// Moves the session's working directory where the session lives, so the tools
+/// of every window run in the same place, and tells them the canonical path the
+/// coordinator resolved, which is not always the one that was typed.
+async fn change_directory(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
+    let req: ChangeDirectoryParams = parse_params(raw)?;
+    let session = validate_session(srv, req.session_id.0.as_ref())?;
+    let coordinator = session.coordinator.as_ref().ok_or_else(no_session)?;
+    let cwd = coordinator
+        .change_directory(req.path)
+        .await
+        .map_err(|error| AcpError::invalid_params().data(json_str(&error)))?;
+    announce_cwd(&srv.out_tx, session, cwd.clone());
+    Ok(json!({ "cwd": cwd }))
+}
+
+/// Tells every window where the session's tools run now, so their status bars
+/// and path completions follow a `/cd` any of them made.
+fn announce_cwd(out_tx: &Sender<Value>, session: &SessionState, cwd: PathBuf) {
+    send(
+        out_tx,
+        Notification {
+            method: CWD_METHOD.into(),
+            params: Some(json!({
+                "sessionId": session.handle.session_id.to_string(),
+                "cwd": cwd,
+            })),
+        },
+    );
+}
+
 /// Lists the turns a rewind can return to, or rewinds to one. A rewind drops
 /// every message from that turn on, so the client is told to clear its
 /// transcript before the remaining history is replayed as updates.
@@ -2393,9 +2445,18 @@ async fn run_dispatch(
             send_manual_compaction(session, &srv.out_tx, id, instructions).await
         }
         InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(feedback)) => {
-            let text = feedback.to_string();
-            let sid = SessionId::from(session.handle.session_id.to_string());
-            session_update(&srv.out_tx, &sid, translate::text_delta(&text));
+            match feedback {
+                // A `/cd` the session ran for one window: the others follow it
+                // by announcement, the same way their status bar does when the
+                // change came over `maki/chdir`.
+                FrontendFeedback::WorkingDirectory(cwd) => {
+                    announce_cwd(&srv.out_tx, session, cwd);
+                }
+                FrontendFeedback::Text(text) => {
+                    let sid = SessionId::from(session.handle.session_id.to_string());
+                    session_update(&srv.out_tx, &sid, translate::text_delta(&text));
+                }
+            }
             respond_prompt(&srv.out_tx, id.clone(), StopReason::EndTurn);
             Ok(())
         }
@@ -8153,6 +8214,34 @@ mod tests {
                 assert_eq!(response["result"]["stopReason"], "end_turn");
                 turns.assert_untouched();
             }
+        });
+    }
+
+    #[test]
+    fn a_cd_from_a_prompt_moves_every_window() {
+        smol::block_on(async {
+            let (mut srv, _, out_rx, _) = server_awaiting_answer();
+            install_registry(&mut srv, test_registry(&[]));
+            let temp = TempDir::new().unwrap();
+            let target = temp.path().canonicalize().unwrap();
+
+            dispatch_prompt(
+                &mut srv,
+                &format!("/cd {}", target.display()),
+                false,
+                &RequestId::Number(3),
+            )
+            .await
+            .unwrap();
+
+            let announced = out_rx
+                .try_iter()
+                .find(|message| message["method"] == CWD_METHOD)
+                .expect("every window hears where the session runs now");
+            assert_eq!(
+                announced["params"]["cwd"],
+                serde_json::to_value(&target).unwrap()
+            );
         });
     }
 

@@ -635,6 +635,7 @@ pub fn run(
                                 | AgentEvent::ToolDone(_)
                                 | AgentEvent::QueueItemConsumed { .. }
                                 | AgentEvent::MirroredPrompt { .. }
+                                | AgentEvent::CwdChanged { .. }
                                 | AgentEvent::HistoryCommitted { .. }
                                 | AgentEvent::PermissionDismissed { .. }
                                 | AgentEvent::ModelSwitched { .. }

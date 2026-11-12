@@ -4,6 +4,7 @@
 //! watcher may ask for a turn, and the answers go back to the one that asked.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -32,6 +33,9 @@ pub const TURN_METHOD: &str = "maki/ui/turn";
 pub const COMMITTED_METHOD: &str = "maki/ui/committed";
 /// The question another window answered, so every window closes it.
 pub const PERMISSION_DONE_METHOD: &str = "maki/ui/permission_done";
+/// Where the session's tools run now, so every window's status bar follows a
+/// `/cd` made in any of them.
+pub const CWD_METHOD: &str = "maki/ui/cwd";
 /// Client to server: a window that did not ask answers the session's permission
 /// question. Forwarded to the connection that owns the session.
 pub const ANSWER_PERMISSION_METHOD: &str = "maki/ui/answer_permission";
@@ -155,6 +159,19 @@ impl Taps {
                     tap.announce_committed();
                 }
             }
+            // Where the session's tools run now: every window follows it, and
+            // one attaching later replays it from the log.
+            Some(CWD_METHOD) => {
+                let Some(id) = message.pointer("/params/sessionId").and_then(Value::as_str) else {
+                    return;
+                };
+                if let Some(tap) = self.get(id) {
+                    if let Some(cwd) = message.pointer("/params/cwd").and_then(Value::as_str) {
+                        tap.set_cwd(PathBuf::from(cwd));
+                    }
+                    tap.publish(message);
+                }
+            }
             _ => {}
         }
         // A turn can end in a task of its own, whose last message is this one,
@@ -215,6 +232,9 @@ pub struct SessionTap {
     /// The session's config options, so an attach can paint its status bar
     /// without asking the owning loop.
     info: Mutex<Option<Value>>,
+    /// Where the session's tools run, so an attach resolves paths against the
+    /// same directory the session does.
+    cwd: Mutex<Option<PathBuf>>,
     inbound: (Sender<RemoteRequest>, flume::Receiver<RemoteRequest>),
 }
 
@@ -231,6 +251,7 @@ impl Default for SessionTap {
             owner: Mutex::default(),
             asker: Mutex::default(),
             info: Mutex::default(),
+            cwd: Mutex::default(),
             inbound: flume::unbounded(),
         }
     }
@@ -419,6 +440,14 @@ impl SessionTap {
 
     pub fn set_info(&self, options: Value) {
         *self.info.lock().unwrap() = Some(options);
+    }
+
+    pub fn set_cwd(&self, cwd: PathBuf) {
+        *self.cwd.lock().unwrap() = Some(cwd);
+    }
+
+    pub fn cwd(&self) -> Option<PathBuf> {
+        self.cwd.lock().unwrap().clone()
     }
 
     pub fn info(&self) -> Option<Value> {
@@ -765,6 +794,28 @@ mod tests {
             .collect();
         answered.sort_unstable();
         assert_eq!(answered, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_moved_directory_reaches_every_window_and_a_later_attach() {
+        let taps = Taps::default();
+        taps.ensure("s1");
+        let (tx, rx) = flume::unbounded();
+        taps.get("s1").unwrap().subscribe(tx);
+
+        taps.observe(&json!({
+            "jsonrpc": "2.0",
+            "method": CWD_METHOD,
+            "params": { "sessionId": "s1", "cwd": "/elsewhere" },
+        }));
+
+        let message = rx.recv().unwrap();
+        assert_eq!(message["params"]["cwd"], "/elsewhere");
+        assert_eq!(
+            taps.get("s1").unwrap().cwd(),
+            Some(PathBuf::from("/elsewhere")),
+            "an attach resolves paths against the directory the session uses"
+        );
     }
 
     #[test]
