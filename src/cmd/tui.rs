@@ -410,6 +410,7 @@ fn hosted_session(
     Ok(RemoteSession {
         connection,
         label: format!("this machine, shared on {address}"),
+        can_switch: true,
     })
 }
 
@@ -715,6 +716,19 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
                 attached = true;
                 session_picker = false;
                 focused = 0;
+            }
+            RunOutcome::Switch { session } => {
+                let mut hosted = rehosted_session(&cwd, &cli, Some(session.to_string()))?;
+                let info = hosted.connection.client.share().map_err(|e| eyre!(e))?;
+                hosted.label = format!("this machine, shared on {}", info.address);
+                shared_session = Some(hosted.connection.session.0.to_string());
+                notice = Some(format!(
+                    "{}; other machines can attach to this session",
+                    hosted.label
+                ));
+                tabs = vec![AppSession::new(&hosted.connection.model, &cwd_str)];
+                focused = 0;
+                remote = Some(hosted);
             }
             RunOutcome::Reload {
                 tabs: reloaded,

@@ -65,7 +65,15 @@ pub fn run(
     if interactive {
         let label = target.label().to_owned();
         let cwd = std::env::current_dir().context(CWD_ERR)?;
-        return tui::run(cli, cwd, Some(maki_ui::RemoteSession { connection, label }));
+        return tui::run(
+            cli,
+            cwd,
+            Some(maki_ui::RemoteSession {
+                connection,
+                label,
+                can_switch: false,
+            }),
+        );
     }
     let mut session = Session::new(connection);
     match prompt {
@@ -510,7 +518,7 @@ mod tests {
             Command::Empty => "empty",
             Command::Help => "help",
             Command::Quit => "quit",
-                    Command::Cancel => "cancel",
+            Command::Cancel => "cancel",
             Command::Prompt(_) => "prompt",
         }
     }

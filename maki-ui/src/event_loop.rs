@@ -218,6 +218,9 @@ pub struct EventLoopParams {
 pub struct RemoteSession {
     pub connection: maki_acp_client::Connection,
     pub label: String,
+    /// Whether this window can start the agent again on another session, which
+    /// only the window that spawned it can.
+    pub can_switch: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3563,15 +3566,17 @@ impl<'t> EventLoop<'t> {
                 }
                 let _ = reply_tx.send(Ok(json!(id)));
             }
-            SessionRequest::Focus { id } => match parse_session_id(&id) {
-                Ok(_) if self.ctx.remote.is_some() => {
-                    let _ = reply_tx.send(Err(HOSTED_ONE_SESSION_ERR.into()));
-                }
-                Ok(id) => self.focus_session(id, reply_tx),
-                Err(error) => {
-                    let _ = reply_tx.send(Err(error));
-                }
-            },
+            SessionRequest::Focus { id } => {
+                let reply = match parse_session_id(&id) {
+                    Ok(id) if self.ctx.remote.is_some() => self.switch_hosted_session(id),
+                    Ok(id) => {
+                        self.focus_session(id, reply_tx);
+                        return;
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::SetTitle { id, title } => {
                 let title = normalize_title(&title);
                 let reply = (|| {
@@ -4022,6 +4027,36 @@ impl<'t> EventLoop<'t> {
         if let Err(error) = self.request_focus(id, reply.clone()) {
             let _ = reply.send(Err(error));
         }
+    }
+
+    /// Another stored session this window may follow. The agent serves one
+    /// session at a time, so the window ends and reopens on it, the way
+    /// `/share` reopens on the session it serves.
+    fn switch_hosted_session(&mut self, id: MakiId) -> UiReply {
+        let Some((can_switch, served)) = self
+            .ctx
+            .remote
+            .as_ref()
+            .map(|remote| (remote.can_switch, remote.connection.session.0.to_string()))
+        else {
+            return Err(NOT_LIVE_ERR.into());
+        };
+        if !can_switch {
+            return Err(HOSTED_ONE_SESSION_ERR.into());
+        }
+        if served == id.to_string() {
+            return Ok(json!(true));
+        }
+        let session = AppSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
+        if let Some(block) = session_lock::resume_block(
+            &session.cwd,
+            &self.session_cwd,
+            session_lock::open_elsewhere(&self.sessions_dir, &id),
+        ) {
+            return Err(block.to_string());
+        }
+        self.sessions[self.focused].app.exit_request = ExitRequest::Switch { session: id };
+        Ok(json!(true))
     }
 
     /// A new session where this window's agent runs, for `maki.session.new`
@@ -7176,11 +7211,12 @@ mod tests {
     }
 
     /// A window that follows the scripted agent behind {connection}.
-    fn hosted_harness(connection: maki_acp_client::Connection) -> RuntimeHarness {
+    fn hosted_harness(connection: maki_acp_client::Connection, can_switch: bool) -> RuntimeHarness {
         let mut harness = RuntimeHarness::new();
         harness.ctx.as_mut().unwrap().remote = Some(RemoteSession {
             connection,
             label: "agent".to_owned(),
+            can_switch,
         });
         harness
     }
@@ -7194,7 +7230,7 @@ mod tests {
         const OPTION_METHOD: &str = "session/set_config_option";
 
         let (stop, script, connection) = scripted_agent();
-        let harness = hosted_harness(connection);
+        let harness = hosted_harness(connection, true);
         let session = harness.session();
         let ended_id = session.id;
         let stop_after = Arc::clone(&stop);
@@ -7228,13 +7264,47 @@ mod tests {
         );
     }
 
+    /// A session this window may follow: the agent serves one at a time, so
+    /// the window ends and reopens on it instead of adding a tab that would
+    /// share its connection.
+    #[test]
+    fn a_hosted_window_switches_to_another_stored_session() {
+        let (stop, script, connection) = scripted_agent();
+        let harness = hosted_harness(connection, true);
+        let mut other = AppSession::new("test-model", &harness.session().cwd);
+        other.save(&harness.ctx().storage).unwrap();
+        let other_id = other.id;
+        let stop_after = Arc::clone(&stop);
+        run_event_loop(
+            harness,
+            |harness| harness.runtime(harness.session()),
+            move |event_loop| {
+                let (reply_tx, reply_rx) = flume::bounded(1);
+                event_loop.handle_session_request(
+                    SessionRequest::Focus {
+                        id: other_id.to_string(),
+                    },
+                    reply_tx,
+                );
+                assert_eq!(reply_rx.try_recv().unwrap().unwrap(), json!(true));
+                assert_eq!(
+                    event_loop.sessions[0].app.exit_request,
+                    ExitRequest::Switch { session: other_id }
+                );
+                assert_eq!(event_loop.sessions.len(), 1);
+                stop_after.store(true, Ordering::Release);
+            },
+        );
+        script.join().unwrap();
+    }
+
     /// A window follows one session, so a second one cannot share its
     /// connection: it must refuse instead of opening a tab that would eat the
     /// other tab's updates.
     #[test]
     fn a_hosted_window_refuses_to_open_a_second_session() {
         let (stop, script, connection) = scripted_agent();
-        let harness = hosted_harness(connection);
+        let harness = hosted_harness(connection, false);
         let mut other = AppSession::new("test-model", &harness.session().cwd);
         other.save(&harness.ctx().storage).unwrap();
         let stop_after = Arc::clone(&stop);

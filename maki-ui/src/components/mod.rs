@@ -285,12 +285,17 @@ pub enum ExitRequest {
     /// Tear the window down so it can reopen as a client of an agent that
     /// serves the same session.
     Share,
+    /// Tear the window down so it can reopen on another session the agent it
+    /// serves holds.
+    Switch {
+        session: maki_storage::id::MakiId,
+    },
 }
 
 impl ExitRequest {
     pub fn code(&self) -> i32 {
         match self {
-            Self::None | Self::Success | Self::Reload | Self::Share => 0,
+            Self::None | Self::Success | Self::Reload | Self::Share | Self::Switch { .. } => 0,
             Self::Error => 1,
         }
     }
