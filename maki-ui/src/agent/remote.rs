@@ -18,9 +18,10 @@ use agent_client_protocol_schema::{
 };
 use flume::Receiver;
 use futures_lite::future::or;
-use maki_acp_client::{Client, Connection, PermissionPrompt};
+use maki_acp_client::{Client, Connection, PermissionPrompt, SubagentEnd};
 use maki_agent::actor::{ActorBackend, BackendResult, ControlWork, TurnContext, WorkKind};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
+use maki_agent::types::SubagentInfo;
 use maki_agent::{
     ActorWorkIdentity, ActorWorkKind, AgentEvent, AgentId, AgentInput, DoneReason, Envelope,
     EventSender, History, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCancellationReason,
@@ -39,6 +40,7 @@ const PERMISSION_PREFIX: &str = "remote-";
 const REMOTE_TOOL: &str = "unknown";
 const MCP_PROMPT_UNAVAILABLE: &str = "MCP prompts run where the session lives, not in this window";
 const MIRROR_LABEL: &str = "This turn is running in another window";
+const SUBAGENT_FAILED: &str = "the subagent's turn failed";
 /// Where the agent names the plan file a window in plan mode drafts into.
 const MODE_META: [&str; 2] = ["maki", "plan"];
 
@@ -69,6 +71,8 @@ impl AcpBackend {
             turn: turn.clone(),
             mirror: Mirror::new(agent_tx.clone(), connection.model.clone()),
             permissions: permissions.clone(),
+            agent_tx: agent_tx.clone(),
+            children: HashMap::new(),
         };
         smol::spawn(reader.run()).detach();
         let client = Arc::clone(&connection.client);
@@ -281,6 +285,17 @@ struct Reader {
     turn: SharedTurn,
     mirror: Mirror,
     permissions: Permissions,
+    /// Where the subagent rows go, and the one translator each child keeps so
+    /// its tool names and thinking blocks stay its own.
+    agent_tx: flume::Sender<Envelope>,
+    children: HashMap<String, ChildStream>,
+}
+
+/// One subagent this window follows: what its updates translate through, and
+/// what it needs to build the envelope around them.
+struct ChildStream {
+    translator: Translator,
+    events: flume::Receiver<Envelope>,
 }
 
 impl Reader {
@@ -358,8 +373,111 @@ impl Reader {
                 replace,
                 compacted,
             } => self.mirror.committed(messages, start, replace, compacted),
+            // A subagent's rows belong in that child's chat, so they carry the
+            // child's identity instead of this window's turn.
+            maki_acp_client::Event::SubagentUpdate { subagent, update } => {
+                self.subagent_update(subagent, *update)
+            }
+            maki_acp_client::Event::SubagentEnd { subagent, end } => {
+                self.subagent_end(subagent, end)
+            }
             _ => {}
         }
+    }
+
+    /// The identity a subagent's rows carry, as the window's own actor names
+    /// it. An id this window cannot read is dropped: the rows would be lost in
+    /// the root chat otherwise.
+    fn subagent(&mut self, subagent: &maki_acp_client::Subagent) -> Option<SubagentInfo> {
+        let Ok(agent_id) = subagent.id.parse::<AgentId>() else {
+            warn!(id = %subagent.id, "a subagent named an identity this window cannot read");
+            return None;
+        };
+        Some(SubagentInfo {
+            agent_id,
+            parent_agent_id: subagent
+                .parent
+                .as_deref()
+                .and_then(|parent| parent.parse().ok()),
+            parent_tool_use_id: subagent.tool_use_id.clone(),
+            name: subagent.name.clone(),
+            prompt: subagent.prompt.clone(),
+            model: subagent.model.clone(),
+            opts: None,
+            answer_tx: None,
+            cancel: None,
+        })
+    }
+
+    fn subagent_update(&mut self, subagent: maki_acp_client::Subagent, update: SessionUpdate) {
+        let Some(info) = self.subagent(&subagent) else {
+            return;
+        };
+        let model = info.model.clone().unwrap_or_default();
+        let stream = self.children.entry(subagent.id.clone()).or_insert_with(|| {
+            let (tx, events) = flume::unbounded();
+            ChildStream {
+                translator: Translator {
+                    sender: EventSender::new(tx),
+                    model,
+                    tools: HashMap::new(),
+                    usage: TokenUsage::default(),
+                    context_window: 0,
+                },
+                events,
+            }
+        });
+        stream.translator.update(update);
+        for mut envelope in stream.events.try_iter() {
+            envelope.subagent = Some(info.clone());
+            let _ = self.agent_tx.try_send(envelope);
+        }
+    }
+
+    /// A subagent's turn ended. The window marks that child's chat finished
+    /// the way it does for a session it runs itself.
+    fn subagent_end(&mut self, subagent: maki_acp_client::Subagent, end: SubagentEnd) {
+        let Some(info) = self.subagent(&subagent) else {
+            return;
+        };
+        let agent_id = info.agent_id;
+        let turn_id = TurnId::generate();
+        let outcome = match end {
+            SubagentEnd::Completed => TurnOutcome::completed(
+                agent_id,
+                turn_id,
+                TokenUsage::default(),
+                1,
+                DoneReason::EndTurn,
+            ),
+            SubagentEnd::Cancelled => TurnOutcome::cancelled(
+                agent_id,
+                turn_id,
+                TokenUsage::default(),
+                1,
+                TurnCancellationReason::User,
+            ),
+            SubagentEnd::Failed => TurnOutcome::failed(
+                agent_id,
+                turn_id,
+                TokenUsage::default(),
+                1,
+                TurnFailure {
+                    kind: TurnFailureKind::Tool,
+                    diagnostic: SUBAGENT_FAILED.into(),
+                    user_message: SUBAGENT_FAILED.into(),
+                    retryable: false,
+                },
+            ),
+        };
+        for event in [AgentEvent::TurnOutcome(outcome), AgentEvent::SubagentClosed] {
+            let _ = self.agent_tx.try_send(Envelope {
+                event,
+                subagent: Some(info.clone()),
+                identity: None,
+            });
+        }
+        self.children.remove(&subagent.id);
     }
 }
 
@@ -891,6 +1009,85 @@ mod tests {
                 assert_eq!(announced.as_deref(), Some(plan.as_path()));
             }
             other => panic!("unexpected events: {other:?}"),
+        }
+    }
+
+    /// A subagent's rows reach the window's own event stream with the child's
+    /// identity, which is what puts them in that child's chat.
+    #[test]
+    fn a_subagent_update_is_shaped_for_that_childs_chat() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap();
+        let client = TcpStream::connect(local).unwrap();
+        let (mut agent, _) = listener.accept().unwrap();
+        let child = AgentId::generate();
+        let script = std::thread::spawn(move || {
+            let mut reader = BufReader::new(agent.try_clone().unwrap());
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                let result = if request["method"] == "initialize" {
+                    serde_json::json!({ "protocolVersion": 1, "agentCapabilities": {} })
+                } else {
+                    serde_json::json!({ "sessionId": "sess-1" })
+                };
+                let reply = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result,
+                });
+                writeln!(agent, "{reply}").unwrap();
+                agent.flush().unwrap();
+            }
+            let update = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "sess-1",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": "digging" },
+                    },
+                    "_meta": {
+                        "maki": {
+                            "subagent": {
+                                "id": child.to_string(),
+                                "toolUseId": "tool-1",
+                                "name": "research",
+                            },
+                        },
+                    },
+                },
+            });
+            writeln!(agent, "{update}").unwrap();
+            agent.flush().unwrap();
+            child
+        });
+
+        let connection = maki_acp_client::connect_streams(
+            client.try_clone().unwrap(),
+            client,
+            Path::new("/tmp"),
+        )
+        .unwrap();
+        let (tx, rx) = flume::unbounded();
+        let (_answers_tx, answers_rx) = flume::unbounded();
+        let _backend = AcpBackend::new(&connection, tx, answers_rx);
+
+        let envelope = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the child's row reached the window");
+        let subagent = envelope.subagent.expect("it names the child it belongs to");
+        assert_eq!(subagent.agent_id, script.join().unwrap());
+        assert_eq!(subagent.parent_tool_use_id, "tool-1");
+        assert_eq!(subagent.name, "research");
+        match envelope.event {
+            AgentEvent::TextDelta { text } => assert_eq!(text, "digging"),
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 

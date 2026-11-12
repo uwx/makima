@@ -247,6 +247,22 @@ Model, thinking, fast, workflow and yolo belong to the session, not to a window,
 
 Each window compares that with what it already shows: the ones that differ go through the same path a change typed there would take, and the ones that match are left alone, so a change this window made does not come back to it. A `/model` or `/fast` typed in one window moves the status bar in all of them, and a session opened with `/sessions` arrives with its own options.
 
+### Watching a subagent
+
+A session that runs subagents streams their rows too. Each one is a normal session update, tagged with the child it belongs to:
+
+```json
+{"method":"session/update","params":{"sessionId":"...","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reading src/lib.rs"}},"_meta":{"maki":{"subagent":{"id":"0190f...","toolUseId":"tool-7","name":"research","model":"anthropic/claude-opus-4-6"}}}}
+```
+
+A child's turn end is not a session update, so it travels as its own notification:
+
+```json
+{"jsonrpc":"2.0","method":"maki/subagent/end","params":{"sessionId":"...","end":"completed","subagent":{"id":"0190f...","toolUseId":"tool-7","name":"research"}}}
+```
+
+`end` is `completed`, `cancelled` or `failed`. A window keeps the rows in that child's chat and marks it finished on `end`. The main chat still shows the task tool call, with the summary the subagent reports.
+
 ### Switching the mode
 
 Build and plan mode decide what the session may write, so a switch runs where the session lives. A window asks for it with ACP's own method:

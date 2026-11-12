@@ -93,6 +93,12 @@ const CWD_CHANGE_METHOD: &str = "maki/chdir";
 /// Where a prompt's `_meta` carries the messages the client showed the user
 /// rather than typed, such as the output of a `!shell` command.
 const PREAMBLE_META: [&str; 2] = ["maki", "preamble"];
+/// Where an update carries the subagent it belongs to, when the session runs
+/// one: a window keeps those rows in that child's chat.
+const SUBAGENT_META: [&str; 2] = ["maki", "subagent"];
+/// How a subagent's turn ended. ACP has no session update for it, so the
+/// subagent's own turn outcome travels as this notification.
+const SUBAGENT_END_METHOD: &str = "maki/subagent/end";
 
 type StoredSession = Session<Message, TokenUsage, maki_agent::ToolOutput>;
 const INVALID_THEME_CODE: i32 = -32602;
@@ -3325,6 +3331,14 @@ fn start_event_pump(
             }
             let permission_answer_tx = if let Some(subagent) = subagent {
                 if !matches!(&event, AgentEvent::PermissionRequest { .. }) {
+                    forward_subagent(
+                        &out_tx,
+                        &sid,
+                        &subagent,
+                        &event,
+                        session.cwd().as_deref(),
+                        home.as_deref(),
+                    );
                     continue;
                 }
                 let Some(answer_tx) = subagent.answer_tx else {
@@ -3606,6 +3620,15 @@ fn echo_prompt(srv: &Server, sid: &SessionId, content: &CommandContent) {
 }
 
 fn session_update(out_tx: &Sender<Value>, sid: &SessionId, update: SessionUpdate) {
+    session_update_with_meta(out_tx, sid, update, None);
+}
+
+fn session_update_with_meta(
+    out_tx: &Sender<Value>,
+    sid: &SessionId,
+    update: SessionUpdate,
+    meta: Option<Meta>,
+) {
     let pending = matches!(
         &update,
         SessionUpdate::ToolCall(tool_call) if tool_call.status == ToolCallStatus::Pending
@@ -3613,8 +3636,11 @@ fn session_update(out_tx: &Sender<Value>, sid: &SessionId, update: SessionUpdate
         &update,
         SessionUpdate::ToolCallUpdate(tool_call) if tool_call.fields.status == Some(ToolCallStatus::Pending)
     );
-    let notification =
-        AgentNotification::SessionNotification(SessionNotification::new(sid.clone(), update));
+    let mut source = SessionNotification::new(sid.clone(), update);
+    if let Some(meta) = meta {
+        source = source.meta(meta);
+    }
+    let notification = AgentNotification::SessionNotification(source);
     let notification = Notification {
         method: Arc::from("session/update"),
         params: Some(notification),
@@ -3624,6 +3650,65 @@ fn session_update(out_tx: &Sender<Value>, sid: &SessionId, update: SessionUpdate
     } else {
         send(out_tx, notification);
     }
+}
+
+/// A subagent's own activity, tagged with the child it belongs to. A window
+/// keeps those rows in that child's chat; a child turn's end has no ACP
+/// update, so it travels as [`SUBAGENT_END_METHOD`].
+fn forward_subagent(
+    out_tx: &Sender<Value>,
+    sid: &SessionId,
+    subagent: &maki_agent::types::SubagentInfo,
+    event: &AgentEvent,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) {
+    if let AgentEvent::TurnOutcome(outcome) = event {
+        let end = match outcome {
+            maki_agent::TurnOutcome::Completed { .. } => "completed",
+            maki_agent::TurnOutcome::Cancelled { .. } => "cancelled",
+            maki_agent::TurnOutcome::Failed { .. } => "failed",
+        };
+        let _ = out_tx.send(json!({
+            "jsonrpc": "2.0",
+            "method": SUBAGENT_END_METHOD,
+            "params": {
+                "sessionId": sid,
+                "end": end,
+                "subagent": subagent_block(subagent),
+            },
+        }));
+        return;
+    }
+    let update = match event {
+        AgentEvent::TextDelta { text } => translate::text_delta(text),
+        AgentEvent::ThinkingDelta { text } => translate::thinking_delta(text),
+        AgentEvent::ThinkingBlockEnd => translate::thinking_block_end(),
+        AgentEvent::ToolPending { id, name } => translate::tool_pending(id, name),
+        AgentEvent::ToolStart(event) => translate::tool_start(event, cwd, home),
+        AgentEvent::ToolExecutionStart { id } => translate::tool_execution_start(id),
+        AgentEvent::ToolOutput { id, content } => translate::tool_output(id, content),
+        AgentEvent::ToolDone(event) => translate::tool_done(event, cwd, home),
+        _ => return,
+    };
+    let mut meta = Meta::new();
+    meta.insert(
+        SUBAGENT_META[0].to_owned(),
+        json!({ SUBAGENT_META[1]: subagent_block(subagent) }),
+    );
+    session_update_with_meta(out_tx, sid, update, Some(meta));
+}
+
+/// The identity a window needs to keep a subagent's rows in its own chat.
+fn subagent_block(subagent: &maki_agent::types::SubagentInfo) -> Value {
+    json!({
+        "id": subagent.agent_id.to_string(),
+        "parent": subagent.parent_agent_id.map(|parent| parent.to_string()),
+        "toolUseId": subagent.parent_tool_use_id,
+        "name": subagent.name,
+        "model": subagent.model,
+        "prompt": subagent.prompt,
+    })
 }
 
 fn no_session() -> AcpError {
@@ -6869,6 +6954,87 @@ mod tests {
             assert!(pending.lock().unwrap().operation.is_none());
             coordinator.close().await.unwrap();
         });
+    }
+
+    /// A subagent's activity reaches every window tagged with the child it
+    /// belongs to, and its turn end travels as its own notification, because
+    /// ACP has no session update for it.
+    #[test]
+    fn event_pump_forwards_a_subagent_tagged_with_its_identity() {
+        let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+        let (out_tx, out_rx) = flume::unbounded::<Value>();
+        let (answer_tx, _answer_rx) = flume::unbounded::<String>();
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let session_id = SessionRef::from(MakiId::generate());
+        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
+        let agent_id = maki_agent::AgentId::generate();
+        let subagent = maki_agent::types::SubagentInfo {
+            agent_id,
+            parent_agent_id: None,
+            parent_tool_use_id: "tool-1".to_owned(),
+            name: "research".to_owned(),
+            prompt: None,
+            model: None,
+            opts: None,
+            answer_tx: None,
+            cancel: None,
+        };
+
+        start_event_pump(
+            event_rx,
+            session_id,
+            out_tx,
+            pending,
+            true,
+            answer_tx,
+            coordinator.read(),
+            maki_storage::paths::home(),
+            PUMP_TRUSTED,
+            None,
+            test_observer(),
+        )
+        .detach();
+
+        event_tx
+            .send(Envelope {
+                event: AgentEvent::TextDelta {
+                    text: "digging".to_owned(),
+                },
+                subagent: Some(subagent.clone()),
+                identity: None,
+            })
+            .unwrap();
+        event_tx
+            .send(Envelope {
+                event: AgentEvent::TurnOutcome(maki_agent::TurnOutcome::completed(
+                    agent_id,
+                    maki_agent::TurnId::generate(),
+                    Default::default(),
+                    1,
+                    maki_agent::DoneReason::EndTurn,
+                )),
+                subagent: Some(subagent),
+                identity: None,
+            })
+            .unwrap();
+
+        let update = out_rx.recv().unwrap();
+        assert_eq!(
+            update["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert_eq!(
+            update["params"]["_meta"]["maki"]["subagent"]["id"],
+            agent_id.to_string()
+        );
+        assert_eq!(
+            update["params"]["_meta"]["maki"]["subagent"]["toolUseId"],
+            "tool-1"
+        );
+        let end = out_rx.recv().unwrap();
+        assert_eq!(end["method"], SUBAGENT_END_METHOD);
+        assert_eq!(end["params"]["end"], "completed");
+        assert_eq!(end["params"]["subagent"]["id"], agent_id.to_string());
     }
 
     #[test]

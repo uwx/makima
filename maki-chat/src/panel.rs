@@ -512,6 +512,10 @@ impl SessionPanel {
     fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::Update(update) => self.on_update(*update, cx),
+            // This panel draws one transcript, so a subagent's rows read inline
+            // with the turn that started it.
+            Event::SubagentUpdate { update, .. } => self.on_update(*update, cx),
+            Event::SubagentEnd { .. } => cx.notify(),
             Event::Permission(prompt) => {
                 self.pending = Some(PendingPermission {
                     request: prompt.id,

@@ -57,6 +57,7 @@ const SESSION_CANCEL_METHOD: &str = "session/cancel";
 const SESSION_NEW_METHOD: &str = "session/new";
 const INITIALIZE_METHOD: &str = "initialize";
 const SESSION_UPDATE_METHOD: &str = "session/update";
+const SUBAGENT_END_METHOD: &str = "maki/subagent/end";
 const PERMISSION_METHOD: &str = "session/request_permission";
 const UI_CAPABILITY_KEY: &str = "maki-ui";
 const YOLO_OPTION_ID: &str = "yolo";
@@ -95,6 +96,16 @@ const TRUNCATED_HISTORY: &str =
 /// An inbound event from the agent, already narrowed to what the desktop renders.
 pub enum Event {
     Update(Box<SessionUpdate>),
+    /// A subagent's own activity, which belongs in that child's chat.
+    SubagentUpdate {
+        subagent: Subagent,
+        update: Box<SessionUpdate>,
+    },
+    /// A subagent's turn ended; ACP has no update for that.
+    SubagentEnd {
+        subagent: Subagent,
+        end: SubagentEnd,
+    },
     Permission(PermissionPrompt),
     /// Another window answered a permission question this one also shows.
     PermissionDone {
@@ -144,6 +155,30 @@ pub enum Event {
     /// again, so its transcript replays from here.
     Reconnected,
     Closed(String),
+}
+
+/// The identity of the subagent an update came from, as the agent names it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Subagent {
+    pub id: String,
+    #[serde(default)]
+    pub parent: Option<String>,
+    pub tool_use_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// How a subagent's turn ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentEnd {
+    Completed,
+    Cancelled,
+    Failed,
 }
 
 /// Where another machine reaches a shared session, and the token it presents.
@@ -1281,6 +1316,7 @@ impl Client {
     fn handle_notification(&self, method: &str, message: &Value) {
         match method {
             SESSION_UPDATE_METHOD => self.handle_session_update(message),
+            SUBAGENT_END_METHOD => self.handle_subagent_end(message),
             FLASH_METHOD => {
                 if let Some(text) = message.pointer("/params/text").and_then(Value::as_str) {
                     let _ = self.emit(Event::Flash(text.to_owned()));
@@ -1317,10 +1353,36 @@ impl Client {
         let Some(params) = message.get("params") else {
             return;
         };
+        let subagent = params
+            .pointer("/_meta/maki/subagent")
+            .and_then(|block| serde_json::from_value::<Subagent>(block.clone()).ok());
         let Ok(notification) = serde_json::from_value::<SessionNotification>(params.clone()) else {
             return;
         };
-        let _ = self.emit(Event::Update(Box::new(notification.update)));
+        let _ = match subagent {
+            Some(subagent) => self.emit(Event::SubagentUpdate {
+                subagent,
+                update: Box::new(notification.update),
+            }),
+            None => self.emit(Event::Update(Box::new(notification.update))),
+        };
+    }
+
+    fn handle_subagent_end(&self, message: &Value) {
+        let Some(params) = message.get("params") else {
+            return;
+        };
+        let (Some(subagent), Some(end)) = (
+            params
+                .get("subagent")
+                .and_then(|block| serde_json::from_value::<Subagent>(block.clone()).ok()),
+            params
+                .get("end")
+                .and_then(|end| serde_json::from_value::<SubagentEnd>(end.clone()).ok()),
+        ) else {
+            return;
+        };
+        let _ = self.emit(Event::SubagentEnd { subagent, end });
     }
 
     fn handle_request(&self, id: Value, method: &str, message: &Value) {
