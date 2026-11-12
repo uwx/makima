@@ -218,9 +218,9 @@ pub struct EventLoopParams {
 pub struct RemoteSession {
     pub connection: maki_acp_client::Connection,
     pub label: String,
-    /// Whether this window can start the agent again on another session, which
-    /// only the window that spawned it can.
-    pub can_switch: bool,
+    /// Whether this window started the agent: it runs on this machine, so its
+    /// credentials are this machine's, and it can be started again here.
+    pub owned: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1623,12 +1623,16 @@ impl SpawnCtx {
     /// asks the agent to, so only the commands that must run in the session's
     /// own process are refused.
     fn command_capabilities(&self) -> (TargetCapabilities, TargetCapabilities) {
-        match self.remote {
-            Some(_) => (
-                TargetCapabilities::ALL,
-                TargetCapabilities::ALL.without(TargetCapability::SessionOwnership),
-            ),
+        match &self.remote {
             None => (TargetCapabilities::ALL, TargetCapabilities::ALL),
+            Some(remote) => {
+                let mut presented =
+                    TargetCapabilities::ALL.without(TargetCapability::SessionOwnership);
+                if !remote.owned {
+                    presented = presented.without(TargetCapability::LocalCredentials);
+                }
+                (TargetCapabilities::ALL, presented)
+            }
         }
     }
 
@@ -2748,8 +2752,8 @@ impl<'t> EventLoop<'t> {
                     }
                 }
                 if let maki_commands::HostRequest::Builtin(operation) = &request
-                    && self.ctx.remote.is_some()
-                    && let Some(guidance) = hosted_guidance(operation)
+                    && let Some(remote) = &self.ctx.remote
+                    && let Some(guidance) = hosted_guidance(operation, remote.owned)
                 {
                     self.sessions[index].app.flash(guidance.to_owned());
                     let _ = reply.send(Ok(HostResponse::Completed));
@@ -4059,15 +4063,15 @@ impl<'t> EventLoop<'t> {
     /// session at a time, so the window ends and reopens on it, the way
     /// `/share` reopens on the session it serves.
     fn switch_hosted_session(&mut self, id: MakiId) -> UiReply {
-        let Some((can_switch, served)) = self
+        let Some((owned, served)) = self
             .ctx
             .remote
             .as_ref()
-            .map(|remote| (remote.can_switch, remote.connection.session.0.to_string()))
+            .map(|remote| (remote.owned, remote.connection.session.0.to_string()))
         else {
             return Err(NOT_LIVE_ERR.into());
         };
-        if !can_switch {
+        if !owned {
             return Err(HOSTED_ONE_SESSION_ERR.into());
         }
         if served == id.to_string() {
@@ -5716,11 +5720,11 @@ where
 /// What a command that only works on the session's own window says when this
 /// window follows someone else's session instead of hiding it: a typed command
 /// that vanished reads as a bug.
-fn hosted_guidance(operation: &BuiltinOperation) -> Option<&'static str> {
+fn hosted_guidance(operation: &BuiltinOperation, owned: bool) -> Option<&'static str> {
     match operation {
         BuiltinOperation::OpenTasks => Some(HOSTED_TASKS_GUIDANCE),
         BuiltinOperation::OpenMcpPicker => Some(HOSTED_MCP_GUIDANCE),
-        BuiltinOperation::OpenLoginPicker => Some(HOSTED_LOGIN_GUIDANCE),
+        BuiltinOperation::OpenLoginPicker if !owned => Some(HOSTED_LOGIN_GUIDANCE),
         _ => None,
     }
 }
@@ -7319,12 +7323,12 @@ mod tests {
     }
 
     /// A window that follows the scripted agent behind {connection}.
-    fn hosted_harness(connection: maki_acp_client::Connection, can_switch: bool) -> RuntimeHarness {
+    fn hosted_harness(connection: maki_acp_client::Connection, owned: bool) -> RuntimeHarness {
         let mut harness = RuntimeHarness::new();
         harness.ctx.as_mut().unwrap().remote = Some(RemoteSession {
             connection,
             label: "agent".to_owned(),
-            can_switch,
+            owned,
         });
         harness
     }
@@ -7400,6 +7404,30 @@ mod tests {
                     ExitRequest::Switch { session: other_id }
                 );
                 assert_eq!(event_loop.sessions.len(), 1);
+                stop_after.store(true, Ordering::Release);
+            },
+        );
+        script.join().unwrap();
+    }
+
+    /// Credentials belong to a machine: only a window whose agent runs here
+    /// may log in, while tasks and MCP stay out of every following window.
+    #[test_case(true, true ; "agent this window started")]
+    #[test_case(false, false ; "agent on another machine")]
+    fn a_following_window_logs_in_only_where_its_agent_runs(owned: bool, can_login: bool) {
+        let (stop, script, connection) = scripted_agent();
+        let harness = hosted_harness(connection, owned);
+        let stop_after = Arc::clone(&stop);
+        run_event_loop(
+            harness,
+            |harness| harness.runtime(harness.session()),
+            move |event_loop| {
+                let (_, presented) = event_loop.ctx.command_capabilities();
+                assert_eq!(
+                    presented.contains(TargetCapability::LocalCredentials),
+                    can_login
+                );
+                assert!(!presented.contains(TargetCapability::SessionOwnership));
                 stop_after.store(true, Ordering::Release);
             },
         );

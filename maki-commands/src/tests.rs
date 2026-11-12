@@ -1222,7 +1222,10 @@ fn commands_that_act_on_the_session_need_its_own_window() {
     let owned = TargetCapabilities::from_capability(TargetCapability::SessionOwnership).union(
         TargetCapabilities::from_capability(TargetCapability::InteractiveUi),
     );
-    for id in [BuiltinId::Tasks, BuiltinId::Mcp, BuiltinId::Login] {
+    let local = TargetCapabilities::from_capability(TargetCapability::LocalCredentials).union(
+        TargetCapabilities::from_capability(TargetCapability::InteractiveUi),
+    );
+    for id in [BuiltinId::Tasks, BuiltinId::Mcp] {
         let builtin = BUILTIN_COMMANDS
             .iter()
             .find(|command| command.id == id)
@@ -1233,6 +1236,19 @@ fn commands_that_act_on_the_session_need_its_own_window() {
             builtin.name
         );
     }
+    // Credentials are the machine's, not the session's, so `/login` asks for
+    // the machine rather than the process.
+    let login = BUILTIN_COMMANDS
+        .iter()
+        .find(|command| command.id == BuiltinId::Login)
+        .unwrap();
+    assert!(login.required_capabilities.contains_all(local));
+    assert!(
+        !login
+            .required_capabilities
+            .contains(TargetCapability::SessionOwnership),
+        "a window whose agent runs here can log in"
+    );
     let registry = CommandRegistry::new();
     let producer = registry.create_producer(ProducerPrecedence::Builtin);
     producer

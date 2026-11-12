@@ -38,6 +38,9 @@ pub enum TargetCapability {
     /// The command acts on a session this process runs: its tasks, its MCP
     /// servers. A window following someone else's session cannot.
     SessionOwnership,
+    /// The command reads and writes credentials where the agent runs, which a
+    /// window can only do when that agent runs on this machine.
+    LocalCredentials,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -58,6 +61,7 @@ impl TargetCapabilities {
         TargetCapability::Reload,
         TargetCapability::UiActions,
         TargetCapability::SessionOwnership,
+        TargetCapability::LocalCredentials,
     ]);
 
     pub const fn from_capability(capability: TargetCapability) -> Self {
@@ -283,6 +287,9 @@ const INTERACTIVE: TargetCapabilities =
 const OWNED_UI: TargetCapabilities = INTERACTIVE.union(TargetCapabilities::from_capability(
     TargetCapability::SessionOwnership,
 ));
+const LOCAL_UI: TargetCapabilities = INTERACTIVE.union(TargetCapabilities::from_capability(
+    TargetCapability::LocalCredentials,
+));
 const COMPACTION: TargetCapabilities =
     TargetCapabilities::from_capability(TargetCapability::HistoryCompaction);
 const SESSION_REPLACEMENT: TargetCapabilities =
@@ -446,7 +453,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
-        OWNED_UI,
+        LOCAL_UI,
     ),
     builtin!(
         Cd,

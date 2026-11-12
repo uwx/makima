@@ -71,7 +71,7 @@ pub fn run(
             Some(maki_ui::RemoteSession {
                 connection,
                 label,
-                can_switch: false,
+                owned: false,
             }),
         );
     }

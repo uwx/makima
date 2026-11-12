@@ -410,7 +410,7 @@ fn hosted_session(
     Ok(RemoteSession {
         connection,
         label: format!("this machine, shared on {address}"),
-        can_switch: true,
+        owned: true,
     })
 }
 
