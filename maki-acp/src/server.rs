@@ -12,7 +12,7 @@ use agent_client_protocol_schema::{
     AgentNotification, AgentRequest, AgentResponse, AvailableCommand, AvailableCommandInput,
     AvailableCommandsUpdate, ConfigOptionUpdate, ContentBlock, ContentChunk,
     CreateElicitationResponse, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError,
-    ImageContent, InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer,
+    ImageContent, InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer, Meta,
     NewSessionRequest, Notification, PromptRequest, PromptResponse, Request, RequestId,
     RequestPermissionRequest, RequestPermissionResponse, Response, SessionConfigOptionValue,
     SessionId, SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
@@ -87,6 +87,9 @@ const REWIND_STALE: &str = "that turn is gone; open the rewind picker again";
 /// Client to server: compact the transcript where the session lives, with the
 /// optional guidance in `instructions`.
 const COMPACT_METHOD: &str = "maki/compact";
+/// Where a prompt's `_meta` carries the messages the client showed the user
+/// rather than typed, such as the output of a `!shell` command.
+const PREAMBLE_META: [&str; 2] = ["maki", "preamble"];
 
 type StoredSession = Session<Message, TokenUsage, maki_agent::ToolOutput>;
 const INVALID_THEME_CODE: i32 = -32602;
@@ -349,6 +352,9 @@ struct PendingDispatch {
     /// [`Pending::cancels`] when the dispatch started.
     cancels: u64,
     request_id: RequestId,
+    /// What the client showed the user rather than typed, such as the output
+    /// of a `!shell` command, which the agent reads before the message.
+    preamble: Vec<Message>,
     future: CommandFuture<InputDispatch>,
 }
 
@@ -2263,6 +2269,7 @@ fn validate_session<'a>(srv: &'a Server, requested: &str) -> Result<&'a SessionS
 fn start_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
     let content = extract_prompt_content(&req.prompt)?;
+    let preamble = extract_preamble(req.meta.as_ref())?;
     if srv.dispatch.is_some() {
         return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
     }
@@ -2292,6 +2299,7 @@ fn start_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Acp
         operation_id,
         cancels,
         request_id: id.clone(),
+        preamble,
         future,
     });
     Ok(())
@@ -2314,6 +2322,7 @@ async fn finish_prompt(srv: &mut Server, dispatched: InputDispatch) -> Result<()
         operation_id,
         cancels,
         request_id,
+        preamble,
         ..
     }) = srv.dispatch.take()
     else {
@@ -2342,13 +2351,14 @@ async fn finish_prompt(srv: &mut Server, dispatched: InputDispatch) -> Result<()
             return Ok(());
         }
     }
-    run_dispatch(srv, &request_id, dispatched).await
+    run_dispatch(srv, &request_id, dispatched, preamble).await
 }
 
 async fn run_dispatch(
     srv: &Server,
     id: &RequestId,
     dispatch: InputDispatch,
+    preamble: Vec<Message>,
 ) -> Result<(), AcpError> {
     let session = srv.session.as_ref().ok_or_else(no_session)?;
     match dispatch {
@@ -2360,6 +2370,7 @@ async fn run_dispatch(
                     content,
                     prompt: None,
                 },
+                preamble,
             )
             .await
         }
@@ -2371,9 +2382,11 @@ async fn run_dispatch(
             Ok(())
         }
         InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
-            send_command_turn(session, id, turn).await
+            send_command_turn(session, id, turn, preamble).await
         }
         InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) => {
+            // An isolated turn copies the history and answers one question;
+            // the client's shell output belongs to the primary history.
             send_isolated_turn(session, &srv.out_tx, id, turn).await
         }
         InputDispatch::Dispatched(CommandOutcome::ManualCompaction(instructions)) => {
@@ -2657,6 +2670,7 @@ async fn send_command_turn(
     session: &SessionState,
     id: &RequestId,
     turn: AgentTurn,
+    preamble: Vec<Message>,
 ) -> Result<(), AcpError> {
     let prompt = turn.prompt.map(|prompt| maki_agent::McpPromptRef {
         qualified_name: prompt.qualified_name.to_string(),
@@ -2678,6 +2692,7 @@ async fn send_command_turn(
         })
         .collect();
     let mut input = AgentInput::new(turn.content.text.to_string(), images);
+    input.preamble = preamble;
     input.prompt = prompt.map(Box::new);
     session.coordinator.as_ref().ok_or_else(no_session)?;
     let session_ended = || AcpError::new(-32603, SESSION_ENDED_MESSAGE);
@@ -3130,6 +3145,17 @@ fn extract_prompt_content(blocks: &[ContentBlock]) -> Result<CommandContent, Acp
         text: Arc::from(text),
         attachments: Arc::from(attachments),
     })
+}
+
+fn extract_preamble(meta: Option<&Meta>) -> Result<Vec<Message>, AcpError> {
+    let Some(preamble) = meta
+        .and_then(|meta| meta.get(PREAMBLE_META[0]))
+        .and_then(|maki| maki.get(PREAMBLE_META[1]))
+    else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(preamble.clone())
+        .map_err(|error| AcpError::invalid_params().data(json_str(&error)))
 }
 
 fn append(text: &mut String, part: &str) {
@@ -8151,6 +8177,35 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(smol::block_on(turns.next_text()), "Review src");
+    }
+
+    #[test]
+    fn a_prompt_preamble_reaches_the_agent_before_the_message() {
+        smol::block_on(async {
+            let (mut srv, _, _, turns) = server_awaiting_answer();
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            const SHELL_PREAMBLE: &str = "shell preamble output: 2 passed";
+            let shell_output = Message::observation(SHELL_PREAMBLE.into());
+            let mut raw = prompt_request(&session_id, "run the tests again", false);
+            raw["params"]["_meta"] = serde_json::json!({
+                "maki": { "preamble": serde_json::to_value([shell_output]).unwrap() },
+            });
+
+            handle_prompt(&mut srv, &raw, &RequestId::Number(44))
+                .await
+                .unwrap();
+
+            assert_eq!(turns.next_text().await, "run the tests again");
+            let history = turns.actor.committed_snapshot();
+            assert!(
+                history
+                    .messages
+                    .iter()
+                    .any(|message| message.user_text() == Some(SHELL_PREAMBLE)),
+                "the agent read the shell output before the message: {:?}",
+                history.messages
+            );
+        });
     }
 
     #[test]

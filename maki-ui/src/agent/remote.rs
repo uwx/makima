@@ -111,6 +111,7 @@ impl ActorBackend for AcpBackend {
                 ));
             }
             let blocks = blocks(&input);
+            let preamble = preamble(&input);
             self.turn.start(Translator {
                 sender,
                 model: self.model.clone(),
@@ -127,7 +128,7 @@ impl ActorBackend for AcpBackend {
                 })
             };
             let client = Arc::clone(&self.client);
-            let stop = smol::unblock(move || client.prompt_blocks(blocks)).await;
+            let stop = smol::unblock(move || client.prompt_blocks(blocks, preamble)).await;
             // Everything the agent said about this turn arrived before its
             // response, so the reader drains the rest before the turn settles.
             let (ack_tx, ack_rx) = flume::bounded(1);
@@ -244,6 +245,15 @@ fn done_reason(stop: StopReason) -> DoneReason {
         StopReason::MaxTurnRequests => DoneReason::MaxTurns,
         _ => DoneReason::EndTurn,
     }
+}
+
+/// What the shell put in front of the message, as the stored messages the
+/// agent reads before it. Empty when the turn has none.
+fn preamble(input: &AgentInput) -> Option<Value> {
+    if input.preamble.is_empty() {
+        return None;
+    }
+    serde_json::to_value(&input.preamble).ok()
 }
 
 fn blocks(input: &AgentInput) -> Vec<ContentBlock> {
@@ -1138,17 +1148,21 @@ mod tests {
         let mut history = History::new(Vec::new());
         let (_trigger, _reason, context) = turn_context();
 
-        let result = smol::block_on(backend.run_turn(
-            &mut history,
-            context,
-            AgentInput::new("hi".to_owned(), Vec::new()),
-            WorkKind::Turn,
-        ));
+        let mut input = AgentInput::new("hi".to_owned(), Vec::new());
+        input.preamble = vec![Message::observation(
+            "shell preamble output: 2 passed".into(),
+        )];
+        let result = smol::block_on(backend.run_turn(&mut history, context, input, WorkKind::Turn));
 
         let prompt = script.join().expect("script");
         assert_eq!(
             prompt["params"]["prompt"][0]["text"], "hi",
             "the prompt reached the agent"
+        );
+        assert_eq!(
+            prompt["params"]["_meta"]["maki"]["preamble"][0]["content"][0]["text"],
+            "shell preamble output: 2 passed",
+            "what the shell printed travels with the prompt"
         );
         match result {
             BackendResult::EnteredRun(TurnOutcome::Completed { reason, .. }) => {

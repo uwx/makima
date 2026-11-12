@@ -197,6 +197,14 @@ A window that only watches a session asks the agent to compact it, because the t
 
 `instructions` is optional. The call returns when the compaction ends, with the same `stopReason` a prompt gets. Every window sees the `Compact context` tool call while it runs, and the compacted transcript arrives afterwards as a `maki/ui/committed` with `replace: true` and `compacted: true`.
 
+A `!shell` command's output, and anything else the window showed but the user did not type, travels with the prompt instead of being typed into it:
+
+```json
+{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{"sessionId":"...","prompt":[{"type":"text","text":"run the tests again"}],"_meta":{"maki":{"preamble":[{"role":"user","content":[{"type":"text","text":"shell preamble output: ..."}],"kind":"observation"}]}}}}
+```
+
+The messages are the stored form, in the order the agent should read them, before the prompt.
+
 A rewind works the same way, for the same reason:
 
 ```json

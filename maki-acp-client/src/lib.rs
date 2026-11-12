@@ -16,14 +16,14 @@ use std::time::Duration;
 
 pub use agent_client_protocol_schema::{
     CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
-    InitializeRequest, JsonRpcMessage, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, Notification, PermissionOption, PromptRequest, PromptResponse,
-    ProtocolVersion, Request, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, TextContent, ToolCallContent, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    InitializeRequest, JsonRpcMessage, LoadSessionRequest, LoadSessionResponse, Meta,
+    NewSessionRequest, NewSessionResponse, Notification, PermissionOption, PromptRequest,
+    PromptResponse, ProtocolVersion, Request, RequestId, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
+    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use flume::{Receiver, Sender};
 use serde::de::DeserializeOwned;
@@ -76,6 +76,8 @@ const COMMITTED_METHOD: &str = "maki/ui/committed";
 const PERMISSION_DONE_METHOD: &str = "maki/ui/permission_done";
 const REWIND_METHOD: &str = "maki/rewind";
 const COMPACT_METHOD: &str = "maki/compact";
+const PREAMBLE_KEY: &str = "maki";
+const PREAMBLE_FIELD: &str = "preamble";
 const REWOUND_METHOD: &str = "maki/ui/rewind";
 const SHORT_SESSION_CHARS: usize = 8;
 #[cfg(windows)]
@@ -1095,7 +1097,10 @@ impl Client {
     }
 
     pub fn prompt(&self, text: &str) -> Result<StopReason, String> {
-        self.prompt_blocks(vec![ContentBlock::Text(TextContent::new(text.to_owned()))])
+        self.prompt_blocks(
+            vec![ContentBlock::Text(TextContent::new(text.to_owned()))],
+            None,
+        )
     }
 
     /// Asks the agent to compact the transcript where the session lives, and
@@ -1115,14 +1120,25 @@ impl Client {
         Ok(response.stop_reason)
     }
 
-    pub fn prompt_blocks(&self, blocks: Vec<ContentBlock>) -> Result<StopReason, String> {
+    /// Sends a turn. `preamble` is what the window showed the user rather than
+    /// typed, as stored messages, which the agent reads before the prompt.
+    pub fn prompt_blocks(
+        &self,
+        blocks: Vec<ContentBlock>,
+        preamble: Option<Value>,
+    ) -> Result<StopReason, String> {
         let session = self
             .session
             .lock()
             .unwrap()
             .clone()
             .ok_or_else(|| "no active session".to_owned())?;
-        let request = PromptRequest::new(session, blocks);
+        let mut request = PromptRequest::new(session, blocks);
+        if let Some(preamble) = preamble {
+            let mut meta = Meta::new();
+            meta.insert(PREAMBLE_KEY.into(), json!({ PREAMBLE_FIELD: preamble }));
+            request.meta = Some(meta);
+        }
         let response: PromptResponse = self.request(SESSION_PROMPT_METHOD, request, None)?;
         Ok(response.stop_reason)
     }
@@ -1389,7 +1405,9 @@ pub fn short_session(session: &SessionId) -> String {
 mod tests {
     use std::path::Path;
 
-    use agent_client_protocol_schema::{Diff, StopReason, ToolCallContent};
+    use agent_client_protocol_schema::{
+        ContentBlock, Diff, NewSessionResponse, SessionId, StopReason, TextContent, ToolCallContent,
+    };
     use serde_json::Value;
 
     use std::time::{Duration, Instant};
@@ -1847,6 +1865,43 @@ old
                 "session/new",
                 "session/set_config_option"
             ]
+        );
+    }
+
+    #[test]
+    fn a_prompt_preamble_travels_in_the_meta() {
+        let (address, server) = fake_agent(4, |method, request| match method {
+            "initialize" => initialized(method),
+            "maki/live" => Some(serde_json::json!({ "sessions": [] })),
+            "session/new" => Some(
+                serde_json::to_value(NewSessionResponse::new(SessionId::new("sess-preamble")))
+                    .unwrap(),
+            ),
+            "session/prompt" => {
+                assert_eq!(request["params"]["prompt"][0]["text"], "run them again");
+                assert_eq!(
+                    request["params"]["_meta"]["maki"]["preamble"][0]["role"],
+                    "user"
+                );
+                Some(serde_json::json!({ "stopReason": "end_turn" }))
+            }
+            _ => None,
+        });
+        let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
+        let connection = super::connect(&target).unwrap();
+        connection
+            .client
+            .prompt_blocks(
+                vec![ContentBlock::Text(TextContent::new(
+                    "run them again".to_owned(),
+                ))],
+                Some(serde_json::json!([{ "role": "user" }])),
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            server.join().unwrap(),
+            ["initialize", "maki/live", "session/new", "session/prompt"]
         );
     }
 
