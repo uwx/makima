@@ -1630,6 +1630,12 @@ enum InternalEvent {
         session: MakiId,
         error: String,
     },
+    /// A rewind the agent ran for this window finished, carrying the draft
+    /// that goes back into the input box.
+    Rewound {
+        session: MakiId,
+        result: Result<String, String>,
+    },
     Unshared(Result<(), String>),
 }
 
@@ -2365,6 +2371,14 @@ impl<'t> EventLoop<'t> {
                     self.sessions[idx]
                         .app
                         .flash(format!("the agent refused this change: {error}"));
+                }
+            }
+            InternalEvent::Rewound { session, result } => {
+                if let Some(idx) = self.position(session) {
+                    match result {
+                        Ok(draft) => self.sessions[idx].app.restore_rewind_draft(draft),
+                        Err(error) => self.sessions[idx].app.flash(error),
+                    }
                 }
             }
             InternalEvent::Shared(result) => {
@@ -3979,7 +3993,9 @@ impl<'t> EventLoop<'t> {
             }
             Action::ReplaceSession(request) => self.request_replacement(idx, *request),
             Action::RewindAgent { target, boundary } => {
-                if let Err(error) = self.dispatch_rewind(idx, target, boundary) {
+                if self.ctx.remote.is_some() {
+                    self.rewind_shared(idx, boundary.offset);
+                } else if let Err(error) = self.dispatch_rewind(idx, target, boundary) {
                     self.sessions[idx].app.flash(error);
                 }
             }
@@ -4226,6 +4242,23 @@ impl<'t> EventLoop<'t> {
                 self.forward_options(id, changed);
             }
         }
+    }
+
+    /// Rewinds the session where it lives. The agent replaces its transcript
+    /// and announces the new one, which this window adopts like any other
+    /// commit; the draft for the input box comes back with the answer.
+    fn rewind_shared(&mut self, idx: usize, offset: usize) {
+        let Some(remote) = &self.ctx.remote else {
+            return;
+        };
+        let client = Arc::clone(&remote.connection.client);
+        let internal_tx = self.internal_tx.clone();
+        let session = self.sessions[idx].id();
+        smol::spawn(async move {
+            let result = smol::unblock(move || client.rewind(offset)).await;
+            let _ = internal_tx.send(InternalEvent::Rewound { session, result });
+        })
+        .detach();
     }
 
     /// Sends the options this window changed to the agent that owns a shared

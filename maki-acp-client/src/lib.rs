@@ -1851,6 +1851,33 @@ old
     }
 
     #[test]
+    fn rewinding_names_the_turn_and_returns_the_draft() {
+        use agent_client_protocol_schema::{NewSessionResponse, SessionId};
+
+        let (address, server) = fake_agent(4, |method, request| match method {
+            "initialize" => initialized(method),
+            "maki/live" => Some(serde_json::json!({ "sessions": [] })),
+            "session/new" => Some(
+                serde_json::to_value(NewSessionResponse::new(SessionId::new("sess-rewind")))
+                    .unwrap(),
+            ),
+            "maki/rewind" => {
+                assert_eq!(request["params"]["offset"], 4);
+                Some(serde_json::json!({ "draft": "try again" }))
+            }
+            _ => None,
+        });
+        let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
+        let connection = super::connect(&target).unwrap();
+        assert_eq!(connection.client.rewind(4).unwrap(), "try again");
+        drop(connection);
+        assert_eq!(
+            server.join().unwrap(),
+            ["initialize", "maki/live", "session/new", "maki/rewind"]
+        );
+    }
+
+    #[test]
     fn compacting_names_the_session_and_the_guidance() {
         use agent_client_protocol_schema::{NewSessionResponse, SessionId};
 

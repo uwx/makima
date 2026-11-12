@@ -395,6 +395,14 @@ impl App {
         }
     }
 
+    /// Puts back what the session rewound to, when the rewind ran where the
+    /// session lives and this window only hears the draft.
+    pub(crate) fn restore_rewind_draft(&mut self, draft: String) {
+        self.refresh_at_ref_labels(&draft);
+        self.input_box.set_input(draft);
+        self.input_box.buffer.move_to_end();
+    }
+
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
         if let Some((target, boundary)) = self.rewind_picker.target_boundary(entry.turn_index) {
             return vec![Action::RewindAgent { target, boundary }];

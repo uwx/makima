@@ -7611,6 +7611,21 @@ fn rewind_to_middle_truncates_and_populates_input() {
 }
 
 #[test]
+fn a_rewound_shared_session_puts_the_draft_back() {
+    let mut app = test_app();
+    app.input_box.set_input("half typed".into());
+
+    app.restore_rewind_draft("first prompt".into());
+
+    assert_eq!(app.input_box.buffer.value(), "first prompt");
+    assert_eq!(
+        app.input_box.buffer.cursor_byte_offset(),
+        "first prompt".len(),
+        "the cursor lands after the restored draft"
+    );
+}
+
+#[test]
 fn rewind_to_first_turn_clears_everything() {
     let mut app = build_rewind_app();
     let baseline = 100_000 - estimate_message_tokens(app.state.session.messages());
