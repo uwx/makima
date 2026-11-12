@@ -907,14 +907,19 @@ async fn open_share(srv: &mut Server, raw: &Value, host: &mut Host) -> Result<Va
             format!("read the address to share: {error}"),
         )
     })?;
-    let token: Arc<str> = lan_token(host.params.storage.path())
-        .map_err(|error| {
-            AcpError::new(
-                share::SHARE_FAILED_CODE,
-                format!("read the LAN token: {error}"),
-            )
-        })?
-        .into();
+    // A client that started this agent names the token it will hand out
+    // (`--share --token`); otherwise this machine's stored one is the token.
+    let token: Arc<str> = match raw.pointer("/params/token").and_then(Value::as_str) {
+        Some(token) => token.into(),
+        None => lan_token(host.params.storage.path())
+            .map_err(|error| {
+                AcpError::new(
+                    share::SHARE_FAILED_CODE,
+                    format!("read the LAN token: {error}"),
+                )
+            })?
+            .into(),
+    };
     let (stop, stopped) = flume::bounded(1);
     let executor = Local::clone(&host.executor);
     let params = Rc::clone(&host.params);

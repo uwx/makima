@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -484,6 +484,12 @@ impl Target {
 
     /// The agent this machine runs, with extra arguments for its `acp` command,
     /// like `--share`.
+    /// The agent this machine runs, under `acp`, with the flags this run was
+    /// given so the agent it starts behaves like one it ran itself.
+    pub fn hosted(cwd: PathBuf, agent: &str, flags: Vec<String>) -> Self {
+        Self::local_with(cwd, agent, flags)
+    }
+
     pub fn local_with(cwd: PathBuf, agent: &str, extra: Vec<String>) -> Self {
         let mut args = vec![ACP_SUBCOMMAND.to_owned()];
         args.extend(extra);
@@ -1175,9 +1181,16 @@ impl Client {
         Ok(reply)
     }
 
-    /// Opens a listener other machines can watch this session through.
-    pub fn share(&self) -> Result<ShareInfo, String> {
-        self.request(SHARE_METHOD, json!({}), Some(SESSION_TIMEOUT))
+    /// Opens a listener other machines can watch this session through: at
+    /// `bind`, or wherever the system puts it, guarded by `token` or by the
+    /// one stored on this machine.
+    pub fn share(
+        &self,
+        bind: Option<SocketAddr>,
+        token: Option<&str>,
+    ) -> Result<ShareInfo, String> {
+        let params = json!({ "bind": bind.map(|address| address.to_string()), "token": token });
+        self.request(SHARE_METHOD, params, Some(SESSION_TIMEOUT))
     }
 
     /// Stops the listener this connection opened.
@@ -2411,7 +2424,8 @@ old
         let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
         let connection = super::connect(&target).unwrap();
 
-        let share = connection.client.share().unwrap();
+        let bind = "127.0.0.1:4000".parse().unwrap();
+        let share = connection.client.share(Some(bind), Some(TOKEN)).unwrap();
         assert_eq!(share.link, "lan://192.168.1.4:4000");
         assert_eq!(share.address, "192.168.1.4:4000");
         assert_eq!(share.token, TOKEN);

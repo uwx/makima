@@ -72,6 +72,7 @@ pub fn run(
                 connection,
                 label,
                 owned: false,
+                sharing: false,
             }),
         );
     }

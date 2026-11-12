@@ -82,12 +82,17 @@ pub enum RunOutcome {
     Reload {
         tabs: Vec<AppSession>,
         focused: usize,
+        /// Whether the agent that served them listened for other machines, so
+        /// the window restored here listens again.
+        shared: bool,
+        /// The session that agent holds, so the window reopens on it.
+        hosted: Option<MakiId>,
     },
     /// The focused session should reopen on an agent this window starts, so
     /// other machines can watch it.
     Share { session: Option<MakiId> },
     /// The window should reopen on another session the agent it serves holds.
-    Switch { session: MakiId },
+    Switch { session: MakiId, shared: bool },
 }
 
 pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
@@ -97,21 +102,28 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         let el = event_loop::EventLoop::new(&mut terminal, params)?;
         el.run(initial_prompt)?
     };
+    let (shared, hosted) = (report.shared, report.hosted);
     Ok(match report.exit {
         components::ExitRequest::Reload => RunOutcome::Reload {
             tabs: report.tabs,
             focused: report.focused,
+            shared,
+            hosted,
         },
         components::ExitRequest::Share => RunOutcome::Share {
             session: report.tabs.get(report.focused).map(|tab| tab.id),
         },
-        components::ExitRequest::Switch { session } => RunOutcome::Switch { session },
+        components::ExitRequest::Switch { session } => RunOutcome::Switch { session, shared },
         exit => {
-            let session_id = report
-                .tabs
-                .get(report.focused)
-                .filter(|s| app::session_has_content(s))
-                .map(|s| s.id);
+            // The conversation lives in the agent when this window started
+            // one, so that is the id a resume hint must name.
+            let session_id = hosted.or_else(|| {
+                report
+                    .tabs
+                    .get(report.focused)
+                    .filter(|s| app::session_has_content(s))
+                    .map(|s| s.id)
+            });
             let started = Instant::now();
             drop(report);
             tracing::info!(

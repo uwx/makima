@@ -120,15 +120,11 @@ pub fn dispatch(mut cli: Cli) -> Result<()> {
             token,
         }) => {
             acp::run(
+                &cli,
                 startup_cwd()?,
                 model,
                 yolo,
                 automode,
-                cli.no_plugins,
-                cli.no_jit,
-                cli.system_prompt,
-                cli.append_system_prompt,
-                trust_mode,
                 listen,
                 share,
                 token,

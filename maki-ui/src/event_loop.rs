@@ -169,6 +169,12 @@ pub(crate) struct ShutdownReport {
     pub exit: ExitRequest,
     pub tabs: Vec<AppSession>,
     pub focused: usize,
+    /// The session the agent this window started serves, when it started one:
+    /// that is where the conversation lives, so it outlives the window.
+    pub hosted: Option<MakiId>,
+    /// Whether that agent was listening for other machines as the window
+    /// closed, so reopening on the same conversation can listen again.
+    pub shared: bool,
 }
 
 pub struct EventLoopParams {
@@ -215,6 +221,8 @@ pub struct RemoteSession {
     /// Whether this window started the agent: it runs on this machine, so its
     /// credentials are this machine's, and it can be started again here.
     pub owned: bool,
+    /// Whether that agent is listening for other machines right now.
+    pub sharing: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1869,6 +1877,8 @@ pub(crate) struct EventLoop<'t> {
     internal_tx: flume::Sender<InternalEvent>,
     internal_rx: flume::Receiver<InternalEvent>,
     model_discovery: Discovery,
+    /// Whether the agent this window serves listens for other machines.
+    shared: bool,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -2059,6 +2069,7 @@ impl<'t> EventLoop<'t> {
         let command_runtime = Arc::new(command_runtime);
         // A window that follows a session does not run MCP servers of its own:
         // the agent's are the ones its tools come from.
+        let sharing = remote.as_ref().is_some_and(|remote| remote.sharing);
         let (mcp_handle, mcp_config_errors) = if remote.is_some() {
             (None, McpConfigErrors::new(cwd.clone()))
         } else {
@@ -2227,6 +2238,7 @@ impl<'t> EventLoop<'t> {
             internal_tx,
             internal_rx,
             model_discovery,
+            shared: sharing,
         })
     }
 
@@ -2565,17 +2577,23 @@ impl<'t> EventLoop<'t> {
             }
             InternalEvent::Shared(result) => {
                 let message = match result {
-                    Ok(info) => format!(
-                        "other machines can watch this session at {} with token {}",
-                        info.link, info.token
-                    ),
+                    Ok(info) => {
+                        self.shared = true;
+                        format!(
+                            "other machines can watch this session at {} with token {}",
+                            info.link, info.token
+                        )
+                    }
                     Err(error) => format!("could not share this session: {error}"),
                 };
                 self.sessions[self.focused].app.flash(message);
             }
             InternalEvent::Unshared(result) => {
                 let message = match result {
-                    Ok(()) => "this session is no longer shared".to_owned(),
+                    Ok(()) => {
+                        self.shared = false;
+                        "this session is no longer shared".to_owned()
+                    }
                     Err(error) => format!("could not stop sharing: {error}"),
                 };
                 self.sessions[self.focused].app.flash(message);
@@ -2754,7 +2772,7 @@ impl<'t> EventLoop<'t> {
                         let internal = self.internal_tx.clone();
                         smol::spawn(async move {
                             let event = if share {
-                                InternalEvent::Shared(client.share())
+                                InternalEvent::Shared(client.share(None, None))
                             } else {
                                 InternalEvent::Unshared(client.unshare())
                             };
@@ -5421,6 +5439,14 @@ impl<'t> EventLoop<'t> {
         );
     }
 
+    /// The session the agent this window started serves. It is where the
+    /// conversation lives, so a reopened window resumes it and the exit hint
+    /// names it.
+    fn hosted_session(&self) -> Option<MakiId> {
+        let remote = self.ctx.remote.as_ref().filter(|remote| remote.owned)?;
+        remote.connection.session.0.parse().ok()
+    }
+
     fn shutdown(mut self) -> ShutdownReport {
         self.model_discovery = Discovery::idle();
         let outputs = self.provider_usage.handle(ProviderUsageInput::Shutdown);
@@ -5513,6 +5539,8 @@ impl<'t> EventLoop<'t> {
             exit,
             tabs,
             focused: self.focused,
+            hosted: self.hosted_session(),
+            shared: self.shared,
         }
     }
 }
@@ -7262,6 +7290,7 @@ mod tests {
             internal_tx,
             internal_rx,
             model_discovery: Discovery::idle(),
+            shared: false,
         };
         test(&mut event_loop);
         smol::block_on(
@@ -7411,6 +7440,7 @@ mod tests {
             connection,
             label: "agent".to_owned(),
             owned,
+            sharing: false,
         });
         harness
     }

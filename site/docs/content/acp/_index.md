@@ -13,6 +13,22 @@ Run Makima inside your editor. `makima acp` starts an [ACP](https://agentclientp
 makima acp
 ```
 
+## The window runs its session on an agent
+
+The terminal interface is an ACP client. Plain `makima` starts `makima acp` in a child process, passes it the flags of this run (model, project trust, `--yolo`, `--automode`, tool filters, system prompt), and talks to it over stdio, the way `makima attach` talks to an agent on another machine. The child owns the session: it runs the tools, loads MCP servers and writes the transcript.
+
+```
+makima            makima acp
+  |  initialize, session/new  |
+  |-------------------------->|
+  |  session/update, prompt    |
+  |<------------------------->|
+```
+
+So there is one way to run a session, and every command means the same whether the agent is under this window or on another machine. `/share`, `/reload`, `/sessions`, `/model`, `/login`, `/mcp` and `/tasks` all ask the process that holds the conversation.
+
+A machine with no provider configured keeps its session in the window, because an agent cannot start without a model: the login card runs there, and the next start hosts the agent.
+
 ## Zed setup
 
 Add Makima as a custom agent in Zed's `settings.json`:
@@ -61,7 +77,7 @@ The token comes from `--token`, then `MAKIMA_LAN_TOKEN`, then `lan-token` in the
 makima acp --share 0.0.0.0:7331
 ```
 
-`makima --share 0.0.0.0:7331 -c <ID>` opens an existing session on the agent instead of a new one, and `-l` picks the latest session for the directory. The window names that session in its resume hint, and `makima -c <ID>` resumes it later without the listener.
+Plain `makima` does the same thing without opening a listener: the same child process serves the session, and `/share` opens the TCP side when you ask for it. `makima --share 0.0.0.0:7331 -c <ID>` asks its agent for the listener at that address straight away. Either way `-c <ID>` opens an existing session on the agent instead of a new one, and `-l` picks the latest session for the directory. The window names that session in its resume hint, and `makima -c <ID>` resumes it later without the listener.
 
 The stdio connection owns the session, and other connections attach to it as below. Closing stdio ends the session and the process, and watchers see the connection end. `--share` and `--listen` are mutually exclusive: `--listen` serves TCP only, `--share` adds TCP beside stdio.
 
@@ -74,8 +90,10 @@ The listener speaks plain TCP, and the token is its only gate. Use it on a netwo
 A connection that owns a session can open a listener for it later, without a restart:
 
 ```json
-{"jsonrpc":"2.0","id":4,"method":"maki/share","params":{}}
+{"jsonrpc":"2.0","id":4,"method":"maki/share","params":{"bind":"0.0.0.0:7331","token":"..."}}
 ```
+
+Both fields are optional: `bind` defaults to every interface on a port the system picks, and `token` to `MAKIMA_LAN_TOKEN` or the stored `lan-token`.
 
 ```json
 {"bind":"0.0.0.0:60667","address":"192.168.2.4:60667","link":"lan://192.168.2.4:60667","token":"..."}
@@ -85,7 +103,7 @@ A connection that owns a session can open a listener for it later, without a res
 
 Only the connection that owns the session can share it: a watching connection gets `-32014`, even while it holds control. A share that cannot bind answers `-32013`.
 
-The terminal window starts a listener with `/share` and stops it with `/unshare`. In a window that runs the session itself, `/share` restarts the interface as a client of an agent that serves the same session, on every interface and a port the system picks, and shows the link other machines use. From there the window talks ACP like `--share` does, and `/unshare` stops the listener without ending the session; the session keeps running until the window closes.
+The terminal window starts a listener with `/share` and stops it with `/unshare`. Because the window already talks ACP to its agent, `/share` only asks that agent to listen, on every interface and a port the system picks, and shows the link and token other machines use. `/unshare` stops the listener without ending the session, and `/reload` opens a new one when the agent restarts, so the window keeps serving. The session keeps running until the window closes.
 
 The desktop window has the same thing as a status bar toggle. `Share` opens the listener and shows the address with buttons for the link and the token, `Stop sharing` closes it. Another window reaches it with `MAKI_DESKTOP_REMOTE=lan://192.168.2.4:60667` and `MAKI_DESKTOP_LAN_TOKEN=...`, or by choosing the session under `Remote` in its sidebar, which asks for the token. The same link works in the composer as `/connect lan://192.168.2.4:60667 <token>`. The link names no directory: that window watches the session the other machine serves instead of starting one.
 
@@ -241,7 +259,7 @@ Picking another stored session in `/sessions` reopens the window on it. The agen
 
 The reply lists every server with its `name`, `transport`, `tools`, `prompts`, `status` (`running`, `connecting`, `disabled`, `failed`, `needs_auth`), the `error` behind a failure and its `url`. A window shows those in its picker and sends a toggle for the one you switch; the agent restarts the connection and the next reply shows the new state. `maki mcp auth` still runs on the machine that hosts the server. `/login` is different: credentials belong to a machine, so a window whose agent runs here can log in and the agent uses the new key straight away. A window attached to another machine asks you to log in there.
 
-`/reload` rebuilds the window's plugins and config where you typed it. A window that also serves its session starts the agent again on the same session, so the agent reloads too. A window attached to another machine's agent cannot reload that process, so it asks you to restart.
+`/reload` rebuilds the window's plugins and config where you typed it, then starts the agent again on the same session, so the agent reloads too and keeps listening if it was sharing. A window attached to another machine's agent cannot reload that process, so it asks you to restart.
 
 ### Following the options
 

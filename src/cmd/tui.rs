@@ -25,7 +25,7 @@ use maki_storage::session_lock;
 use maki_storage::sessions::SESSIONS_DIR;
 use maki_ui::{AppSession, RemoteSession, RunOutcome};
 
-use crate::cli::{Cli, normalize_tool_name};
+use crate::cli::Cli;
 use crate::setup;
 
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
@@ -33,7 +33,6 @@ const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous 
 const PIPED_INPUT_SEPARATOR: &str = "\n\n";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 const PICKER_NEEDS_TUI_ERR: &str = "continuing without a session ID opens the session picker, which needs the TUI; run `makima sessions --json` to list session IDs";
-const SHARED_PICKER_UNSUPPORTED: &str = "picking a session for --share is not supported yet; pass its id, like `makima --share ADDR -c <ID>`";
 
 /// A project `.env` is loaded exactly once, when a folder that was not trusted
 /// becomes trusted. Every other rebuild must leave the process env alone.
@@ -116,20 +115,7 @@ fn load_config(
     }
     let automode_on = cli.automode || config.always_automode;
     super::seed_automode(&mut config, automode_on);
-    if !cli.allowed_tools.is_empty() {
-        config.agent.allowed_tools = cli
-            .allowed_tools
-            .iter()
-            .map(|t| normalize_tool_name(t))
-            .collect::<Result<Vec<_>>>()?;
-    }
-    if !cli.disallowed_tools.is_empty() {
-        config.agent.disabled_tools.extend(
-            cli.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
-    }
+    cli.apply_tool_filters(&mut config)?;
     config.validate()?;
     Ok(config)
 }
@@ -372,6 +358,10 @@ fn exit_resume_hint(id: &str, colored: bool) -> String {
 
 const ATTACHED_RELOAD: &str = "this window is attached to another machine; restart it to reload";
 const NOTHING_TO_SHARE: &str = "there is no session to share";
+const HOSTED_LABEL: &str = "this machine";
+const AGENT_FAILED: &str = "the agent this window runs did not start";
+const SHARE_NEEDS_LOGIN: &str =
+    "not sharing: a session needs a configured model first; run /login, then /share";
 /// The agent a window serves releases its session lock while it exits, so the
 /// restarted one can still find the session claimed for a moment.
 const REHOST_ATTEMPTS: u32 = 20;
@@ -382,52 +372,82 @@ fn share_bind() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
 }
 
-/// Runs this window on a session an agent of its own owns, so other machines
-/// can watch it: the interface talks ACP to that agent, as `makima attach` does.
-fn hosted_session(
-    cwd: &Path,
-    address: SocketAddr,
-    token: Option<String>,
-    model: Option<String>,
-    resume: Option<String>,
-) -> Result<RemoteSession> {
+fn push_flag(flags: &mut Vec<String>, flag: &str, value: &str) {
+    flags.push(flag.to_owned());
+    flags.push(value.to_owned());
+}
+
+/// The flags that make the agent this window starts serve the run the way
+/// this command line asked: the same project, tools, prompt and model.
+/// Everything else shapes the window itself and stays here.
+fn agent_flags(cli: &Cli) -> Vec<String> {
+    let mut flags = Vec::new();
+    if let Some(model) = &cli.model {
+        push_flag(&mut flags, "--model", model);
+    }
+    if let Some(prompt) = &cli.system_prompt {
+        push_flag(&mut flags, "--system-prompt", prompt);
+    }
+    if let Some(prompt) = &cli.append_system_prompt {
+        push_flag(&mut flags, "--append-system-prompt", prompt);
+    }
+    if !cli.allowed_tools.is_empty() {
+        push_flag(&mut flags, "--allowed-tools", &cli.allowed_tools.join(","));
+    }
+    if !cli.disallowed_tools.is_empty() {
+        push_flag(
+            &mut flags,
+            "--disallowed-tools",
+            &cli.disallowed_tools.join(","),
+        );
+    }
+    for (flag, set) in [
+        ("--yolo", cli.yolo),
+        ("--automode", cli.automode),
+        ("--trust", cli.trust),
+        ("--no-project", cli.no_project),
+        ("--no-commands", cli.no_commands),
+        ("--no-plugins", cli.no_plugins),
+        ("--no-jit", cli.no_jit),
+    ] {
+        if set {
+            flags.push(flag.to_owned());
+        }
+    }
+    flags
+}
+
+/// Starts the agent this window serves: the same program in its `acp` role,
+/// with the flags of this run. The window then talks ACP to it, the way a
+/// window attached to another machine talks to that machine's agent.
+fn hosted_session(cwd: &Path, cli: &Cli, resume: Option<String>) -> Result<RemoteSession> {
     let program = std::env::current_exe().context("find this program")?;
-    let mut extra = vec!["--share".to_owned(), address.to_string()];
-    if let Some(token) = token {
-        extra.push("--token".to_owned());
-        extra.push(token);
-    }
-    if let Some(model) = model {
-        extra.push("--model".to_owned());
-        extra.push(model);
-    }
-    let mut target =
-        Target::local_with(cwd.to_path_buf(), &program.to_string_lossy(), extra).quiet();
+    let mut target = Target::local_with(
+        cwd.to_path_buf(),
+        &program.to_string_lossy(),
+        agent_flags(cli),
+    )
+    .quiet();
     if let Some(id) = resume {
         target = target.resuming(id);
     }
-    let connection = maki_acp_client::connect(&target).map_err(|error| eyre!(error))?;
+    let connection =
+        maki_acp_client::connect(&target).map_err(|error| eyre!("{AGENT_FAILED}: {error}"))?;
     Ok(RemoteSession {
         connection,
-        label: format!("this machine, shared on {address}"),
+        label: HOSTED_LABEL.to_owned(),
         owned: true,
+        sharing: false,
     })
 }
 
-/// Starts serving this session again after `/reload`, on the same session.
-/// The agent that just stopped releases its lock while it exits, so the claim
+/// Starts this session's agent again, after `/reload` or a switch. The agent
+/// that just stopped releases its session lock while it exits, so the claim
 /// can still be refused for a moment.
 fn rehosted_session(cwd: &Path, cli: &Cli, resume: Option<String>) -> Result<RemoteSession> {
     let mut attempt = 1;
     loop {
-        let spawned = hosted_session(
-            cwd,
-            share_bind(),
-            cli.share_token.clone(),
-            cli.model.clone(),
-            resume.clone(),
-        );
-        match spawned {
+        match hosted_session(cwd, cli, resume.clone()) {
             Ok(hosted) => return Ok(hosted),
             Err(error)
                 if attempt < REHOST_ATTEMPTS
@@ -439,6 +459,29 @@ fn rehosted_session(cwd: &Path, cli: &Cli, resume: Option<String>) -> Result<Rem
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Opens the listener other machines attach through, and names where it is.
+fn share_session(
+    remote: &mut RemoteSession,
+    bind: Option<SocketAddr>,
+    token: Option<&str>,
+) -> Result<()> {
+    let info = remote
+        .connection
+        .client
+        .share(bind, token)
+        .map_err(|error| eyre!(error))?;
+    remote.label = format!("this machine, shared on {}", info.address);
+    remote.sharing = true;
+    Ok(())
+}
+
+fn shared_notice(remote: &RemoteSession) -> String {
+    format!(
+        "{}; other machines can attach to this session",
+        remote.label
+    )
 }
 
 /// The session `--share` opens where its agent runs, or nothing to start a
@@ -456,24 +499,13 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
     if cli.print && session_picker_requested(&cli) {
         bail!(PICKER_NEEDS_TUI_ERR);
     }
-    if cli.share.is_some() && session_picker_requested(&cli) {
-        bail!(SHARED_PICKER_UNSUPPORTED);
-    }
     let explicit_model = cli.model.is_some();
     let mut apply_explicit_model = explicit_model;
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
-    if let (Some(address), None) = (cli.share, remote.as_ref()) {
-        let resume = hosted_resume(&cli, &cwd.to_string_lossy(), &storage)?;
-        remote = Some(hosted_session(
-            &cwd,
-            address,
-            cli.share_token.clone(),
-            cli.model.clone(),
-            resume,
-        )?);
-    }
     let mut attached = remote.is_some();
+    let mut owned = remote.as_ref().is_some_and(|remote| remote.owned);
+    let mut listen = cli.share;
     let _instance = (!cli.print)
         .then(|| {
             maki_storage::instances::InstanceGuard::register(
@@ -496,13 +528,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
 
     let can_ask =
         !cli.print && !cli.is_sdk_mode() && io::stdin().is_terminal() && io::stderr().is_terminal();
-    let mut notice = remote.as_ref().map(|remote| match cli.share {
-        Some(_) => format!(
-            "{}; other machines can attach to this session",
-            remote.label
-        ),
-        None => format!("attached to {}", remote.label),
-    });
+    let mut notice = None;
     let answer = trust.state.unanswered().and_then(|question| {
         policy_grant(question, &stack.config.trust)
             .map(|pattern| {
@@ -593,8 +619,30 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
     }
 
     let cwd_str = cwd.to_string_lossy().into_owned();
+    // Every window runs its session on an agent of its own, the way a window
+    // attached to another machine runs on that machine's: it is a client of
+    // the process that owns the conversation, so `/share`, `/reload` and
+    // `/sessions` all have one to ask. A machine with no provider configured
+    // yet keeps its session here so the login card can run before an agent
+    // could start at all.
+    if remote.is_none() && !stack.needs_login {
+        let resume = hosted_resume(&cli, &cwd_str, &storage)?;
+        remote = Some(hosted_session(&cwd, &cli, resume)?);
+        owned = true;
+    }
+    match (remote.as_mut(), listen) {
+        (Some(hosted), Some(address)) => {
+            share_session(hosted, Some(address), cli.share_token.as_deref())?;
+            notice = Some(shared_notice(hosted));
+        }
+        (None, Some(_)) => startup_warnings.push(SHARE_NEEDS_LOGIN.to_owned()),
+        (Some(hosted), None) if !hosted.owned => {
+            notice = Some(format!("attached to {}", hosted.label));
+        }
+        _ => {}
+    }
     let session_id = cli.continue_session.as_ref().and_then(|o| o.as_deref());
-    let mut session_picker = !attached && session_picker_requested(&cli);
+    let mut session_picker = session_picker_requested(&cli) && (owned || !attached);
     let mut tabs = vec![match &remote {
         Some(remote) => AppSession::new(&remote.connection.model, &cwd_str),
         None => resolve_session(
@@ -608,12 +656,6 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
     let mut focused = 0;
     let mut warnings = startup_warnings;
     let mut teardown = Teardown::default();
-    // A shared session lives in the agent this window started; the local
-    // transcript is only a view of it, so the resume hint must name that one.
-    let mut shared_session = remote
-        .as_ref()
-        .filter(|_| cli.share.is_some())
-        .map(|remote| remote.connection.session.0.to_string());
     loop {
         let focused_tab = &tabs[focused];
         let (model, warning) = restored_session_model(
@@ -671,12 +713,9 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
 
         match outcome {
             RunOutcome::Exit { session_id, code } => {
-                let resume = shared_session
-                    .clone()
-                    .or_else(|| session_id.map(|id| id.to_string()));
-                if let Some(id) = resume {
+                if let Some(id) = session_id {
                     let colored = io::stderr().is_terminal();
-                    eprintln!("{}", exit_resume_hint(&id, colored));
+                    eprintln!("{}", exit_resume_hint(&id.to_string(), colored));
                 }
                 let started = Instant::now();
                 drop(stack);
@@ -696,45 +735,36 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
                 let Some(id) = session else {
                     bail!(NOTHING_TO_SHARE);
                 };
-                let mut hosted = hosted_session(
-                    &cwd,
-                    share_bind(),
-                    cli.share_token.clone(),
-                    cli.model.clone(),
-                    Some(id.to_string()),
-                )?;
-                let info = hosted.connection.client.share().map_err(|e| eyre!(e))?;
-                hosted.label = format!("this machine, shared on {}", info.address);
-                cli.share = Some(share_bind());
-                shared_session = Some(hosted.connection.session.0.to_string());
-                notice = Some(format!(
-                    "{}; other machines can attach to this session",
-                    hosted.label
-                ));
+                listen = Some(share_bind());
+                let mut hosted = hosted_session(&cwd, &cli, Some(id.to_string()))?;
+                share_session(&mut hosted, listen, None)?;
+                notice = Some(shared_notice(&hosted));
                 tabs = vec![AppSession::new(&hosted.connection.model, &cwd_str)];
                 remote = Some(hosted);
                 attached = true;
+                owned = true;
                 session_picker = false;
                 focused = 0;
             }
-            RunOutcome::Switch { session } => {
+            RunOutcome::Switch { session, shared } => {
                 let mut hosted = rehosted_session(&cwd, &cli, Some(session.to_string()))?;
-                let info = hosted.connection.client.share().map_err(|e| eyre!(e))?;
-                hosted.label = format!("this machine, shared on {}", info.address);
-                shared_session = Some(hosted.connection.session.0.to_string());
-                notice = Some(format!(
-                    "{}; other machines can attach to this session",
-                    hosted.label
-                ));
+                if shared {
+                    share_session(&mut hosted, listen, cli.share_token.as_deref())?;
+                    notice = Some(shared_notice(&hosted));
+                }
                 tabs = vec![AppSession::new(&hosted.connection.model, &cwd_str)];
                 focused = 0;
                 remote = Some(hosted);
+                attached = true;
+                owned = true;
             }
             RunOutcome::Reload {
                 tabs: reloaded,
                 focused: f,
+                shared,
+                hosted,
             } => {
-                if attached && cli.share.is_none() {
+                if attached && !owned {
                     bail!(ATTACHED_RELOAD);
                 }
                 // The picker is a one-shot startup request; a later
@@ -769,24 +799,23 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
                 stack = new_stack;
                 warnings = new_warnings;
                 focused = f.min(tabs.len() - 1);
-                if attached {
+                if owned {
                     // The agent holds the session, so a reload means starting
                     // it again on that session with the new plugins and config.
-                    let hosted = rehosted_session(&cwd, &cli, shared_session.clone())?;
-                    let info = hosted.connection.client.share().map_err(|e| eyre!(e))?;
-                    shared_session = Some(hosted.connection.session.0.to_string());
-                    notice = Some(format!(
-                        "reloaded; this machine, shared on {}; other machines can attach to this session",
-                        info.address
-                    ));
-                    tabs = vec![AppSession::new(&hosted.connection.model, &cwd_str)];
+                    let resume = hosted.map(|id| id.to_string());
+                    let mut restarted = rehosted_session(&cwd, &cli, resume)?;
+                    if shared {
+                        share_session(&mut restarted, listen, cli.share_token.as_deref())?;
+                        notice = Some(format!("reloaded; {}", shared_notice(&restarted)));
+                    }
+                    tabs = vec![AppSession::new(&restarted.connection.model, &cwd_str)];
                     focused = 0;
-                    remote = Some(hosted);
+                    remote = Some(restarted);
                 }
                 tracing::info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     tabs = tabs.len(),
-                    hosted = attached,
+                    hosted = owned,
                     "reload: rebuilt plugins and config"
                 );
             }
@@ -1168,17 +1197,61 @@ mod tests {
         assert!(err.to_string().contains(session_lock::OPEN_ELSEWHERE_MSG));
     }
 
+    /// The agent a window starts is handed the flags that shape its session,
+    /// so `makima --yolo --no-plugins` means the same when the tools run in
+    /// another process.
     #[test]
-    fn sharing_with_the_session_picker_asks_for_the_id_instead() {
+    fn the_agent_is_started_with_this_runs_flags() {
         use clap::Parser;
 
-        let err = run(
-            Cli::parse_from(["makima", "--share", "127.0.0.1:7331", "-c"]),
-            PathBuf::from(THIS_CWD),
-            None,
-        )
-        .expect_err("the picker needs a window that runs the session");
-        assert!(err.to_string().contains(SHARED_PICKER_UNSUPPORTED));
+        let cli = Cli::parse_from([
+            "makima",
+            "--model",
+            "test/model",
+            "--yolo",
+            "--automode",
+            "--no-project",
+            "--no-commands",
+            "--no-plugins",
+            "--no-jit",
+            "--allowed-tools",
+            "bash,read",
+            "--disallowed-tools",
+            "write",
+            "--system-prompt",
+            "be terse",
+            "--append-system-prompt",
+            "and kind",
+        ]);
+
+        assert_eq!(
+            agent_flags(&cli),
+            [
+                "--model",
+                "test/model",
+                "--system-prompt",
+                "be terse",
+                "--append-system-prompt",
+                "and kind",
+                "--allowed-tools",
+                "bash,read",
+                "--disallowed-tools",
+                "write",
+                "--yolo",
+                "--automode",
+                "--no-project",
+                "--no-commands",
+                "--no-plugins",
+                "--no-jit",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plain_run_asks_the_agent_for_nothing_extra() {
+        use clap::Parser;
+
+        assert!(agent_flags(&Cli::parse_from(["makima"])).is_empty());
     }
 
     #[test]

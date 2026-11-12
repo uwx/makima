@@ -6,6 +6,7 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use maki_config::Config;
 use maki_config::project::TrustMode;
 
 use crate::print::OutputFormat;
@@ -68,7 +69,7 @@ pub struct Cli {
     pub input_format: InputFormat,
 
     /// Skip loading custom commands from .makima/commands, .claude/commands, etc.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_commands: bool,
 
     /// Skip user `init.lua` files (global and project) but keep the Lua
@@ -76,11 +77,11 @@ pub struct Cli {
     /// keymap still load. Use this to recover from a broken `init.lua`
     /// or keymap override. Only Lua `init.lua` files are affected;
     /// `permissions.toml`, custom commands, and env files load as usual.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_plugins: bool,
 
     /// Run plugin Lua on the interpreter with full debug info (no native codegen)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_jit: bool,
 
     /// Skip all permission prompts (allow everything)
@@ -94,14 +95,14 @@ pub struct Cli {
     /// Load shared project `.makima` config for this run without asking and
     /// without recording an answer. For containers and CI, where the state
     /// directory is thrown away anyway. Only use it on a project you trust.
-    #[arg(long, conflicts_with = "no_project")]
+    #[arg(long, global = true, conflicts_with = "no_project")]
     pub trust: bool,
 
     /// Load nothing from the project's `.makima` directory: no init.lua,
     /// permissions.toml, mcp.toml, .env, commands or skills, whatever the
     /// folder's trust. Use it to work in a repository whose `.makima` files
     /// are broken or that you do not want to run.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_project: bool,
 
     /// Exit after the agent completes (for automation workflows)
@@ -118,11 +119,21 @@ pub struct Cli {
     pub share_token: Option<String>,
 
     /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
-    #[arg(long, value_delimiter = ',', visible_alias = "allowedTools")]
+    #[arg(
+        long,
+        global = true,
+        value_delimiter = ',',
+        visible_alias = "allowedTools"
+    )]
     pub allowed_tools: Vec<String>,
 
     /// Disallowed tools (comma-separated).
-    #[arg(long, value_delimiter = ',', visible_alias = "disallowedTools")]
+    #[arg(
+        long,
+        global = true,
+        value_delimiter = ',',
+        visible_alias = "disallowedTools"
+    )]
     pub disallowed_tools: Vec<String>,
 
     /// Session ID for SDK mode
@@ -138,11 +149,11 @@ pub struct Cli {
     pub max_turns: Option<u32>,
 
     /// System prompt override
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub system_prompt: Option<String>,
 
     /// Append to system prompt
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub append_system_prompt: Option<String>,
 
     /// Permission mode for SDK
@@ -229,6 +240,27 @@ impl Cli {
 
     pub fn is_sdk_mode(&self) -> bool {
         self.print && matches!(self.input_format, InputFormat::StreamJson)
+    }
+
+    /// Restricts the tools this run may use. The window applies it to the
+    /// session it shows and the agent it starts applies it to the session it
+    /// serves, so `--allowed-tools` means the same wherever the tools run.
+    pub fn apply_tool_filters(&self, config: &mut Config) -> Result<()> {
+        if !self.allowed_tools.is_empty() {
+            config.agent.allowed_tools = self
+                .allowed_tools
+                .iter()
+                .map(|tool| normalize_tool_name(tool))
+                .collect::<Result<Vec<_>>>()?;
+        }
+        if !self.disallowed_tools.is_empty() {
+            config.agent.disabled_tools.extend(
+                self.disallowed_tools
+                    .iter()
+                    .filter_map(|tool| normalize_tool_name(tool).ok()),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -437,6 +469,41 @@ mod tests {
                 .to_string()
                 .contains(MODEL_HELP)
         );
+    }
+
+    /// A window starts its agent as `makima acp`, so every flag that shapes a
+    /// session has to parse after the subcommand too, not only before it.
+    #[test]
+    fn session_flags_parse_after_the_acp_subcommand() {
+        let cli = Cli::parse_from([
+            "makima",
+            "acp",
+            "--model",
+            "test/model",
+            "--yolo",
+            "--automode",
+            "--no-plugins",
+            "--no-jit",
+            "--no-commands",
+            "--no-project",
+            "--allowed-tools",
+            "bash,read",
+            "--disallowed-tools",
+            "write",
+            "--system-prompt",
+            "be terse",
+            "--append-system-prompt",
+            "and kind",
+        ]);
+
+        assert!(matches!(cli.command, Some(Command::Acp { .. })));
+        assert!(cli.no_plugins && cli.no_jit && cli.no_commands);
+        assert!(cli.no_project);
+        assert_eq!(cli.trust_mode(), TrustMode::Ignore);
+        assert_eq!(cli.allowed_tools, ["bash", "read"]);
+        assert_eq!(cli.disallowed_tools, ["write"]);
+        assert_eq!(cli.system_prompt.as_deref(), Some("be terse"));
+        assert_eq!(cli.append_system_prompt.as_deref(), Some("and kind"));
     }
 
     #[test]
