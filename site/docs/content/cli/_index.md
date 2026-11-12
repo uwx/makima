@@ -152,16 +152,17 @@ makima acp --share 0.0.0.0:7331
 makima --no-jit acp
 ```
 
-Starts an [ACP](/docs/acp/) server on stdio for editors like Zed, or over TCP with `--listen`, or both with `--share`, for [remote agents](/docs/acp/#remote-agents-over-tcp). Subcommand flags are `-m` / `--model`, `--yolo`, `--listen`, `--share` and `--token`. Global flags like `--no-jit` must come before the subcommand.
+Starts an [ACP](/docs/acp/) server on stdio for editors like Zed, or over TCP with `--listen`, or both with `--share`, for [remote agents](/docs/acp/#remote-agents-over-tcp). Subcommand flags are `-m` / `--model`, `--yolo`, `--automode`, `--listen`, `--share` and `--token`. Everything that shapes a session, like `--no-jit` or `--allowed-tools`, also parses after the subcommand, so a window can hand its own flags to the agent it starts.
 
 ### `makima --share`
 
 ```bash
 makima --share 0.0.0.0:7331
 makima --share 0.0.0.0:7331 --share-token my-token
+makima -c 01J8X... --share 0.0.0.0:7331
 ```
 
-Runs the interface on a session this process owns, and lets other machines watch it. The interface talks ACP to an agent of its own, the way the desktop does, so what another window or a phone sees is the same session you are typing into, and a turn another window runs appears here too, under a line saying where it runs. Watch it with `makima attach lan://<address>` or from the phone app. It starts a new session; resuming one with `-c` or `-l` is not supported there yet, though the session it created can be reopened afterwards.
+Runs the interface on a session this process owns, and lets other machines watch it. Every window already runs its session on an agent of its own, so `--share` only asks that agent to listen, which is what `/share` does inside the window. What another window or a phone sees is the session you are typing into: a turn started there appears here under a line saying where it runs. Watch it with `makima attach lan://<address>` or from the phone app. Any session works, a new one or one resumed with `-c` / `-l`, and `/sessions` switches to another without dropping the listener.
 
 ### `makima attach`
 

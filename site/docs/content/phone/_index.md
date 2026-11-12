@@ -21,9 +21,10 @@ makima --share 0.0.0.0:7331 --share-token my-token
 
 `--share` binds every interface on 7331, so the phone reaches it at the
 computer's address on the same network, for example `lan://192.168.2.4:7331`.
-Without `--share-token` the agent uses the token in its state directory, which
-the phone never sees, so pass one you can type. The desktop window's status bar
-does the same with `Share`, and shows both the link and the token to copy.
+`/share` inside a window does the same on a port the system picks, and both
+flash the link with the token to type into the phone. Without `--share-token`
+(or without one passed to `/share`) the agent uses the token stored in its
+state directory.
 
 The listener speaks plain TCP, and the token is its only gate. Use it on a
 network you trust, or over a private one such as Tailscale.
