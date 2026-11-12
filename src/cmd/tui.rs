@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
@@ -372,6 +372,10 @@ fn exit_resume_hint(id: &str, colored: bool) -> String {
 
 const ATTACHED_RELOAD: &str = "this window is attached to another machine; restart it to reload";
 const NOTHING_TO_SHARE: &str = "there is no session to share";
+/// The agent a window serves releases its session lock while it exits, so the
+/// restarted one can still find the session claimed for a moment.
+const REHOST_ATTEMPTS: u32 = 20;
+const REHOST_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Where `/share` binds: every interface, on a port the system picks.
 fn share_bind() -> SocketAddr {
@@ -407,6 +411,33 @@ fn hosted_session(
         connection,
         label: format!("this machine, shared on {address}"),
     })
+}
+
+/// Starts serving this session again after `/reload`, on the same session.
+/// The agent that just stopped releases its lock while it exits, so the claim
+/// can still be refused for a moment.
+fn rehosted_session(cwd: &Path, cli: &Cli, resume: Option<String>) -> Result<RemoteSession> {
+    let mut attempt = 1;
+    loop {
+        let spawned = hosted_session(
+            cwd,
+            share_bind(),
+            cli.share_token.clone(),
+            cli.model.clone(),
+            resume.clone(),
+        );
+        match spawned {
+            Ok(hosted) => return Ok(hosted),
+            Err(error)
+                if attempt < REHOST_ATTEMPTS
+                    && format!("{error:#}").contains(session_lock::OPEN_ELSEWHERE_MSG) =>
+            {
+                attempt += 1;
+                thread::sleep(REHOST_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// The session `--share` opens where its agent runs, or nothing to start a
@@ -689,7 +720,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
                 tabs: reloaded,
                 focused: f,
             } => {
-                if attached {
+                if attached && cli.share.is_none() {
                     bail!(ATTACHED_RELOAD);
                 }
                 // The picker is a one-shot startup request; a later
@@ -724,9 +755,24 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
                 stack = new_stack;
                 warnings = new_warnings;
                 focused = f.min(tabs.len() - 1);
+                if attached {
+                    // The agent holds the session, so a reload means starting
+                    // it again on that session with the new plugins and config.
+                    let hosted = rehosted_session(&cwd, &cli, shared_session.clone())?;
+                    let info = hosted.connection.client.share().map_err(|e| eyre!(e))?;
+                    shared_session = Some(hosted.connection.session.0.to_string());
+                    notice = Some(format!(
+                        "reloaded; this machine, shared on {}; other machines can attach to this session",
+                        info.address
+                    ));
+                    tabs = vec![AppSession::new(&hosted.connection.model, &cwd_str)];
+                    focused = 0;
+                    remote = Some(hosted);
+                }
                 tracing::info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     tabs = tabs.len(),
+                    hosted = attached,
                     "reload: rebuilt plugins and config"
                 );
             }

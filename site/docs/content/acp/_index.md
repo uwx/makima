@@ -233,6 +233,8 @@ A window that follows another process's session starts a new conversation where 
 
 `/tasks`, `/mcp` and `/login` still belong to the process that runs the session: tasks, MCP servers and credentials live there. They stay out of the command list in a window that does not run it, and answer with guidance when typed.
 
+`/reload` rebuilds the window's plugins and config where you typed it. A window that also serves its session starts the agent again on the same session, so the agent reloads too. A window attached to another machine's agent cannot reload that process, so it asks you to restart.
+
 ### Switching the mode
 
 Build and plan mode decide what the session may write, so a switch runs where the session lives. A window asks for it with ACP's own method:
