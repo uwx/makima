@@ -33,7 +33,6 @@ use tracing::warn;
 use crate::app::MIRROR_PRESENTATION;
 
 const TOOL_UNAVAILABLE: &str = "This command only works on a session this window runs";
-const CONTROL_UNAVAILABLE: &str = "Compaction runs where the session lives, not in this window";
 const PERMISSION_PREFIX: &str = "remote-";
 const REMOTE_TOOL: &str = "unknown";
 const MCP_PROMPT_UNAVAILABLE: &str = "MCP prompts run where the session lives, not in this window";
@@ -191,15 +190,50 @@ impl ActorBackend for AcpBackend {
         &'a mut self,
         _history: &'a mut History,
         context: TurnContext,
-        _instructions: Option<&'a str>,
+        instructions: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
-            EventSender::with_identity(self.agent_tx.clone(), Some(context.work)).try_send(
-                AgentEvent::ControlError {
-                    message: CONTROL_UNAVAILABLE.to_owned(),
-                },
-            );
-            BackendResult::ControlFailed
+            // The transcript this window copies gets replaced once the agent
+            // announces what it committed, so the compaction itself runs
+            // where the session lives and this side only watches it.
+            let sender = EventSender::with_identity(self.agent_tx.clone(), Some(context.work));
+            self.turn.start(Translator {
+                sender: sender.clone(),
+                model: self.model.clone(),
+                tools: HashMap::new(),
+                usage: TokenUsage::default(),
+                context_window: 0,
+            });
+            let cancel = {
+                let client = Arc::clone(&self.client);
+                let cancel = context.cancel.clone();
+                smol::spawn(async move {
+                    cancel.cancelled().await;
+                    client.cancel();
+                })
+            };
+            let client = Arc::clone(&self.client);
+            let instructions = instructions.map(str::to_owned);
+            let stop = smol::unblock(move || client.compact(instructions.as_deref())).await;
+            let (ack_tx, ack_rx) = flume::bounded(1);
+            let _ = self.settle.send(ack_tx);
+            let _ = ack_rx.recv_async().await;
+            self.turn.finish();
+            cancel.cancel().await;
+            match stop {
+                Ok(StopReason::EndTurn) => {
+                    sender.try_send(AgentEvent::ControlComplete {
+                        usage: TokenUsage::default(),
+                    });
+                    BackendResult::CompactDone
+                }
+                Ok(_) => BackendResult::ControlFailed,
+                Err(error) => {
+                    warn!(%error, "remote compaction failed");
+                    sender.try_send(AgentEvent::ControlError { message: error });
+                    BackendResult::ControlFailed
+                }
+            }
         })
     }
 }
@@ -1253,6 +1287,57 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn compacting_a_shared_session_asks_where_the_session_lives() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let client = std::net::TcpStream::connect(address).expect("connect");
+        let (agent, _) = listener.accept().expect("accept");
+        let script = std::thread::spawn(move || {
+            let reading = agent.try_clone().expect("clone");
+            let mut script = Script {
+                lines: std::io::BufReader::new(reading).lines(),
+                out: agent,
+            };
+            script.handshake();
+            let compact = script.recv();
+            script.update(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "t1",
+                "title": "Compact context",
+                "status": "pending",
+            }));
+            script.respond(
+                &compact["id"],
+                serde_json::json!({ "stopReason": "end_turn" }),
+            );
+            compact
+        });
+        let split = client.try_clone().expect("clone");
+        let connection = maki_acp_client::connect_streams(split, client, Path::new("/tmp"))
+            .expect("connect streams");
+        let (tx, rx) = flume::unbounded();
+        let (_answer_tx, answer_rx) = flume::unbounded();
+        let mut backend = AcpBackend::new(&connection, tx, answer_rx);
+        let mut history = History::new(Vec::new());
+        let (_trigger, _reason, context) = turn_context();
+
+        let result = smol::block_on(backend.run_compact(&mut history, context, Some("keep it")));
+
+        let compact = script.join().expect("script");
+        assert_eq!(compact["method"], "maki/compact");
+        assert_eq!(compact["params"]["sessionId"], SESSION_ID);
+        assert_eq!(compact["params"]["instructions"], "keep it");
+        assert!(matches!(result, BackendResult::CompactDone));
+        let events = drain(&rx);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolPending { name, .. } if name == "Compact context")),
+            "the row the agent opened is painted here: {events:?}"
+        );
     }
 
     #[test]

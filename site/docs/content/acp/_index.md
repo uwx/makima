@@ -187,6 +187,16 @@ A window that keeps its own copy of the session's config, like the terminal inte
 
 The window compares the option list after each change of its own and sends only the built-ins that moved: model, thinking, fast, workflow, yolo. Plugin options stay on the side that owns them. If the agent refuses the value, the window says so and keeps running on the config the agent still has.
 
+### Compacting a shared session
+
+A window that only watches a session asks the agent to compact it, because the transcript to summarize lives there:
+
+```json
+{"jsonrpc":"2.0","id":8,"method":"maki/compact","params":{"sessionId":"...","instructions":"keep the failing test names"}}
+```
+
+`instructions` is optional. The call returns when the compaction ends, with the same `stopReason` a prompt gets. Every window sees the `Compact context` tool call while it runs, and the compacted transcript arrives afterwards as a `maki/ui/committed` with `replace: true` and `compacted: true`.
+
 ### When the link drops
 
 A client attached over TCP reconnects on its own. It retries with backoff (from 250 ms, capped at 5 s), runs `initialize` again, asks `maki/live` for the sessions the agent serves, and attaches the one it was watching. The reattach replays the session's updates and its committed history, so the transcript the client missed comes back in order, and a turn that ran while it was away shows up too.

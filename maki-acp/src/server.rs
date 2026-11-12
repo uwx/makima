@@ -84,6 +84,9 @@ const SESSIONS_METHOD: &str = "maki/sessions";
 const REWIND_METHOD: &str = "maki/rewind";
 const REWIND_PREVIEW_CHARS: usize = 80;
 const REWIND_STALE: &str = "that turn is gone; open the rewind picker again";
+/// Client to server: compact the transcript where the session lives, with the
+/// optional guidance in `instructions`.
+const COMPACT_METHOD: &str = "maki/compact";
 
 type StoredSession = Session<Message, TokenUsage, maki_agent::ToolOutput>;
 const INVALID_THEME_CODE: i32 = -32602;
@@ -1021,6 +1024,10 @@ async fn handle_request(
         },
         "session/set_mode" => handle_set_mode(srv, raw, params).await,
         "session/set_config_option" => handle_set_config(srv, raw).await,
+        COMPACT_METHOD => match start_compaction(srv, raw, &id).await {
+            Ok(()) => return,
+            Err(error) => Err(error),
+        },
         SESSIONS_METHOD => {
             if !srv.ui.enabled() {
                 respond_request(srv, method, id, Err(AcpError::method_not_found()));
@@ -1878,6 +1885,23 @@ fn list_sessions(srv: &Server, params: &AcpParams) -> Value {
 #[derive(Deserialize)]
 struct RewindParams {
     offset: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactParams {
+    session_id: SessionId,
+    instructions: Option<String>,
+}
+
+/// Compacts the transcript where the session lives, so a window that only
+/// watches the session can compact it too. The prompt-shaped `session/prompt
+/// {"/compact"}` path stays for clients that dispatch commands themselves.
+async fn start_compaction(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
+    let req: CompactParams = parse_params(raw)?;
+    validate_session(srv, req.session_id.0.as_ref())?;
+    let session = srv.session.as_ref().ok_or_else(no_session)?;
+    send_manual_compaction(session, &srv.out_tx, id, req.instructions).await
 }
 
 /// Lists the turns a rewind can return to, or rewinds to one. A rewind drops
@@ -7153,6 +7177,35 @@ mod tests {
                 turns.actor.latest_ticket().is_none(),
                 "compaction bypasses primary input"
             );
+        });
+    }
+
+    #[test]
+    fn compact_method_compacts_where_the_session_lives() {
+        smol::block_on(async {
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            let raw = serde_json::json!({
+                "params": { "sessionId": session_id, "instructions": "keep the failures" },
+            });
+
+            start_compaction(&mut srv, &raw, &RequestId::Number(41))
+                .await
+                .unwrap();
+            let pending = out_rx.recv_async().await.unwrap();
+            assert_eq!(pending["params"]["update"]["sessionUpdate"], "tool_call");
+            assert_eq!(pending["params"]["update"]["title"], "Compact context");
+            turns.next().await;
+            turns.release();
+
+            let started = out_rx.recv_async().await.unwrap();
+            let completed = out_rx.recv_async().await.unwrap();
+            let terminal = out_rx.recv_async().await.unwrap();
+            assert_eq!(started["params"]["update"]["status"], "in_progress");
+            assert_eq!(completed["params"]["update"]["status"], "completed");
+            assert_eq!(terminal["id"], 41);
+            assert_eq!(terminal["result"]["stopReason"], "end_turn");
+            assert!(out_rx.is_empty(), "compaction answers once");
         });
     }
 

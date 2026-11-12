@@ -75,6 +75,7 @@ const TURN_METHOD: &str = "maki/ui/turn";
 const COMMITTED_METHOD: &str = "maki/ui/committed";
 const PERMISSION_DONE_METHOD: &str = "maki/ui/permission_done";
 const REWIND_METHOD: &str = "maki/rewind";
+const COMPACT_METHOD: &str = "maki/compact";
 const REWOUND_METHOD: &str = "maki/ui/rewind";
 const SHORT_SESSION_CHARS: usize = 8;
 #[cfg(windows)]
@@ -1097,6 +1098,23 @@ impl Client {
         self.prompt_blocks(vec![ContentBlock::Text(TextContent::new(text.to_owned()))])
     }
 
+    /// Asks the agent to compact the transcript where the session lives, and
+    /// waits for it. `instructions` guides the summary.
+    pub fn compact(&self, instructions: Option<&str>) -> Result<StopReason, String> {
+        let session = self
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no active session".to_owned())?;
+        let response: PromptResponse = self.request(
+            COMPACT_METHOD,
+            json!({ "sessionId": session.0, "instructions": instructions }),
+            None,
+        )?;
+        Ok(response.stop_reason)
+    }
+
     pub fn prompt_blocks(&self, blocks: Vec<ContentBlock>) -> Result<StopReason, String> {
         let session = self
             .session
@@ -1371,7 +1389,7 @@ pub fn short_session(session: &SessionId) -> String {
 mod tests {
     use std::path::Path;
 
-    use agent_client_protocol_schema::{Diff, ToolCallContent};
+    use agent_client_protocol_schema::{Diff, StopReason, ToolCallContent};
     use serde_json::Value;
 
     use std::time::{Duration, Instant};
@@ -1829,6 +1847,38 @@ old
                 "session/new",
                 "session/set_config_option"
             ]
+        );
+    }
+
+    #[test]
+    fn compacting_names_the_session_and_the_guidance() {
+        use agent_client_protocol_schema::{NewSessionResponse, SessionId};
+
+        let (address, server) = fake_agent(4, |method, request| match method {
+            "initialize" => initialized(method),
+            "maki/live" => Some(serde_json::json!({ "sessions": [] })),
+            "session/new" => Some(
+                serde_json::to_value(NewSessionResponse::new(SessionId::new("sess-compact")))
+                    .unwrap(),
+            ),
+            "maki/compact" => {
+                assert_eq!(request["params"]["sessionId"], "sess-compact");
+                assert_eq!(request["params"]["instructions"], "keep the failures");
+                Some(serde_json::json!({ "stopReason": "end_turn" }))
+            }
+            _ => None,
+        });
+        let target = Target::lan(&format!("lan://{address}:/srv/app"), Some("token")).unwrap();
+        let connection = super::connect(&target).unwrap();
+        let stop = connection
+            .client
+            .compact(Some("keep the failures"))
+            .unwrap();
+        assert_eq!(stop, StopReason::EndTurn);
+        drop(connection);
+        assert_eq!(
+            server.join().unwrap(),
+            ["initialize", "maki/live", "session/new", "maki/compact"]
         );
     }
 
