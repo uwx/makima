@@ -441,9 +441,9 @@ fn hosted_session(cwd: &Path, cli: &Cli, resume: Option<String>) -> Result<Remot
     })
 }
 
-/// Starts this session's agent again, after `/reload` or a switch. The agent
-/// that just stopped releases its session lock while it exits, so the claim
-/// can still be refused for a moment.
+/// Starts this session's agent after the window had been serving it itself:
+/// on `/share`, `/reload` or a switch. The previous owner releases its session
+/// lock while it exits, so the claim can still be refused for a moment.
 fn rehosted_session(cwd: &Path, cli: &Cli, resume: Option<String>) -> Result<RemoteSession> {
     let mut attempt = 1;
     loop {
@@ -736,7 +736,9 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
                     bail!(NOTHING_TO_SHARE);
                 };
                 listen = Some(share_bind());
-                let mut hosted = hosted_session(&cwd, &cli, Some(id.to_string()))?;
+                // A window that ran its session here holds that session's lock
+                // until it exits, so the agent takes a moment to find it free.
+                let mut hosted = rehosted_session(&cwd, &cli, Some(id.to_string()))?;
                 share_session(&mut hosted, listen, None)?;
                 notice = Some(shared_notice(&hosted));
                 tabs = vec![AppSession::new(&hosted.connection.model, &cwd_str)];
