@@ -133,7 +133,8 @@ impl Chat {
             // describes were streamed here already.
             AgentEvent::HistoryCommitted { .. }
             | AgentEvent::CwdChanged { .. }
-            | AgentEvent::ModeChanged { .. } => {}
+            | AgentEvent::ModeChanged { .. }
+            | AgentEvent::OptionsChanged { .. } => {}
             // A permission prompt this window did not show.
             AgentEvent::PermissionDismissed { .. } => {}
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),

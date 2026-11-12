@@ -637,6 +637,7 @@ pub fn run(
                                 | AgentEvent::MirroredPrompt { .. }
                                 | AgentEvent::CwdChanged { .. }
                                 | AgentEvent::ModeChanged { .. }
+                                | AgentEvent::OptionsChanged { .. }
                                 | AgentEvent::HistoryCommitted { .. }
                                 | AgentEvent::PermissionDismissed { .. }
                                 | AgentEvent::ModelSwitched { .. }

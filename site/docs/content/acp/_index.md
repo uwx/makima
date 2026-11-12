@@ -237,6 +237,16 @@ Picking another stored session in `/sessions` reopens the window on it. The agen
 
 `/reload` rebuilds the window's plugins and config where you typed it. A window that also serves its session starts the agent again on the same session, so the agent reloads too. A window attached to another machine's agent cannot reload that process, so it asks you to restart.
 
+### Following the options
+
+Model, thinking, fast, workflow and yolo belong to the session, not to a window, so the session announces them whenever they change:
+
+```json
+{"method":"session/update","params":{"sessionId":"...","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"openai/gpt-5","options":[]},{"id":"fast","name":"Fast mode","type":"select","currentValue":"enabled","options":[]}]}}}
+```
+
+Each window compares that with what it already shows: the ones that differ go through the same path a change typed there would take, and the ones that match are left alone, so a change this window made does not come back to it. A `/model` or `/fast` typed in one window moves the status bar in all of them, and a session opened with `/sessions` arrives with its own options.
+
 ### Switching the mode
 
 Build and plan mode decide what the session may write, so a switch runs where the session lives. A window asks for it with ACP's own method:

@@ -886,6 +886,11 @@ pub enum AgentEvent {
         mode: String,
         plan: Option<PathBuf>,
     },
+    /// The session announced its option values, as `(id, value)` pairs. Every
+    /// window follows them so both sides agree whoever changed them.
+    OptionsChanged {
+        options: Vec<(String, String)>,
+    },
     /// The current reasoning block is complete; the next `ThinkingDelta`
     /// belongs to a new block.
     ThinkingBlockEnd,

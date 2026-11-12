@@ -39,8 +39,8 @@ use maki_agent::session_coordinator::{
     builtin_option_definitions, canonical_directory, publication_claim,
 };
 use maki_agent::session_options::{
-    DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, SessionOptionsSnapshot,
-    THINKING_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
+    DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, MODEL_OPTION_ID, SessionOptionOwner,
+    SessionOptionsSnapshot, THINKING_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
 };
 use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{
@@ -766,6 +766,16 @@ fn changed_builtin_options(
             })
         })
         .collect()
+}
+
+/// A boolean option is `enabled` or `disabled`, and `true` or `false` to a
+/// client that asked the session for booleans.
+fn normalized_option_value(value: &str) -> &str {
+    match value {
+        "true" => ENABLED_VALUE,
+        "false" => DISABLED_VALUE,
+        other => other,
+    }
 }
 
 /// The built-in option values a fresh session inherits from the one it
@@ -1689,6 +1699,11 @@ enum InternalEvent {
         session: MakiId,
         error: String,
     },
+    /// An option the session announced did not land in this window.
+    OptionApplyFailed {
+        session: MakiId,
+        error: String,
+    },
     /// `/cd` over the agent failed; say why where it was typed.
     DirectoryRefused {
         session: MakiId,
@@ -2445,6 +2460,13 @@ impl<'t> EventLoop<'t> {
                         .flash(format!("the agent refused this change: {error}"));
                 }
             }
+            InternalEvent::OptionApplyFailed { session, error } => {
+                if let Some(idx) = self.position(session) {
+                    self.sessions[idx]
+                        .app
+                        .flash(format!("the session's change did not apply here: {error}"));
+                }
+            }
             InternalEvent::DirectoryRefused { session, error } => {
                 if let Some(idx) = self.position(session) {
                     self.sessions[idx].app.flash(format!("cd: {error}"));
@@ -2973,6 +2995,10 @@ impl<'t> EventLoop<'t> {
         // point at one place whoever asked for the switch.
         if let AgentEvent::ModeChanged { mode, plan } = &envelope.event {
             self.follow_mode(idx, mode, plan.clone());
+            return;
+        }
+        if let AgentEvent::OptionsChanged { options } = &envelope.event {
+            self.follow_options(idx, options);
             return;
         }
         // The agent moved the directory its tools run in. This window's shadow
@@ -4872,6 +4898,55 @@ impl<'t> EventLoop<'t> {
         );
     }
 
+    /// Option values the session announced. The ones this window already shows
+    /// are skipped, so a change it made itself does not come back to it, and
+    /// the rest land through the same coordinator a change made here uses.
+    fn follow_options(&mut self, idx: usize, options: &[(String, String)]) {
+        let current = self.sessions[idx].coordinator.read().options();
+        let target = self.selected_target(idx);
+        for (id, announced) in options {
+            let value = normalized_option_value(announced);
+            let shown = current.options.iter().any(|option| {
+                option.definition.id.as_ref() == id.as_str()
+                    && option.current_value.as_ref() == value
+            });
+            if shown {
+                continue;
+            }
+            if id == MODEL_OPTION_ID {
+                self.dispatch_model_selection(
+                    idx,
+                    target.clone(),
+                    maki_commands::ModelSelection {
+                        spec: Some(Arc::from(value)),
+                        ..Default::default()
+                    },
+                    None,
+                );
+            } else {
+                self.dispatch_option_value(idx, id, value);
+            }
+        }
+    }
+
+    /// Applies one announced option in this window's own coordinator, without
+    /// asking the agent again: it is where the value came from.
+    fn dispatch_option_value(&self, idx: usize, id: &str, value: &str) {
+        let coordinator = self.sessions[idx].coordinator.clone();
+        let internal_tx = self.internal_tx.clone();
+        let session = self.sessions[idx].id();
+        let (id, value) = (id.to_owned(), value.to_owned());
+        smol::spawn(async move {
+            if let Err(error) = coordinator.set_option(id.as_str(), value.as_str()).await {
+                let _ = internal_tx.send(InternalEvent::OptionApplyFailed {
+                    session,
+                    error: format!("{id}: {error}"),
+                });
+            }
+        })
+        .detach();
+    }
+
     fn dispatch_target_directory(
         &self,
         idx: usize,
@@ -5895,6 +5970,39 @@ mod tests {
 
             release_runtime(changed);
             release_runtime(untouched);
+        });
+    }
+
+    /// An option the session announced lands here, whoever changed it, so the
+    /// status bar of a window that did not type the command still agrees.
+    #[test]
+    fn an_announced_option_lands_in_the_window() {
+        with_event_loop(|event_loop| {
+            assert!(!event_loop.sessions[0].app.root_config().workflow);
+            event_loop.handle_agent(
+                0,
+                Box::new(Envelope {
+                    event: AgentEvent::OptionsChanged {
+                        options: vec![("workflow".to_owned(), "enabled".to_owned())],
+                    },
+                    subagent: None,
+                    identity: None,
+                }),
+            );
+            pump_until(event_loop, |event_loop| {
+                event_loop.sessions[0].app.root_config().workflow
+            });
+            assert!(
+                event_loop.sessions[0]
+                    .coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .any(|option| option.definition.id.as_ref() == "workflow"
+                        && option.current_value.as_ref() == "enabled"),
+                "the window's own coordinator holds the announced value"
+            );
         });
     }
 

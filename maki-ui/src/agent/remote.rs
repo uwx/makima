@@ -12,8 +12,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use agent_client_protocol_schema::{
-    ContentBlock, CurrentModeUpdate, ImageContent, PermissionOption, PermissionOptionKind,
-    SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallUpdate, UsageUpdate,
+    ConfigOptionUpdate, ContentBlock, CurrentModeUpdate, ImageContent, PermissionOption,
+    PermissionOptionKind, SessionConfigKind, SessionUpdate, StopReason, TextContent, ToolCall,
+    ToolCallContent, ToolCallUpdate, UsageUpdate,
 };
 use flume::Receiver;
 use futures_lite::future::or;
@@ -312,6 +313,12 @@ impl Reader {
                     self.mirror.mode(update);
                     return;
                 }
+                // So do the options: `/model` or `/fast` in another window is
+                // this window's status bar too, whether a turn is running or not.
+                if let SessionUpdate::ConfigOptionUpdate(update) = *update {
+                    self.mirror.options(update);
+                    return;
+                }
                 if let Some(update) = self.turn.route(update) {
                     self.mirror.update(*update);
                 }
@@ -492,6 +499,22 @@ impl Mirror {
             mode: update.current_mode_id.0.to_string(),
             plan,
         });
+    }
+
+    fn options(&self, update: ConfigOptionUpdate) {
+        let options = update
+            .config_options
+            .iter()
+            .filter_map(|option| match &option.kind {
+                SessionConfigKind::Select(select) => {
+                    Some((option.id.0.to_string(), select.current_value.0.to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        self.translator
+            .sender
+            .try_send(AgentEvent::OptionsChanged { options });
     }
 
     fn dismissed(&self, id: String) {
@@ -866,6 +889,31 @@ mod tests {
             ] => {
                 assert_eq!(mode, "plan");
                 assert_eq!(announced.as_deref(), Some(plan.as_path()));
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_option_announcement_reaches_the_window() {
+        use agent_client_protocol_schema::{
+            ConfigOptionUpdate, SessionConfigOption, SessionConfigSelectOption,
+        };
+
+        let (tx, rx) = flume::unbounded();
+        let mirror = Mirror::new(tx, MODEL.to_owned());
+        let fast = SessionConfigOption::select(
+            "fast",
+            "Fast mode",
+            "enabled",
+            vec![SessionConfigSelectOption::new("enabled", "enabled")],
+        );
+
+        mirror.options(ConfigOptionUpdate::new(vec![fast]));
+
+        match drain(&rx).as_slice() {
+            [AgentEvent::OptionsChanged { options }] => {
+                assert_eq!(options, &[("fast".to_owned(), "enabled".to_owned())]);
             }
             other => panic!("unexpected events: {other:?}"),
         }
