@@ -154,8 +154,6 @@ const UNKNOWN_PROVIDER: &str = "Unknown";
 const RUNTIME_GONE_ERR: &str = "session closed while its model was preparing";
 /// Commands that act on a session this window runs, refused when it follows
 /// another process's session.
-const HOSTED_NEW_GUIDANCE: &str =
-    "this window follows a session another process runs; start a new conversation there";
 const HOSTED_TASKS_GUIDANCE: &str =
     "tasks belong to the session's own window; they are not visible from here";
 const HOSTED_MCP_GUIDANCE: &str =
@@ -761,6 +759,23 @@ fn changed_builtin_options(
                     option.current_value.to_string(),
                 )
             })
+        })
+        .collect()
+}
+
+/// The built-in option values a fresh session inherits from the one it
+/// replaces, as the pairs `session/set_config_option` takes. Plugin options
+/// stay behind: each side keeps its own copy of what a plugin stores.
+fn carried_options(snapshot: &SessionOptionsSnapshot) -> Vec<(String, String)> {
+    snapshot
+        .options
+        .iter()
+        .filter(|option| matches!(option.definition.owner, SessionOptionOwner::Builtin))
+        .map(|option| {
+            (
+                option.definition.id.to_string(),
+                option.current_value.to_string(),
+            )
         })
         .collect()
 }
@@ -1590,14 +1605,13 @@ impl SpawnCtx {
 
     /// What the session's commands may do here. A window that runs its own
     /// session replaces it outright; one attached to another machine's session
-    /// cannot, because its turn would come back to the same transcript.
+    /// asks the agent to, so only the commands that must run in the session's
+    /// own process are refused.
     fn command_capabilities(&self) -> (TargetCapabilities, TargetCapabilities) {
         match self.remote {
             Some(_) => (
                 TargetCapabilities::ALL,
-                TargetCapabilities::ALL
-                    .without(TargetCapability::SessionReplacement)
-                    .without(TargetCapability::SessionOwnership),
+                TargetCapabilities::ALL.without(TargetCapability::SessionOwnership),
             ),
             None => (TargetCapabilities::ALL, TargetCapabilities::ALL),
         }
@@ -1680,6 +1694,14 @@ enum InternalEvent {
     Rewound {
         session: MakiId,
         result: Result<String, String>,
+    },
+    /// `/new` where another agent owns the session: the agent answered, so
+    /// this window can replace its shadow with a fresh one.
+    SessionReplaced {
+        runtime: Arc<()>,
+        shadow: Box<AppSession>,
+        kind: SessionReplacementKind,
+        result: Result<(), String>,
     },
     Unshared(Result<(), String>),
 }
@@ -2429,6 +2451,29 @@ impl<'t> EventLoop<'t> {
                         Ok(draft) => self.sessions[idx].app.restore_rewind_draft(draft),
                         Err(error) => self.sessions[idx].app.flash(error),
                     }
+                }
+            }
+            InternalEvent::SessionReplaced {
+                runtime,
+                shadow,
+                kind,
+                result,
+            } => {
+                let Some(idx) = self.runtime_position(&runtime) else {
+                    return;
+                };
+                match result {
+                    Ok(()) => self.bring_up(
+                        RuntimeTarget::Replace {
+                            runtime,
+                            kind: Some(kind),
+                            reply: None,
+                        },
+                        *shadow,
+                    ),
+                    Err(error) => self.sessions[idx]
+                        .app
+                        .flash(format!("new session: {error}")),
                 }
             }
             InternalEvent::Shared(result) => {
@@ -3892,6 +3937,11 @@ impl<'t> EventLoop<'t> {
 
     fn request_replacement(&mut self, idx: usize, request: SessionReplacementRequest) {
         let SessionReplacementRequest { mut session, kind } = request;
+        if self.ctx.remote.is_some() {
+            self.replace_hosted_session(idx, session, kind);
+            return;
+        }
+
         if let Err(error) = ensure_replacement_lock_available(&self.sessions[idx], session.id) {
             self.sessions[idx].app.flash(error.into());
             return;
@@ -3908,6 +3958,42 @@ impl<'t> EventLoop<'t> {
             reply: None,
         };
         self.bring_up(target, session);
+    }
+
+    /// `/new` where another agent owns the session: that agent starts a fresh
+    /// session, then this window replaces its shadow with one that carries the
+    /// same choices, so neither side keeps talking to the old conversation.
+    fn replace_hosted_session(
+        &mut self,
+        idx: usize,
+        shadow: AppSession,
+        kind: SessionReplacementKind,
+    ) {
+        let Some(remote) = &self.ctx.remote else {
+            return;
+        };
+        let client = Arc::clone(&remote.connection.client);
+        let internal_tx = self.internal_tx.clone();
+        let runtime = self.sessions[idx].handles.identity();
+        let options = carried_options(&self.sessions[idx].coordinator.read().options());
+        let cwd = PathBuf::from(&shadow.cwd);
+        smol::spawn(async move {
+            let result = smol::unblock(move || {
+                client.new_session(&cwd)?;
+                for (option, value) in options {
+                    client.set_config_option(&option, &value)?;
+                }
+                Ok(())
+            })
+            .await;
+            let _ = internal_tx.send(InternalEvent::SessionReplaced {
+                runtime,
+                shadow: Box::new(shadow),
+                kind,
+                result,
+            });
+        })
+        .detach();
     }
 
     fn set_focused(&mut self, next: usize) {
@@ -5494,7 +5580,6 @@ where
 /// that vanished reads as a bug.
 fn hosted_guidance(operation: &BuiltinOperation) -> Option<&'static str> {
     match operation {
-        BuiltinOperation::ResetSession => Some(HOSTED_NEW_GUIDANCE),
         BuiltinOperation::OpenTasks => Some(HOSTED_TASKS_GUIDANCE),
         BuiltinOperation::OpenMcpPicker => Some(HOSTED_MCP_GUIDANCE),
         BuiltinOperation::OpenLoginPicker => Some(HOSTED_LOGIN_GUIDANCE),
@@ -6975,6 +7060,126 @@ mod tests {
             .storage_writer
             .send(Arc::clone(&app.state.session));
         event_loop.sync_orchestration();
+    }
+
+    /// `/new` in a window that follows another agent: the agent starts the
+    /// session and its choices follow, so the window only replaces its shadow
+    /// once the agent has agreed.
+    #[test]
+    fn a_hosted_window_starts_its_new_session_where_the_session_lives() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::AtomicBool;
+
+        const NEW_SESSION_METHOD: &str = "session/new";
+        const OPTION_METHOD: &str = "session/set_config_option";
+        const READ_POLL: Duration = Duration::from_millis(50);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap();
+        let client = TcpStream::connect(local).unwrap();
+        let (mut agent, _) = listener.accept().unwrap();
+        agent.set_read_timeout(Some(READ_POLL)).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_script = Arc::clone(&stop);
+        let script = std::thread::spawn(move || {
+            let mut pending: Vec<u8> = Vec::new();
+            let mut byte = [0_u8; 1];
+            let mut methods: Vec<String> = Vec::new();
+            loop {
+                if stop_script.load(Ordering::Acquire) {
+                    break;
+                }
+                match agent.read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(_) => pending.push(byte[0]),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+                if !pending.ends_with(
+                    b"
+",
+                ) {
+                    continue;
+                }
+                let Ok(request) = serde_json::from_slice::<serde_json::Value>(&pending) else {
+                    break;
+                };
+                pending.clear();
+                let method = request["method"].as_str().unwrap_or_default().to_owned();
+                let result = if method == NEW_SESSION_METHOD {
+                    serde_json::json!({ "sessionId": format!("agent-{}", methods.len()) })
+                } else if method == "initialize" {
+                    serde_json::json!({ "protocolVersion": 1, "agentCapabilities": {} })
+                } else {
+                    serde_json::json!({ "configOptions": [] })
+                };
+                methods.push(method);
+                let reply = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result,
+                });
+                if writeln!(agent, "{reply}")
+                    .and_then(|()| agent.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            methods
+        });
+
+        let connection = maki_acp_client::connect_streams(
+            client.try_clone().unwrap(),
+            client,
+            Path::new("/tmp"),
+        )
+        .unwrap();
+
+        let mut harness = RuntimeHarness::new();
+        harness.ctx.as_mut().unwrap().remote = Some(RemoteSession {
+            connection,
+            label: "agent".to_owned(),
+        });
+        let session = harness.session();
+        let ended_id = session.id;
+        let stop_after = Arc::clone(&stop);
+        run_event_loop(
+            harness,
+            move |harness| harness.runtime(session),
+            move |event_loop| {
+                event_loop.request_replacement(
+                    0,
+                    SessionReplacementRequest {
+                        session: AppSession::new("test-model", event_loop.session_cwd.as_str()),
+                        kind: SessionReplacementKind::Reset { ended_id },
+                    },
+                );
+                pump_until(event_loop, |event_loop| {
+                    event_loop.sessions[0].id() != ended_id
+                });
+                stop_after.store(true, Ordering::Release);
+            },
+        );
+
+        let methods = script.join().unwrap();
+        assert_eq!(
+            methods.iter().filter(|m| *m == NEW_SESSION_METHOD).count(),
+            2,
+            "the window asks the agent for the new session: {methods:?}"
+        );
+        assert!(
+            methods.iter().any(|m| m == OPTION_METHOD),
+            "the choices the window shows follow the session: {methods:?}"
+        );
     }
 
     #[test_case(false; "bare_model")]

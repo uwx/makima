@@ -229,7 +229,9 @@ The reply carries the `cwd` the agent resolved, which is canonical and may not b
 
 A window follows it: its status bar, its file completions and its own shells use that directory. The session records the last one, so a window that attaches later gets it in the `maki/attach` reply as `cwd` and starts in the right place. A `/cd` typed as a prompt reaches every window the same way, from the loop that ran the command.
 
-A window that follows another process's session cannot start a new conversation there, so `/new` is not in its command list and answers with guidance when typed. `/tasks`, `/mcp` and `/login` behave the same way: tasks, MCP servers and credentials belong to the process that runs the session.
+A window that follows another process's session starts a new conversation where that session lives. `/new` and `/clear` send ACP's own `session/new`, and only once the agent answers does the window replace the transcript it shows, so the next prompt lands in the new conversation. The choices the window displays (model, thinking, fast, workflow, yolo) go with it as `session/set_config_option` calls, the same way a change made here reaches the agent.
+
+`/tasks`, `/mcp` and `/login` still belong to the process that runs the session: tasks, MCP servers and credentials live there. They stay out of the command list in a window that does not run it, and answer with guidance when typed.
 
 ### Switching the mode
 
