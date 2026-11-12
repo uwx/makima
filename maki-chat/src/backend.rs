@@ -58,7 +58,7 @@ impl Backend {
         thread::Builder::new()
             .name("maki-share".into())
             .spawn(move || {
-                let result = client.share();
+                let result = client.share(None, None);
                 let _ = client.emit(Event::Share(result));
             })
             .map_err(|error| format!("start sharing: {error}"))?;
