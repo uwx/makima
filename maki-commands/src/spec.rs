@@ -35,9 +35,6 @@ pub enum TargetCapability {
     ApplicationLifecycle,
     Reload,
     UiActions,
-    /// The command acts on a session this process runs: its tasks, its MCP
-    /// servers. A window following someone else's session cannot.
-    SessionOwnership,
     /// The command reads and writes credentials where the agent runs, which a
     /// window can only do when that agent runs on this machine.
     LocalCredentials,
@@ -60,7 +57,6 @@ impl TargetCapabilities {
         TargetCapability::ApplicationLifecycle,
         TargetCapability::Reload,
         TargetCapability::UiActions,
-        TargetCapability::SessionOwnership,
         TargetCapability::LocalCredentials,
     ]);
 
@@ -284,9 +280,6 @@ pub struct BuiltinDefinition {
 
 const INTERACTIVE: TargetCapabilities =
     TargetCapabilities::from_capability(TargetCapability::InteractiveUi);
-const OWNED_UI: TargetCapabilities = INTERACTIVE.union(TargetCapabilities::from_capability(
-    TargetCapability::SessionOwnership,
-));
 const LOCAL_UI: TargetCapabilities = INTERACTIVE.union(TargetCapabilities::from_capability(
     TargetCapability::LocalCredentials,
 ));
@@ -443,7 +436,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
-        OWNED_UI,
+        INTERACTIVE,
     ),
     builtin!(
         Login,

@@ -407,6 +407,15 @@ impl McpSnapshotReader {
     pub fn load_full(&self) -> Arc<McpSnapshot> {
         self.load()
     }
+
+    /// Replaces what this reader shows. Only for a window that mirrors the
+    /// servers another process runs: nothing feeds requests from it.
+    pub fn show(&self, snapshot: McpSnapshot) {
+        self.0.store(Arc::new(McpPublishedState {
+            snapshot: Arc::new(snapshot),
+            ..Default::default()
+        }));
+    }
 }
 
 pub enum McpCommand {

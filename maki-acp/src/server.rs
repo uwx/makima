@@ -24,7 +24,7 @@ use flume::{Receiver, Sender};
 use maki_agent::config_change::ConfigChangeError;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams, WorkCancel};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
-use maki_agent::mcp::{self, McpHandle};
+use maki_agent::mcp::{self, McpCommand, McpHandle};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::session_coordinator::{
     SessionCoordinatorError, SessionCoordinatorHandle, publication_claim,
@@ -90,6 +90,8 @@ const COMPACT_METHOD: &str = "maki/compact";
 /// Client to server: move the session's working directory, with the path in
 /// `path`.
 const CWD_CHANGE_METHOD: &str = "maki/chdir";
+/// Lists the session's MCP servers, or toggles one, where they run.
+const MCP_METHOD: &str = "maki/mcp";
 /// Where a prompt's `_meta` carries the messages the client showed the user
 /// rather than typed, such as the output of a `!shell` command.
 const PREAMBLE_META: [&str; 2] = ["maki", "preamble"];
@@ -1076,6 +1078,11 @@ async fn handle_request(
             send(srv.reply(), Response::new(id, result));
             return;
         }
+        MCP_METHOD => {
+            let result = mcp_servers(srv, raw);
+            send(srv.reply(), Response::new(id, result));
+            return;
+        }
         SESSIONS_METHOD => {
             if !srv.ui.enabled() {
                 respond_request(srv, method, id, Err(AcpError::method_not_found()));
@@ -1981,6 +1988,61 @@ async fn change_directory(srv: &mut Server, raw: &Value) -> Result<Value, AcpErr
         .map_err(|error| AcpError::invalid_params().data(json_str(&error)))?;
     announce_cwd(&srv.out_tx, session, cwd.clone());
     Ok(json!({ "cwd": cwd }))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpParams {
+    session_id: SessionId,
+    #[serde(default)]
+    toggle: Option<McpToggle>,
+}
+
+#[derive(serde::Deserialize)]
+struct McpToggle {
+    server: String,
+    enabled: bool,
+}
+
+/// The session's MCP servers, where they run. A window that follows a session
+/// shows these and toggles them here, because the tools they publish are the
+/// agent's.
+fn mcp_servers(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
+    let req: McpParams = parse_params(raw)?;
+    let session = validate_session(srv, req.session_id.0.as_ref())?;
+    let Some(mcp) = session.mcp.as_ref() else {
+        return Ok(json!({ "servers": Vec::<Value>::new() }));
+    };
+    if let Some(toggle) = req.toggle {
+        mcp.send(McpCommand::Toggle {
+            server: toggle.server,
+            enabled: toggle.enabled,
+        });
+    }
+    let snapshot = mcp.reader().load();
+    let servers: Vec<Value> = snapshot
+        .infos
+        .iter()
+        .map(|info| {
+            let (status, error) = match &info.status {
+                maki_agent::McpServerStatus::Connecting => ("connecting", None),
+                maki_agent::McpServerStatus::Running => ("running", None),
+                maki_agent::McpServerStatus::Disabled => ("disabled", None),
+                maki_agent::McpServerStatus::Failed(error) => ("failed", Some(error.clone())),
+                maki_agent::McpServerStatus::NeedsAuth { .. } => ("needs_auth", None),
+            };
+            json!({
+                "name": info.name,
+                "transport": info.transport_kind,
+                "tools": info.tool_count,
+                "prompts": info.prompt_count,
+                "status": status,
+                "error": error,
+                "url": info.url,
+            })
+        })
+        .collect();
+    Ok(json!({ "servers": servers }))
 }
 
 /// Tells every window where the session's tools run now, so their status bars

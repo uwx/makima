@@ -45,7 +45,7 @@ use maki_agent::session_options::{
 use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentRef, CancelToken, Envelope, McpCommand, McpConfigErrors,
-    McpHandle, McpSnapshotReader, mcp,
+    McpHandle, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, mcp,
 };
 use maki_commands::{
     BuiltinOperation, CommandError, HostResponse, TargetCapabilities, TargetCapability,
@@ -152,11 +152,6 @@ const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
 const UNKNOWN_PROVIDER: &str = "Unknown";
 const RUNTIME_GONE_ERR: &str = "session closed while its model was preparing";
-/// What only the process that runs a session can do. A window that follows it
-/// says where the command belongs instead of hiding it: a typed command that
-/// vanished reads as a bug.
-const HOSTED_MCP_GUIDANCE: &str =
-    "MCP servers belong to the session's own window; configure them where it runs";
 const HOSTED_LOGIN_GUIDANCE: &str =
     "credentials belong to the machine that runs the session; log in there";
 const HOSTED_ONE_SESSION_ERR: &str =
@@ -767,6 +762,42 @@ fn changed_builtin_options(
         .collect()
 }
 
+/// The MCP servers an agent reported, as the picker reads them. This window
+/// runs no such servers, so the paths and OAuth details stay empty: it shows
+/// what the agent runs and toggles it there.
+fn mcp_snapshot(servers: &[maki_acp_client::McpServer]) -> McpSnapshot {
+    let infos = servers
+        .iter()
+        .map(|server| McpServerInfo {
+            name: server.name.clone(),
+            transport_kind: match server.transport.as_str() {
+                "http" => "http",
+                _ => "stdio",
+            },
+            tool_count: server.tools,
+            prompt_count: server.prompts,
+            status: match server.status.as_str() {
+                "connecting" => McpServerStatus::Connecting,
+                "running" => McpServerStatus::Running,
+                "needs_auth" => McpServerStatus::NeedsAuth {
+                    url: server.url.clone(),
+                },
+                "failed" => McpServerStatus::Failed(
+                    server.error.clone().unwrap_or_else(|| "failed".to_owned()),
+                ),
+                _ => McpServerStatus::Disabled,
+            },
+            config_path: PathBuf::new(),
+            url: server.url.clone(),
+            oauth: None,
+        })
+        .collect();
+    McpSnapshot {
+        infos,
+        ..Default::default()
+    }
+}
+
 /// A boolean option is `enabled` or `disabled`, and `true` or `false` to a
 /// client that asked the session for booleans.
 fn normalized_option_value(value: &str) -> &str {
@@ -1345,6 +1376,9 @@ struct SpawnCtx {
     status_content_reader: StatusContentReader,
     lua_event_handle: EventHandle,
     mcp_handle: Option<McpHandle>,
+    /// What the MCP picker shows. A window that runs its own MCP reads the
+    /// handle above; one that follows a session shows the agent's servers.
+    mcp_reader: McpSnapshotReader,
     mcp_config_errors: McpConfigErrors,
     model_slot: Arc<ProviderSlot>,
     catalog: ModelCatalog,
@@ -1545,10 +1579,7 @@ impl SpawnCtx {
             session.clone(),
             self.storage.clone(),
             self.catalog.specs(),
-            self.mcp_handle
-                .as_ref()
-                .map(McpHandle::reader)
-                .unwrap_or_else(McpSnapshotReader::empty),
+            self.mcp_reader.clone(),
             self.mcp_config_errors.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
@@ -1624,14 +1655,11 @@ impl SpawnCtx {
     fn command_capabilities(&self) -> (TargetCapabilities, TargetCapabilities) {
         match &self.remote {
             None => (TargetCapabilities::ALL, TargetCapabilities::ALL),
-            Some(remote) => {
-                let mut presented =
-                    TargetCapabilities::ALL.without(TargetCapability::SessionOwnership);
-                if !remote.owned {
-                    presented = presented.without(TargetCapability::LocalCredentials);
-                }
-                (TargetCapabilities::ALL, presented)
-            }
+            Some(remote) if !remote.owned => (
+                TargetCapabilities::ALL,
+                TargetCapabilities::ALL.without(TargetCapability::LocalCredentials),
+            ),
+            Some(_) => (TargetCapabilities::ALL, TargetCapabilities::ALL),
         }
     }
 
@@ -1706,6 +1734,11 @@ enum InternalEvent {
     OptionApplyFailed {
         session: MakiId,
         error: String,
+    },
+    /// The agent answered with its MCP servers, for `/mcp`.
+    McpServers {
+        session: MakiId,
+        result: Result<Vec<maki_acp_client::McpServer>, String>,
     },
     /// `/cd` over the agent failed; say why where it was typed.
     DirectoryRefused {
@@ -2024,8 +2057,17 @@ impl<'t> EventLoop<'t> {
             theme_completion,
         );
         let command_runtime = Arc::new(command_runtime);
-        let (mcp_handle, mcp_config_errors) =
-            smol::block_on(mcp::start(&cwd, project_config.clone()));
+        // A window that follows a session does not run MCP servers of its own:
+        // the agent's are the ones its tools come from.
+        let (mcp_handle, mcp_config_errors) = if remote.is_some() {
+            (None, McpConfigErrors::new(cwd.clone()))
+        } else {
+            smol::block_on(mcp::start(&cwd, project_config.clone()))
+        };
+        let mcp_reader = mcp_handle
+            .as_ref()
+            .map(McpHandle::reader)
+            .unwrap_or_else(McpSnapshotReader::empty);
         let ctx = SpawnCtx {
             prepare_provider: default_model_preparer(Arc::clone(&providers)),
             providers,
@@ -2041,6 +2083,7 @@ impl<'t> EventLoop<'t> {
             status_content_reader,
             lua_event_handle,
             mcp_handle,
+            mcp_reader,
             mcp_config_errors,
             model_slot,
             catalog,
@@ -2463,6 +2506,20 @@ impl<'t> EventLoop<'t> {
                         .flash(format!("the agent refused this change: {error}"));
                 }
             }
+            InternalEvent::McpServers { session, result } => {
+                let Some(idx) = self.position(session) else {
+                    return;
+                };
+                match result {
+                    Ok(servers) => {
+                        self.ctx.mcp_reader.show(mcp_snapshot(&servers));
+                        self.sessions[idx].app.open_mcp_picker();
+                    }
+                    Err(error) => self.sessions[idx]
+                        .app
+                        .flash(format!("mcp servers: {error}")),
+                }
+            }
             InternalEvent::OptionApplyFailed { session, error } => {
                 if let Some(idx) = self.position(session) {
                     self.sessions[idx]
@@ -2755,6 +2812,21 @@ impl<'t> EventLoop<'t> {
                     && let Some(guidance) = hosted_guidance(operation, remote.owned)
                 {
                     self.sessions[index].app.flash(guidance.to_owned());
+                    let _ = reply.send(Ok(HostResponse::Completed));
+                    return;
+                }
+                if let maki_commands::HostRequest::Builtin(BuiltinOperation::OpenMcpPicker) =
+                    &request
+                    && let Some(remote) = &self.ctx.remote
+                {
+                    let client = Arc::clone(&remote.connection.client);
+                    let internal = self.internal_tx.clone();
+                    let session = self.sessions[index].id();
+                    smol::spawn(async move {
+                        let result = smol::unblock(move || client.mcp_servers()).await;
+                        let _ = internal.send(InternalEvent::McpServers { session, result });
+                    })
+                    .detach();
                     let _ = reply.send(Ok(HostResponse::Completed));
                     return;
                 }
@@ -4367,6 +4439,19 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::ToggleMcp(server_name, enabled) => {
+                if let Some(remote) = &self.ctx.remote {
+                    let client = Arc::clone(&remote.connection.client);
+                    let internal = self.internal_tx.clone();
+                    let session = self.sessions[idx].id();
+                    smol::spawn(async move {
+                        let result =
+                            smol::unblock(move || client.toggle_mcp_server(&server_name, enabled))
+                                .await;
+                        let _ = internal.send(InternalEvent::McpServers { session, result });
+                    })
+                    .detach();
+                    return;
+                }
                 self.sessions[idx].handles.send_mcp(McpCommand::Toggle {
                     server: server_name,
                     enabled,
@@ -5721,7 +5806,6 @@ where
 /// that vanished reads as a bug.
 fn hosted_guidance(operation: &BuiltinOperation, owned: bool) -> Option<&'static str> {
     match operation {
-        BuiltinOperation::OpenMcpPicker => Some(HOSTED_MCP_GUIDANCE),
         BuiltinOperation::OpenLoginPicker if !owned => Some(HOSTED_LOGIN_GUIDANCE),
         _ => None,
     }
@@ -7408,6 +7492,45 @@ mod tests {
         script.join().unwrap();
     }
 
+    /// `/mcp` in a window that follows a session shows the servers the agent
+    /// runs, which is where the tools come from.
+    #[test]
+    fn a_hosted_window_shows_the_agents_mcp_servers() {
+        let (stop, script, connection) = scripted_agent();
+        let harness = hosted_harness(connection, true);
+        let stop_after = Arc::clone(&stop);
+        run_event_loop(
+            harness,
+            |harness| harness.runtime(harness.session()),
+            move |event_loop| {
+                let session = event_loop.sessions[0].id();
+                event_loop.handle_internal(InternalEvent::McpServers {
+                    session,
+                    result: Ok(vec![maki_acp_client::McpServer {
+                        name: "fs".to_owned(),
+                        transport: "stdio".to_owned(),
+                        tools: 3,
+                        prompts: 0,
+                        status: "running".to_owned(),
+                        error: None,
+                        url: None,
+                    }]),
+                });
+                let shown = event_loop.ctx.mcp_reader.load_full();
+                assert_eq!(shown.infos.len(), 1);
+                assert_eq!(shown.infos[0].name, "fs");
+                assert_eq!(shown.infos[0].tool_count, 3);
+                assert!(
+                    matches!(shown.infos[0].status, McpServerStatus::Running),
+                    "the status the agent reported"
+                );
+                assert!(event_loop.sessions[0].app.mcp_picker.is_open());
+                stop_after.store(true, Ordering::Release);
+            },
+        );
+        script.join().unwrap();
+    }
+
     /// A subagent this window follows over the connection still gets its own
     /// chat, reachable from `/tasks`, and finishes when the session says so.
     #[test]
@@ -7470,7 +7593,6 @@ mod tests {
                     presented.contains(TargetCapability::LocalCredentials),
                     can_login
                 );
-                assert!(!presented.contains(TargetCapability::SessionOwnership));
                 stop_after.store(true, Ordering::Release);
             },
         );
@@ -7645,6 +7767,7 @@ mod tests {
                 status_content_reader: StatusContentReader::empty(),
                 lua_event_handle: EventHandle::disconnected_for_test(),
                 mcp_handle: None,
+                mcp_reader: McpSnapshotReader::empty(),
                 mcp_config_errors: McpConfigErrors::new(temp_dir.path().to_path_buf()),
                 model_slot,
                 catalog,

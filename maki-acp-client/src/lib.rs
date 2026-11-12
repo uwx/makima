@@ -80,6 +80,7 @@ const PERMISSION_DONE_METHOD: &str = "maki/ui/permission_done";
 const REWIND_METHOD: &str = "maki/rewind";
 const COMPACT_METHOD: &str = "maki/compact";
 const CHDIR_METHOD: &str = "maki/chdir";
+const MCP_METHOD: &str = "maki/mcp";
 const PREAMBLE_KEY: &str = "maki";
 const PREAMBLE_FIELD: &str = "preamble";
 const REWOUND_METHOD: &str = "maki/ui/rewind";
@@ -179,6 +180,30 @@ pub enum SubagentEnd {
     Completed,
     Cancelled,
     Failed,
+}
+
+/// One MCP server as the session runs it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServer {
+    pub name: String,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub tools: usize,
+    #[serde(default)]
+    pub prompts: usize,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct McpResponse {
+    #[serde(default)]
+    servers: Vec<McpServer>,
 }
 
 /// Where another machine reaches a shared session, and the token it presents.
@@ -1071,6 +1096,41 @@ impl Client {
             Some(SESSION_TIMEOUT),
         )?;
         Ok(response.draft)
+    }
+
+    /// The session's MCP servers, where they run.
+    pub fn mcp_servers(&self) -> Result<Vec<McpServer>, String> {
+        let session = self
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no active session".to_owned())?;
+        let response: McpResponse = self.request(
+            MCP_METHOD,
+            json!({ "sessionId": session }),
+            Some(SESSION_TIMEOUT),
+        )?;
+        Ok(response.servers)
+    }
+
+    /// Enables or disables one of the session's MCP servers where they run.
+    pub fn toggle_mcp_server(&self, server: &str, enabled: bool) -> Result<Vec<McpServer>, String> {
+        let session = self
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no active session".to_owned())?;
+        let response: McpResponse = self.request(
+            MCP_METHOD,
+            json!({
+                "sessionId": session,
+                "toggle": { "server": server, "enabled": enabled },
+            }),
+            Some(SESSION_TIMEOUT),
+        )?;
+        Ok(response.servers)
     }
 
     pub fn complete_arguments(&self, text: &str) -> Result<Vec<ArgItem>, String> {

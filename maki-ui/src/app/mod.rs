@@ -1724,6 +1724,12 @@ impl App {
         ordered
     }
 
+    /// Opens the MCP picker on what its reader shows, which for a window that
+    /// follows a session is the agent's own list.
+    pub(crate) fn open_mcp_picker(&mut self) {
+        self.mcp_picker.open();
+    }
+
     fn open_tasks(&mut self) {
         self.task_picker_original = Some(self.active_chat);
         self.task_picker.open(self.task_entries(), " Tasks ");
@@ -3425,7 +3431,7 @@ impl App {
                 vec![]
             }
             BuiltinOperation::OpenMcpPicker => {
-                self.mcp_picker.open();
+                self.open_mcp_picker();
                 vec![]
             }
             BuiltinOperation::OpenLoginPicker => {

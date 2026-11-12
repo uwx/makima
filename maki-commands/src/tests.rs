@@ -1218,57 +1218,30 @@ fn builtin_argument_descriptors_carry_completion_metadata() {
 }
 
 #[test]
-fn commands_that_act_on_the_session_need_its_own_window() {
-    let owned = TargetCapabilities::from_capability(TargetCapability::SessionOwnership).union(
-        TargetCapabilities::from_capability(TargetCapability::InteractiveUi),
-    );
-    let local = TargetCapabilities::from_capability(TargetCapability::LocalCredentials).union(
-        TargetCapabilities::from_capability(TargetCapability::InteractiveUi),
-    );
-    // `/tasks` reads the chats this window already mirrors, so it works
-    // wherever the session runs; `/mcp` changes the process that runs it.
-    let tasks = BUILTIN_COMMANDS
-        .iter()
-        .find(|command| command.id == BuiltinId::Tasks)
-        .unwrap();
-    assert!(
-        !tasks
-            .required_capabilities
-            .contains(TargetCapability::SessionOwnership),
-        "/tasks browses chats a following window mirrors itself"
-    );
-    let mcp = BUILTIN_COMMANDS
-        .iter()
-        .find(|command| command.id == BuiltinId::Mcp)
-        .unwrap();
-    assert!(
-        mcp.required_capabilities.contains_all(owned),
-        "{} has to ask for the session it acts on",
-        mcp.name
-    );
-    // Credentials are the machine's, not the session's, so `/login` asks for
-    // the machine rather than the process.
+fn commands_that_change_the_session_need_a_ui_but_not_its_process() {
+    let ui = TargetCapabilities::from_capability(TargetCapability::InteractiveUi);
+    for id in [BuiltinId::Tasks, BuiltinId::Mcp, BuiltinId::Login] {
+        let builtin = BUILTIN_COMMANDS
+            .iter()
+            .find(|command| command.id == id)
+            .unwrap();
+        assert!(
+            builtin.required_capabilities.contains_all(ui),
+            "{} opens a picker",
+            builtin.name
+        );
+    }
+    // Credentials are the machine's, so `/login` asks for more than a UI.
     let login = BUILTIN_COMMANDS
         .iter()
         .find(|command| command.id == BuiltinId::Login)
         .unwrap();
-    assert!(login.required_capabilities.contains_all(local));
     assert!(
-        !login
+        login
             .required_capabilities
-            .contains(TargetCapability::SessionOwnership),
-        "a window whose agent runs here can log in"
+            .contains(TargetCapability::LocalCredentials),
+        "logging in runs where the credentials live"
     );
-    let registry = CommandRegistry::new();
-    let producer = registry.create_producer(ProducerPrecedence::Builtin);
-    producer
-        .replace(vec![registration("/tasks", owned)])
-        .unwrap();
-    let follower = registry.bind_target(
-        owned.without(TargetCapability::SessionOwnership),
-        Arc::new(Host),
-    );
-    assert!(registry.presented_commands(&follower).unwrap().is_empty());
 }
 
 #[test]
