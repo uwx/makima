@@ -28,7 +28,7 @@ The coordinator owns session option values and validation. Slash commands, ACP c
 
 Make ACP command execution preserve the meaning of each command and project all client-visible state that ACP can represent. Do not report a local command as complete when the client still displays stale state or when the command used different semantics from the TUI.
 
-The correction is broader than adding notifications in `maki-acp`. The current command outcome collapses several persistent and transient effects into `Completed`. The implementation needs explicit ownership for persistent session options, separate execution for isolated turns, and typed progress or feedback for effects that are not options.
+The correction is broader than adding notifications in `makima-acp`. The current command outcome collapses several persistent and transient effects into `Completed`. The implementation needs explicit ownership for persistent session options, separate execution for isolated turns, and typed progress or feedback for effects that are not options.
 
 ## Observed failures
 
@@ -51,7 +51,7 @@ The earlier investigation recorded these failures from manual Zed testing:
 
 ### Command dispatch loses effects
 
-`maki-commands/src/dispatch.rs` defines only these command outcomes:
+`makima-commands/src/dispatch.rs` defines only these command outcomes:
 
 ```rust
 pub enum CommandOutcome {
@@ -63,17 +63,17 @@ pub enum CommandOutcome {
 
 `HostResponse` has the same `Completed` and `AgentTurn` split. A completed result carries no state delta, progress source, feedback text, or lifecycle meaning.
 
-`maki-agent/src/command.rs` implements the portable host through `SessionCommandHost`. It mutates `SessionCommandState`, `PermissionManager`, the model channel, or `InteractiveControl`, then usually returns `HostResponse::Completed`. The state currently contains the model, Fast state, model list, working directory, and Workflow state. YOLO remains in `PermissionManager`.
+`makima-agent/src/command.rs` implements the portable host through `SessionCommandHost`. It mutates `SessionCommandState`, `PermissionManager`, the model channel, or `InteractiveControl`, then usually returns `HostResponse::Completed`. The state currently contains the model, Fast state, model list, working directory, and Workflow state. YOLO remains in `PermissionManager`.
 
-`maki-acp/src/server.rs::handle_prompt` responds to every `CommandOutcome::Completed` with an immediate `PromptResponse(EndTurn)`. It emits no other update. This is why successful backend mutations leave the client stale.
+`makima-acp/src/server.rs::handle_prompt` responds to every `CommandOutcome::Completed` with an immediate `PromptResponse(EndTurn)`. It emits no other update. This is why successful backend mutations leave the client stale.
 
 This loss should not be fixed by adding a large generic `CommandEffect` union to `CommandOutcome`. Persistent options, transient feedback, progress events, and model turns have different ownership and lifecycle rules. They should remain separate abstractions.
 
 ### ACP already has a partial model selector
 
-`maki-acp/src/methods.rs::model_config_option` builds a select option with ID `model` and category `SessionConfigOptionCategory::Model`.
+`makima-acp/src/methods.rs::model_config_option` builds a select option with ID `model` and category `SessionConfigOptionCategory::Model`.
 
-`maki-acp/src/server.rs` includes that option in new-session and load-session responses. Model discovery also emits `ConfigOptionUpdate`. `session/set_config_option`, `/model`, and SDK `set_model` must use the same coordinator and return a refreshed model option.
+`makima-acp/src/server.rs` includes that option in new-session and load-session responses. Model discovery also emits `ConfigOptionUpdate`. `session/set_config_option`, `/model`, and SDK `set_model` must use the same coordinator and return a refreshed model option.
 
 The missing confirmed behavior is the opposite direction: `/model` calls `SessionCommandHost::SetModel`, mutates `SessionCommandState`, and returns `Completed`. The ACP server does not emit a `ConfigOptionUpdate` for that path.
 
@@ -83,37 +83,37 @@ When a headless session wakes, model and dependent capability state must refresh
 
 ### `/new` resets history inside the existing ACP session
 
-`maki-agent/src/command.rs` maps builtin `/new` and alias `/clear` to `BuiltinOperation::ResetSession`. `SessionCommandHost` sends `InteractiveControl::Reset`.
+`makima-agent/src/command.rs` maps builtin `/new` and alias `/clear` to `BuiltinOperation::ResetSession`. `SessionCommandHost` sends `InteractiveControl::Reset`.
 
-`maki-agent/src/headless.rs::apply_interactive_control` replaces the model history with an empty list and records that empty history in the existing session store. It does not create a new `SessionRef`, replace the ACP `SessionId`, or ask the client to clear its transcript.
+`makima-agent/src/headless.rs::apply_interactive_control` replaces the model history with an empty list and records that empty history in the existing session store. It does not create a new `SessionRef`, replace the ACP `SessionId`, or ask the client to clear its transcript.
 
 This behavior explains the manual result: future turns have empty model context, while Zed still shows prior messages under the same session.
 
 ### `/cd` stores the requested path instead of the canonical result
 
-`maki-agent/src/headless.rs::apply_interactive_control` canonicalizes the requested path, verifies that it is a directory, updates the agent working directory, updates permission state, and persists the canonical path.
+`makima-agent/src/headless.rs::apply_interactive_control` canonicalizes the requested path, verifies that it is a directory, updates the agent working directory, updates permission state, and persists the canonical path.
 
 The control reply contains only `Result<(), String>`. After success, `SessionCommandHost` stores the original requested `PathBuf` in `SessionCommandState`. Relative paths and symlinked paths can therefore disagree with the path used by the headless agent.
 
-`maki-acp/src/server.rs::start_event_pump` also captures the session startup directory by value. Later tool-call locations in `maki-acp/src/translate.rs` continue to resolve relative paths against that stale directory after `/cd`.
+`makima-acp/src/server.rs::start_event_pump` also captures the session startup directory by value. Later tool-call locations in `makima-acp/src/translate.rs` continue to resolve relative paths against that stale directory after `/cd`.
 
 ### `/compact` has no ACP translation and no immediate checkpoint
 
-`InteractiveControl::Compact` calls `agent::compact` over the live history and event sender. Agent events include `AutoCompacting` and `CompactionDone`, but `maki-acp/src/server.rs::start_event_pump` has no translation for either event.
+`InteractiveControl::Compact` calls `agent::compact` over the live history and event sender. Agent events include `AutoCompacting` and `CompactionDone`, but `makima-acp/src/server.rs::start_event_pump` has no translation for either event.
 
 The headless session store records history after normal agent turns. The compact control path does not call `SessionStore::record_turn` after compaction. A successful manual compaction can remain only in memory until another turn triggers persistence.
 
 ### `/btw` uses primary-turn semantics in ACP
 
-`SessionCommandHost` converts `BuiltinOperation::QuickQuestion` to a normal `AgentTurn`. `maki-acp/src/server.rs::send_command_turn` sends it through the primary interactive agent input channel with the current mode, tools, Fast state, Workflow state, and normal history mutation.
+`SessionCommandHost` converts `BuiltinOperation::QuickQuestion` to a normal `AgentTurn`. `makima-acp/src/server.rs::send_command_turn` sends it through the primary interactive agent input channel with the current mode, tools, Fast state, Workflow state, and normal history mutation.
 
-The TUI implementation in `maki-ui/src/app/btw.rs` has different semantics. It copies the shared history, closes dangling tool calls in the copy, appends a side-question reminder, supplies an empty tool list, calls the current provider directly, and streams into a modal. It does not append the question or answer to primary model history.
+The TUI implementation in `makima-ui/src/app/btw.rs` has different semantics. It copies the shared history, closes dangling tool calls in the copy, appends a side-question reminder, supplies an empty tool list, calls the current provider directly, and streams into a modal. It does not append the question or answer to primary model history.
 
 ACP cannot display a TUI modal. It can still preserve the model isolation contract and stream the answer as ACP agent-message chunks. The answer will remain visible in Zed's transcript.
 
 ### `/automode` state is private to the Bash plugin
 
-`plugins/bash/bash_helpers.lua` stores `auto_mode_on` in module state. `plugins/bash/init.lua` initializes it from plugin options. The `/automode` handler toggles that module field and calls `maki.ui.flash`.
+`plugins/bash/bash_helpers.lua` stores `auto_mode_on` in module state. `plugins/bash/init.lua` initializes it from plugin options. The `/automode` handler toggles that module field and calls `makima.ui.flash`.
 
 The command result contains neither the previous value nor the resulting value. ACP cannot read the initial state, set an explicit value, validate a selector request, or observe a later change. Inferring state from a completed Lua handler is not reliable.
 
@@ -225,7 +225,7 @@ A Bash-specific ACP hook would fix one command but leave plugin-owned state unpr
 An illustrative Lua shape is:
 
 ```lua
-local auto_mode = maki.api.register_session_option({
+local auto_mode = makima.api.register_session_option({
   id = "bash.auto_mode",
   name = "Bash auto mode",
   description = "Classify each bash command before execution",
@@ -314,7 +314,7 @@ The ACP event pump must not retain a startup-only copy. It can read a shared dir
 
 ### Isolated-turn runtime
 
-Factor the provider-level semantics used by `maki-ui/src/app/btw.rs` into a frontend-neutral agent service. The TUI can continue rendering a modal. ACP can translate the same stream to agent-message chunks.
+Factor the provider-level semantics used by `makima-ui/src/app/btw.rs` into a frontend-neutral agent service. The TUI can continue rendering a modal. ACP can translate the same stream to agent-message chunks.
 
 The service should accept copied history, current provider and model, resolved system text, images, cancellation, and an output event sink. It should enforce an empty tool list and return no history mutation.
 
@@ -324,7 +324,7 @@ Do not emulate `/btw` by submitting a specially worded normal `AgentInput`. A pr
 
 ### Registry ownership and crate placement
 
-`maki-commands` owns command metadata and dispatch but currently has no dependency on agent state or Lua. `maki-agent` owns the live session state and is the likely home for session-option runtime behavior. `maki-lua` must register plugin options through per-state app data. The implementation should decide whether definitions live in a small neutral crate or whether `maki-agent` owns the complete registry and exposes a narrow handle to `maki-lua`.
+`makima-commands` owns command metadata and dispatch but currently has no dependency on agent state or Lua. `makima-agent` owns the live session state and is the likely home for session-option runtime behavior. `makima-lua` must register plugin options through per-state app data. The implementation should decide whether definitions live in a small neutral crate or whether `makima-agent` owns the complete registry and exposes a narrow handle to `makima-lua`.
 
 The choice must avoid a dependency cycle and must not make ACP types part of the core abstraction.
 
@@ -449,31 +449,31 @@ The option-registry design should be reviewed before steps 4 through 6 become a 
 
 Core command contracts and behavior:
 
-- `maki-commands/src/dispatch.rs`
-- `maki-commands/src/spec.rs`
-- `maki-agent/src/command.rs`
-- `maki-agent/src/headless.rs`
-- `maki-agent/src/types.rs`
-- `maki-agent/src/agent/compaction.rs`
-- `maki-agent/src/agent/history.rs`
+- `makima-commands/src/dispatch.rs`
+- `makima-commands/src/spec.rs`
+- `makima-agent/src/command.rs`
+- `makima-agent/src/headless.rs`
+- `makima-agent/src/types.rs`
+- `makima-agent/src/agent/compaction.rs`
+- `makima-agent/src/agent/history.rs`
 
 ACP projection and lifecycle:
 
-- `maki-acp/src/server.rs`
-- `maki-acp/src/methods.rs`
-- `maki-acp/src/translate.rs`
-- `maki-acp/src/lib.rs`
+- `makima-acp/src/server.rs`
+- `makima-acp/src/methods.rs`
+- `makima-acp/src/translate.rs`
+- `makima-acp/src/lib.rs`
 
 TUI semantics to preserve or extract:
 
-- `maki-ui/src/app/btw.rs`
-- `maki-ui/src/agent/agent_loop.rs`
-- `maki-ui/src/app/mod.rs`
+- `makima-ui/src/app/btw.rs`
+- `makima-ui/src/agent/agent_loop.rs`
+- `makima-ui/src/app/mod.rs`
 
 Lua option registration and Bash migration:
 
-- `maki-lua/src/api/tool.rs`
-- `maki-lua/src/api/util/command.rs`
+- `makima-lua/src/api/tool.rs`
+- `makima-lua/src/api/util/command.rs`
 - related Lua state app-data and plugin-publication code found during implementation
 - `plugins/bash/init.lua`
 - `plugins/bash/bash_helpers.lua`
@@ -490,16 +490,16 @@ Documentation:
 Use the cheapest affected checks while iterating:
 
 ```text
-cargo check -p maki-commands --tests
-cargo check -p maki-agent --tests
-cargo check -p maki-acp --tests
-cargo check -p maki-lua --tests
-cargo check -p maki-ui --tests
-cargo nextest run -p maki-commands
-cargo nextest run -p maki-agent
-cargo nextest run -p maki-acp
-cargo nextest run -p maki-lua
-cargo nextest run -p maki-ui
+cargo check -p makima-commands --tests
+cargo check -p makima-agent --tests
+cargo check -p makima-acp --tests
+cargo check -p makima-lua --tests
+cargo check -p makima-ui --tests
+cargo nextest run -p makima-commands
+cargo nextest run -p makima-agent
+cargo nextest run -p makima-acp
+cargo nextest run -p makima-lua
+cargo nextest run -p makima-ui
 just gen-docs-check
 ```
 

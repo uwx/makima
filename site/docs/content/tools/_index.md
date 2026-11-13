@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Makima ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Makima ships with 27 built-in tools in this reference (26 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -18,11 +18,11 @@ Commands run in <cwd> by default.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `background` | boolean | no |  | Run in the background and return at once; the result arrives as a message when it ends. |
-| `command` | string | yes |  | The bash command to execute |
-| `description` | string | no |  | Short description (3-5 words) of what the command does |
-| `timeout` | integer | no | 120 | Execution timeout in seconds |
 | `workdir` | string | no | cwd | Working directory |
+| `timeout` | integer | no | 120 | Execution timeout in seconds |
+| `command` | string | yes |  | The bash command to execute |
+| `background` | boolean | no |  | Run in the background and return at once; the result arrives as a message when it ends. |
+| `description` | string | no |  | Short description (3-5 words) of what the command does |
 
 ### `list` {#list}
 
@@ -38,9 +38,9 @@ Read a file. Returns contents with line numbers (1-indexed).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `limit` | integer | yes | Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines). |
 | `offset` | integer | yes | Line number to start from (1-indexed). Use 1 for the first line. |
 | `path` | string | yes | Absolute path to the file |
+| `limit` | integer | yes | Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines). |
 
 ### `write` {#write}
 
@@ -57,10 +57,10 @@ Replace an exact string match in a file.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `new_string` | string | yes |  | Replacement string |
-| `old_string` | string | yes |  | Exact string to find (must match uniquely unless replace_all is true) |
-| `path` | string | yes |  | Absolute path to the file |
 | `replace_all` | boolean | no | false | Replace all occurrences |
+| `path` | string | yes |  | Absolute path to the file |
+| `old_string` | string | yes |  | Exact string to find (must match uniquely unless replace_all is true) |
+| `new_string` | string | yes |  | Replacement string |
 
 ### `multiedit` {#multiedit}
 
@@ -78,10 +78,10 @@ Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `end` | integer | yes | Last line, inclusive |
-| `new_string` | string | yes | Replacement text |
-| `path` | string | yes | Absolute path to the file |
 | `start` | integer | yes | First line (1-indexed) |
+| `path` | string | yes | Absolute path to the file |
+| `new_string` | string | yes | Replacement text |
+| `end` | integer | yes | Last line, inclusive |
 
 ### `insert_lines` <span class="badge badge-optin">opt-in</span> {#insert_lines}
 
@@ -89,9 +89,9 @@ Insert `new_string` after line `line`, or at the top with 0. Only include new li
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `path` | string | yes | Absolute path to the file |
 | `line` | integer | yes | Line number to insert after (1-indexed). Use 0 to insert at the top. |
 | `new_string` | string | yes | Text to insert |
-| `path` | string | yes | Absolute path to the file |
 
 ### `glob` {#glob}
 
@@ -99,8 +99,8 @@ Find files by glob pattern.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `path` | string | no | cwd | Directory to search in |
 | `pattern` | string | yes |  | Glob pattern (e.g. **/*.rs, src/**/*.ts) |
+| `path` | string | no | cwd | Directory to search in |
 
 ### `grep` {#grep}
 
@@ -108,12 +108,12 @@ Search file contents using regex.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `context_after` | integer | no |  | Context lines after match |
-| `context_before` | integer | no |  | Context lines before match |
 | `include` | string | no |  | File glob filter (e.g. *.c) |
-| `limit` | integer | no |  | Max match groups to return |
 | `path` | string | no | cwd | Directory to search in |
 | `pattern` | string | yes |  | Regex pattern |
+| `context_after` | integer | no |  | Context lines after match |
+| `limit` | integer | no |  | Max match groups to return |
+| `context_before` | integer | no |  | Context lines before match |
 
 ### `index` {#index}
 
@@ -147,8 +147,8 @@ Execute Python in a sandbox where every tool is an async function.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `code` | string | yes |  | Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. |
 | `timeout` | integer | no | 30 | Script execution timeout in seconds |
+| `code` | string | yes |  | Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. |
 
 ### `plan_submit` {#plan_submit}
 
@@ -178,11 +178,11 @@ Start a background subagent and return {task_id, turn_id} immediately. Observe r
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `description` | string | yes | Short (3-5 words) description of the task |
-| `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
-| `output_schema` | object | no | JSON Schema the subagent's final result must match. task_wait returns the validated object in result.captured; result.text contains assistant text. |
-| `prompt` | string | yes | Detailed task prompt for the agent |
-| `subagent_type` | string | no | Subagent type: "research" (read-only, default), "general" (can modify files), or "plan_reviewer" (read-only plan audit, plan mode only) |
 | `thinking` | string | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
+| `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
+| `prompt` | string | yes | Detailed task prompt for the agent |
+| `output_schema` | object | no | JSON Schema the subagent's final result must match. task_wait returns the validated object in result.captured; result.text contains assistant text. |
+| `subagent_type` | string | no | Subagent type: "research" (read-only, default), "general" (can modify files), or "plan_reviewer" (read-only plan audit, plan mode only) |
 
 ### `task_wait` {#task_wait}
 
@@ -190,9 +190,9 @@ Wait for one exact task turn. Omit turn_id to select the latest turn once. Messa
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `turn_id` | string | no | Exact admitted turn. Omit to snapshot the latest retained turn once. |
 | `task_id` | string | yes | Task id returned by task_spawn. |
 | `timeout` | integer | no | Observation timeout in seconds. Zero checks without waiting; timeout never cancels work. |
-| `turn_id` | string | no | Exact admitted turn. Omit to snapshot the latest retained turn once. |
 
 ### `task_send` {#task_send}
 
@@ -200,8 +200,8 @@ Submit follow-up instructions to a background subagent and return { queued = tru
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `message` | string | yes | Follow-up instructions for the subagent. |
 | `task_id` | string | yes | Task id returned by task_spawn. |
+| `message` | string | yes | Follow-up instructions for the subagent. |
 
 ### `task_despawn` {#task_despawn}
 
@@ -234,8 +234,8 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `command` | string | yes | - `list [tags]`: tag-grouped index, no bodies.<br>- `read path\|tags`: one body (path) or collated bodies (tags).<br>- `write path tags content`: create or overwrite a note.<br>- `delete path` |
-| `content` | string | no | Body for write (frontmatter added automatically). |
 | `path` | string | no | Relative path, e.g. 'architecture.md'. |
+| `content` | string | no | Body for write (frontmatter added automatically). |
 | `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
 
 ### `skill` {#skill}
@@ -246,6 +246,17 @@ Load a skill that provides instructions and workflows for specific tasks.
 |-----------|------|----------|-------------|
 | `name` | string | yes | Name of the skill to load |
 
+### `inherit` {#inherit}
+
+Discover and import configuration and history left on this machine by other coding agents (Claude Code, Cursor, Windsurf, Gemini CLI, Codex, Cline, Copilot Chat, oh-my-pi, Continue).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | no | Import only the entry with this name (rule label, skill name, memory name or conversation id). |
+| `kind` | string | no | What to import. Required for import; optional for scan. `all` imports every kind at once (conversations are limited to this project's); `conversations-everywhere` imports every chat on the machine into the project its transcript recorded. |
+| `action` | string | no | What to do. Defaults to scan. |
+| `source` | string | no | Only consider this harness (claude, codex, omp, gemini, cline, copilot, continue). |
+
 ## Web
 
 ### `webfetch` {#webfetch}
@@ -254,9 +265,9 @@ Fetch a URL and return its contents.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `format` | string | no |  | Output format: markdown (default), text, or html |
-| `timeout` | integer | no | 30, max 120 | Timeout in seconds |
 | `url` | string | yes |  | URL to fetch (http:// or https://) |
+| `timeout` | integer | no | 30, max 120 | Timeout in seconds |
+| `format` | string | no |  | Output format: markdown (default), text, or html |
 
 ### `websearch` {#websearch}
 
@@ -266,15 +277,3 @@ Search the web for real-time information using Exa AI.
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
-## Additional tools
-
-### `inherit` {#inherit}
-
-Discover and import configuration and history left on this machine by other coding agents (Claude Code, Cursor, Windsurf, Gemini CLI, Codex, Cline, Copilot Chat, oh-my-pi, Continue).
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `action` | string | no | What to do. Defaults to scan. |
-| `kind` | string | no | What to import. Required for import; optional for scan. `all` imports every kind at once (conversations are limited to this project's); `conversations-everywhere` imports every chat on the machine into the project its transcript recorded. |
-| `name` | string | no | Import only the entry with this name (rule label, skill name, memory name or conversation id). |
-| `source` | string | no | Only consider this harness (claude, codex, omp, gemini, cline, copilot, continue). |

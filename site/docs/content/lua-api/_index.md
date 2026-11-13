@@ -2861,13 +2861,13 @@ end
 
 ---
 
-### `maki.env.shell()` {#maki-env-shell}
+### `makima.env.shell()` {#makima-env-shell}
 
 ```lua
-maki.env.shell()
+makima.env.shell()
 ```
 
-Which shell `maki.fn.jobstart` and the `bash` tool run on Windows:
+Which shell `makima.fn.jobstart` and the `bash` tool run on Windows:
 `"bash"`, `"cmd"` or `"powershell"`. Always `"bash"` elsewhere.
 
 A plugin that builds command text should match this: quoting, syntax
@@ -2880,7 +2880,7 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-if maki.env.shell() ~= "bash" then
+if makima.env.shell() ~= "bash" then
   return { llm_output = "this tool needs bash", is_error = true }
 end
 ```
@@ -3150,10 +3150,10 @@ local encoded = makima.base64.encode(buf)
 
 ---
 
-### `maki.fs.read_head()` {#maki-fs-read_head}
+### `makima.fs.read_head()` {#makima-fs-read_head}
 
 ```lua
-maki.fs.read_head({path}, {max_bytes})
+makima.fs.read_head({path}, {max_bytes})
 ```
 
 Read at most {max_bytes} bytes from the start of the file at {path} as a
@@ -3173,7 +3173,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local head = maki.fs.read_head("session.jsonl", 65536)
+local head = makima.fs.read_head("session.jsonl", 65536)
 ```
 
 ---
@@ -4609,6 +4609,8 @@ Lists sessions stored for the current project. Answered from a
 background scan, so a slow disk never blocks the UI. `open_elsewhere` is
 true while another makima instance has the session open. `message_count`
 counts main transcript messages only and excludes subagent histories.
+A window that follows an agent over ACP asks that agent, and the agent's
+sessions carry no `cwd`.
 
 **Returns:** (`table|nil`, `string|nil`) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 
@@ -5831,6 +5833,7 @@ parser language for a given filetype later with `get_lang()`.
 
 ```lua
 makima.treesitter.language.register("tsx", { "tsx", "jsx" })
+makima.treesitter.language.register("typescript", { "ts", "tsx" })
 ```
 
 ---
@@ -5854,8 +5857,10 @@ a grammar with that name exists. Returns nil when nothing matches.
 **Example:**
 
 ```lua
-maki.treesitter.language.register("tsx", { "tsx", "jsx" })
+makima.treesitter.language.register("tsx", { "tsx", "jsx" })
 local lang = makima.treesitter.language.get_lang("jsx") -- "tsx"
+local lang = makima.treesitter.language.get_lang("tsx")
+if lang then print(lang) end -- "typescript"
 ```
 
 ---
@@ -5879,6 +5884,8 @@ Returns all filetypes that have been registered for {lang}.
 ```lua
 local fts = makima.treesitter.language.get_filetypes("tsx")
 -- { "tsx", "jsx" }
+local fts = makima.treesitter.language.get_filetypes("typescript")
+-- { "ts", "tsx" }
 ```
 
 ---

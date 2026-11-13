@@ -61,8 +61,8 @@ makima acp --listen 127.0.0.1:7331 --token my-token
 Every connection opens with a handshake line, so a client that cannot name the token never reaches the agent:
 
 ```
-client -> {"maki":"lan","version":1,"token":"..."}
-server -> {"maki":"lan","version":1,"ok":true}
+client -> {"makima":"lan","version":1,"token":"..."}
+server -> {"makima":"lan","version":1,"ok":true}
 ```
 
 After that, ACP messages flow one JSON-RPC message per line. A refused handshake answers `{"ok":false,"error":"unauthorized"}` and closes the connection.
@@ -90,7 +90,7 @@ The listener speaks plain TCP, and the token is its only gate. Use it on a netwo
 A connection that owns a session can open a listener for it later, without a restart:
 
 ```json
-{"jsonrpc":"2.0","id":4,"method":"maki/share","params":{"bind":"0.0.0.0:7331","token":"..."}}
+{"jsonrpc":"2.0","id":4,"method":"makima/share","params":{"bind":"0.0.0.0:7331","token":"..."}}
 ```
 
 Both fields are optional: `bind` defaults to every interface on a port the system picks, and `token` to `MAKIMA_LAN_TOKEN` or the stored `lan-token`.
@@ -99,7 +99,7 @@ Both fields are optional: `bind` defaults to every interface on a port the syste
 {"bind":"0.0.0.0:60667","address":"192.168.2.4:60667","link":"lan://192.168.2.4:60667","token":"..."}
 ```
 
-`bind` is what the agent bound, `address` what another machine reaches, `link` the agent address a client sets, and `token` what it presents in the handshake. The token is `MAKIMA_LAN_TOKEN` when set, then the stored `lan-token`. Asking twice answers the same listener. `maki/unshare` closes it, and so does ending the connection that opened it.
+`bind` is what the agent bound, `address` what another machine reaches, `link` the agent address a client sets, and `token` what it presents in the handshake. The token is `MAKIMA_LAN_TOKEN` when set, then the stored `lan-token`. Asking twice answers the same listener. `makima/unshare` closes it, and so does ending the connection that opened it.
 
 Only the connection that owns the session can share it: a watching connection gets `-32014`, even while it holds control. A share that cannot bind answers `-32013`.
 
@@ -109,10 +109,10 @@ The desktop window has the same thing as a status bar toggle. `Share` opens the 
 
 ### Finding a session on the local network
 
-While a listener is open, the agent announces it over mDNS as `_maki._tcp`, so a client on the same network finds it without being told an address:
+While a listener is open, the agent announces it over mDNS as `_makima._tcp`, so a client on the same network finds it without being told an address:
 
 ```
-makima on LITTLESCREAMER._maki._tcp.local.
+makima on LITTLESCREAMER._makima._tcp.local.
   project=makima
   version=1
   192.168.2.4:47445
@@ -120,23 +120,23 @@ makima on LITTLESCREAMER._maki._tcp.local.
 
 The name is the project directory and the machine, and `project` repeats the directory for clients that show a list. The token is never announced: reaching the session still needs it, so discovery only replaces typing the address.
 
-The announcement follows the listener. It appears when `--listen`, `--share` or `maki/share` opens one and is withdrawn when it closes. A listener bound to loopback is not announced, because no other machine can reach it.
+The announcement follows the listener. It appears when `--listen`, `--share` or `makima/share` opens one and is withdrawn when it closes. A listener bound to loopback is not announced, because no other machine can reach it.
 
 ### Watching a session
 
-While a connection owns a session, other connections can attach to it. `maki/live` lists what this process serves:
+While a connection owns a session, other connections can attach to it. `makima/live` lists what this process serves:
 
 ```json
 {"sessions":[{"sessionId":"...","watchers":0}]}
 ```
 
-Then send `maki/attach` with the session id:
+Then send `makima/attach` with the session id:
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"maki/attach","params":{"sessionId":"..."}}
+{"jsonrpc":"2.0","id":3,"method":"makima/attach","params":{"sessionId":"..."}}
 ```
 
-Makima first replays what the session already emitted, as the same `session/update` notifications a client already renders, then sends the history the session has committed (see [`maki/ui/committed`](#history)), then streams new updates live. The reply follows the replay:
+Makima first replays what the session already emitted, as the same `session/update` notifications a client already renders, then sends the history the session has committed (see [`makima/ui/committed`](#history)), then streams new updates live. The reply follows the replay:
 
 ```json
 {"sessionId":"...","readOnly":false,"replayed":12,"truncated":false,"configOptions":[...]}
@@ -168,15 +168,15 @@ There is no driver. Every connection attached to a session may prompt, cancel, a
 A permission question goes to every window, so the person nearest any of them can answer it. Every window receives the same `session/request_permission` request, and each answers with the ACP response it already knows; the connection that owns the session takes the first answer and tells the others the question is settled:
 
 ```json
-{"method":"maki/ui/permission_done","params":{"requestId":41}}
+{"method":"makima/ui/permission_done","params":{"requestId":41}}
 ```
 
-A window that receives it closes the question without answering. Pickers and completions still go to the window that asked for the work in flight; if that window is gone, they go to the connection that owns the session. `maki/take_control` still answers `{"controller":true}` for older clients; nothing has to be taken.
+A window that receives it closes the question without answering. Pickers and completions still go to the window that asked for the work in flight; if that window is gone, they go to the connection that owns the session. `makima/take_control` still answers `{"controller":true}` for older clients; nothing has to be taken.
 
 Every connection that shows the session, the owner's included, hears when a turn starts and ends, so it can label a turn another window runs and know whether Stop would do anything:
 
 ```json
-{"method":"maki/ui/turn","params":{"running":true}}
+{"method":"makima/ui/turn","params":{"running":true}}
 ```
 
 A prompt another window sends arrives as a `user_message_chunk` update, so every window shows the question and not just the answer.
@@ -186,14 +186,14 @@ A prompt another window sends arrives as a `user_message_chunk` update, so every
 When a turn settles, the session tells every window what it committed:
 
 ```json
-{"method":"maki/ui/committed","params":{"sessionId":"...","messages":[...],"replace":false,"compacted":false}}
+{"method":"makima/ui/committed","params":{"sessionId":"...","messages":[...],"replace":false,"compacted":false}}
 ```
 
 Append `messages` to the transcript you keep, or replace it whole when `replace` is true: the session rewound or compacted, and the list is now the complete history. `compacted` says a compaction summary is part of it. A client that just attached receives the whole history the same way, with `replace: true`, so its own copy starts where the session is instead of at the first turn it watches.
 
 The messages are the stored form of Makima's messages, the same shape `session/load` writes. Tool results are included, so a window can draw the whole turn and not only its text. A window that watched the turn already drew it from the updates; this list is what keeps its history, and its resume, rewind and token count, identical to every other window's.
 
-The recording follows the session, not the connection: when any window rewinds, the others receive `maki/ui/rewind` and the recording starts over from the rewound transcript. The session lives as long as the process that runs it; when the connection that owns it ends, the session ends and the others lose it.
+The recording follows the session, not the connection: when any window rewinds, the others receive `makima/ui/rewind` and the recording starts over from the rewound transcript. The session lives as long as the process that runs it; when the connection that owns it ends, the session ends and the others lose it.
 
 ### Changing what future turns use
 
@@ -210,15 +210,15 @@ The window compares the option list after each change of its own and sends only 
 A window that only watches a session asks the agent to compact it, because the transcript to summarize lives there:
 
 ```json
-{"jsonrpc":"2.0","id":8,"method":"maki/compact","params":{"sessionId":"...","instructions":"keep the failing test names"}}
+{"jsonrpc":"2.0","id":8,"method":"makima/compact","params":{"sessionId":"...","instructions":"keep the failing test names"}}
 ```
 
-`instructions` is optional. The call returns when the compaction ends, with the same `stopReason` a prompt gets. Every window sees the `Compact context` tool call while it runs, and the compacted transcript arrives afterwards as a `maki/ui/committed` with `replace: true` and `compacted: true`.
+`instructions` is optional. The call returns when the compaction ends, with the same `stopReason` a prompt gets. Every window sees the `Compact context` tool call while it runs, and the compacted transcript arrives afterwards as a `makima/ui/committed` with `replace: true` and `compacted: true`.
 
 A `!shell` command's output, and anything else the window showed but the user did not type, travels with the prompt instead of being typed into it:
 
 ```json
-{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{"sessionId":"...","prompt":[{"type":"text","text":"run the tests again"}],"_meta":{"maki":{"preamble":[{"role":"user","content":[{"type":"text","text":"shell preamble output: ..."}],"kind":"observation"}]}}}}
+{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{"sessionId":"...","prompt":[{"type":"text","text":"run the tests again"}],"_meta":{"makima":{"preamble":[{"role":"user","content":[{"type":"text","text":"shell preamble output: ..."}],"kind":"observation"}]}}}}
 ```
 
 The messages are the stored form, in the order the agent should read them, before the prompt.
@@ -226,33 +226,33 @@ The messages are the stored form, in the order the agent should read them, befor
 A rewind works the same way, for the same reason:
 
 ```json
-{"jsonrpc":"2.0","id":9,"method":"maki/rewind","params":{"offset":4}}
+{"jsonrpc":"2.0","id":9,"method":"makima/rewind","params":{"offset":4}}
 ```
 
-The reply carries the `draft` the rewound turn started from, which the window puts back in its input box. The others hear `maki/ui/rewind` and rebuild from the transcript that follows.
+The reply carries the `draft` the rewound turn started from, which the window puts back in its input box. The others hear `makima/ui/rewind` and rebuild from the transcript that follows.
 
 ### Moving the session's directory
 
 `/cd` changes where the session's tools run, so it runs where the session lives, and every window is told:
 
 ```json
-{"jsonrpc":"2.0","id":11,"method":"maki/chdir","params":{"sessionId":"...","path":"../other-project"}}
+{"jsonrpc":"2.0","id":11,"method":"makima/chdir","params":{"sessionId":"...","path":"../other-project"}}
 ```
 
 The reply carries the `cwd` the agent resolved, which is canonical and may not be the path that was typed. The session then sends what every window shows:
 
 ```json
-{"method":"maki/ui/cwd","params":{"sessionId":"...","cwd":"/home/you/other-project"}}
+{"method":"makima/ui/cwd","params":{"sessionId":"...","cwd":"/home/you/other-project"}}
 ```
 
-A window follows it: its status bar, its file completions and its own shells use that directory. The session records the last one, so a window that attaches later gets it in the `maki/attach` reply as `cwd` and starts in the right place. A `/cd` typed as a prompt reaches every window the same way, from the loop that ran the command.
+A window follows it: its status bar, its file completions and its own shells use that directory. The session records the last one, so a window that attaches later gets it in the `makima/attach` reply as `cwd` and starts in the right place. A `/cd` typed as a prompt reaches every window the same way, from the loop that ran the command.
 
 A window that follows another process's session starts a new conversation where that session lives. `/new` and `/clear` send ACP's own `session/new`, and only once the agent answers does the window replace the transcript it shows, so the next prompt lands in the new conversation. The choices the window displays (model, thinking, fast, workflow, yolo) go with it as `session/set_config_option` calls, the same way a change made here reaches the agent.
 
 `/rename` also runs where the session lives, because the file it edits is the agent's:
 
 ```json
-{"jsonrpc":"2.0","id":14,"method":"maki/rename","params":{"sessionId":"...","title":"fix the parser"}}
+{"jsonrpc":"2.0","id":14,"method":"makima/rename","params":{"sessionId":"...","title":"fix the parser"}}
 ```
 
 The window asks and reports the agent's answer, so a name that cannot be saved is an error there instead of one this window pretends to keep.
@@ -262,10 +262,10 @@ Picking another stored session in `/sessions` reopens the window on it. The agen
 `/tasks` works anywhere: a window that follows the session still keeps a chat for each subagent, filled from the updates above. `/mcp` reads and toggles the servers where they run:
 
 ```json
-{"jsonrpc":"2.0","id":13,"method":"maki/mcp","params":{"sessionId":"...","toggle":{"server":"fs","enabled":false}}}
+{"jsonrpc":"2.0","id":13,"method":"makima/mcp","params":{"sessionId":"...","toggle":{"server":"fs","enabled":false}}}
 ```
 
-The reply lists every server with its `name`, `transport`, `tools`, `prompts`, `status` (`running`, `connecting`, `disabled`, `failed`, `needs_auth`), the `error` behind a failure and its `url`. A window shows those in its picker and sends a toggle for the one you switch; the agent restarts the connection and the next reply shows the new state. `maki mcp auth` still runs on the machine that hosts the server. `/login` is different: credentials belong to a machine, so a window whose agent runs here can log in and the agent uses the new key straight away. A window attached to another machine asks you to log in there.
+The reply lists every server with its `name`, `transport`, `tools`, `prompts`, `status` (`running`, `connecting`, `disabled`, `failed`, `needs_auth`), the `error` behind a failure and its `url`. A window shows those in its picker and sends a toggle for the one you switch; the agent restarts the connection and the next reply shows the new state. `makima mcp auth` still runs on the machine that hosts the server. `/login` is different: credentials belong to a machine, so a window whose agent runs here can log in and the agent uses the new key straight away. A window attached to another machine asks you to log in there.
 
 `/reload` rebuilds the window's plugins and config where you typed it, then starts the agent again on the same session, so the agent reloads too and keeps listening if it was sharing. A window attached to another machine's agent cannot reload that process, so it asks you to restart.
 
@@ -284,13 +284,13 @@ Each window compares that with what it already shows: the ones that differ go th
 A session that runs subagents streams their rows too. Each one is a normal session update, tagged with the child it belongs to:
 
 ```json
-{"method":"session/update","params":{"sessionId":"...","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reading src/lib.rs"}},"_meta":{"maki":{"subagent":{"id":"0190f...","toolUseId":"tool-7","name":"research","model":"anthropic/claude-opus-4-6"}}}}
+{"method":"session/update","params":{"sessionId":"...","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reading src/lib.rs"}},"_meta":{"makima":{"subagent":{"id":"0190f...","toolUseId":"tool-7","name":"research","model":"anthropic/claude-opus-4-6"}}}}
 ```
 
 A child's turn end is not a session update, so it travels as its own notification:
 
 ```json
-{"jsonrpc":"2.0","method":"maki/subagent/end","params":{"sessionId":"...","end":"completed","subagent":{"id":"0190f...","toolUseId":"tool-7","name":"research"}}}
+{"jsonrpc":"2.0","method":"makima/subagent/end","params":{"sessionId":"...","end":"completed","subagent":{"id":"0190f...","toolUseId":"tool-7","name":"research"}}}
 ```
 
 `end` is `completed`, `cancelled` or `failed`. A window keeps the rows in that child's chat and marks it finished on `end`. The main chat still shows the task tool call, with the summary the subagent reports.
@@ -306,16 +306,16 @@ Build and plan mode decide what the session may write, so a switch runs where th
 The session announces the new mode as `current_mode_update`, and every window follows that announcement instead of assuming its request worked:
 
 ```json
-{"method":"session/update","params":{"sessionId":"...","update":{"sessionUpdate":"current_mode_update","currentModeId":"plan","_meta":{"maki":{"plan":"/home/you/project/.makima/plans/fix-the-parser.md"}}}}}
+{"method":"session/update","params":{"sessionId":"...","update":{"sessionUpdate":"current_mode_update","currentModeId":"plan","_meta":{"makima":{"plan":"/home/you/project/.makima/plans/fix-the-parser.md"}}}}}
 ```
 
-Plan mode carries the file the session drafts into, under the `maki` metadata key, because that file belongs to the session and not to a window. A window that sees the path uses the session's plan in its own plan view; Build mode announces no plan. Because the announcement is the session's, it can also arrive between turns, so a window listens for it on the connection rather than inside a turn. Modes saved with a resumed session arrive the same way.
+Plan mode carries the file the session drafts into, under the `makima` metadata key, because that file belongs to the session and not to a window. A window that sees the path uses the session's plan in its own plan view; Build mode announces no plan. Because the announcement is the session's, it can also arrive between turns, so a window listens for it on the connection rather than inside a turn. Modes saved with a resumed session arrive the same way.
 
 ### When the link drops
 
-A client attached over TCP reconnects on its own. It retries with backoff (from 250 ms, capped at 5 s), runs `initialize` again, asks `maki/live` for the sessions the agent serves, and attaches the one it was watching. The reattach replays the session's updates and its committed history, so the transcript the client missed comes back in order, and a turn that ran while it was away shows up too.
+A client attached over TCP reconnects on its own. It retries with backoff (from 250 ms, capped at 5 s), runs `initialize` again, asks `makima/live` for the sessions the agent serves, and attaches the one it was watching. The reattach replays the session's updates and its committed history, so the transcript the client missed comes back in order, and a turn that ran while it was away shows up too.
 
-The client clears what it draws before the replay, so the transcript is the session as it is now rather than a mix. If `maki/live` no longer lists the session, the window is told the shared session ended while it was disconnected and stops retrying. An agent started by the client itself (stdio or SSH) is not reconnected: that process is the session.
+The client clears what it draws before the replay, so the transcript is the session as it is now rather than a mix. If `makima/live` no longer lists the session, the window is told the shared session ended while it was disconnected and stops retrying. An agent started by the client itself (stdio or SSH) is not reconnected: that process is the session.
 
 ## What works
 
@@ -335,7 +335,7 @@ The client clears what it draws before the replay, so the transcript is the sess
 
 ACP maps the target-scoped central registry to ACP command metadata. Commands that require TUI capabilities are omitted from ACP's advertised command list. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`). ACP hides `/new` and `/clear` because the ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference, reset model history, or mutate the active session. Custom Markdown commands, MCP prompts, and portable Lua commands use the same registry and collision rules as the TUI. See [Commands](/docs/commands/).
 
-ACP itself cannot remove messages from the editor's visible transcript or change the editor's displayed session directory. `/compact` changes only the model context. `/cd` changes Makima's canonical working directory, reports it in the transcript, and announces it as `maki/ui/cwd`; Makima's own windows follow that, but an editor that only speaks ACP can keep displaying its original directory field.
+ACP itself cannot remove messages from the editor's visible transcript or change the editor's displayed session directory. `/compact` changes only the model context. `/cd` changes Makima's canonical working directory, reports it in the transcript, and announces it as `makima/ui/cwd`; Makima's own windows follow that, but an editor that only speaks ACP can keep displaying its original directory field.
 
 Authentication, providers, and permissions come from your normal Makima config. Set up [providers](/docs/providers/) first and ACP sessions just work.
 
