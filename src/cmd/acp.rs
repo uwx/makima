@@ -5,12 +5,12 @@ use std::sync::Arc;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
-use maki_agent::{command, tools::ToolRegistry};
-use maki_config::project;
-use maki_config::{load_env_files, load_permissions};
-use maki_lua::PluginHost;
-use maki_lua::ui_sink::HostUi;
-use maki_storage::StateDir;
+use makima_agent::{command, tools::ToolRegistry};
+use makima_config::project;
+use makima_config::{load_env_files, load_permissions};
+use makima_lua::PluginHost;
+use makima_lua::ui_sink::HostUi;
+use makima_storage::StateDir;
 
 use crate::cli::Cli;
 use crate::setup;
@@ -19,26 +19,26 @@ use crate::setup;
 /// the next run agree.
 struct UiThemes;
 
-impl maki_acp::ThemeSource for UiThemes {
+impl makima_acp::ThemeSource for UiThemes {
     fn names(&self) -> Vec<String> {
-        maki_ui::theme_names()
+        makima_ui::theme_names()
     }
 
-    fn current(&self) -> maki_acp::AcpTheme {
+    fn current(&self) -> makima_acp::AcpTheme {
         palette()
     }
 
-    fn install(&self, name: &str) -> Result<maki_acp::AcpTheme, String> {
-        maki_ui::select_theme(name)?;
+    fn install(&self, name: &str) -> Result<makima_acp::AcpTheme, String> {
+        makima_ui::select_theme(name)?;
         Ok(palette())
     }
 }
 
-fn palette() -> maki_acp::AcpTheme {
-    let (name, colors) = maki_ui::theme_palette();
+fn palette() -> makima_acp::AcpTheme {
+    let (name, colors) = makima_ui::theme_palette();
     colors
         .into_iter()
-        .fold(maki_acp::AcpTheme::new(name), |theme, (role, rgb)| {
+        .fold(makima_acp::AcpTheme::new(name), |theme, (role, rgb)| {
             theme.with_color(role, rgb)
         })
 }
@@ -71,10 +71,10 @@ pub fn run(
         Ok((address, shared, token))
     })
     .transpose()?;
-    maki_providers::model_registry::load_from_storage(&storage);
-    let _instance = maki_storage::instances::InstanceGuard::register(
+    makima_providers::model_registry::load_from_storage(&storage);
+    let _instance = makima_storage::instances::InstanceGuard::register(
         &storage,
-        maki_storage::instances::InstanceKind::Acp,
+        makima_storage::instances::InstanceKind::Acp,
         &cwd,
         None,
     );
@@ -85,13 +85,13 @@ pub fn run(
     let trust = project::resolve(&storage, &cwd, cli.trust_mode());
     load_env_files(&trust.project_config);
 
-    let command_registry = maki_commands::CommandRegistry::new();
+    let command_registry = makima_commands::CommandRegistry::new();
     let commands = if cli.no_commands {
         Vec::new()
     } else {
         command::discover_commands(&cwd, &trust.project_config)
     };
-    let ui = maki_acp::ui::UiChannel::new();
+    let ui = makima_acp::ui::UiChannel::new();
     let mut plugin_host = PluginHost::with_command_registry(
         Arc::clone(ToolRegistry::global_arc()),
         command_registry.clone(),
@@ -112,7 +112,7 @@ pub fn run(
         .unwrap_or_default()
         .into_config()
         .context("invalid config")?;
-    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     config.permissions = load_permissions(&trust.project_config)?;
 
     if yolo || config.always_yolo {
@@ -126,7 +126,7 @@ pub fn run(
     }
     config.validate()?;
 
-    let timeouts = maki_providers::Timeouts::from(&config.provider);
+    let timeouts = makima_providers::Timeouts::from(&config.provider);
 
     plugin_host
         .load_builtins(&config.plugins)
@@ -135,7 +135,7 @@ pub fn run(
     let providers = plugin_host
         .provider_registry(timeouts)
         .context("build provider registry")?;
-    let catalog = maki_lua::orchestration::ModelCatalog::offline(
+    let catalog = makima_lua::orchestration::ModelCatalog::offline(
         Arc::clone(&providers),
         &config.provider.model_policy,
     );
@@ -143,7 +143,7 @@ pub fn run(
         &command_registry,
         &commands,
         command::StandardCompletions {
-            model: Some(Arc::new(maki_acp::completion::ModelArgSource::new(
+            model: Some(Arc::new(makima_acp::completion::ModelArgSource::new(
                 catalog.specs(),
                 Arc::clone(&providers),
             ))),
@@ -163,7 +163,7 @@ pub fn run(
     let lua_event_handle = plugin_host.event_handle();
     let yolo = config.permissions.yolo;
 
-    let params = maki_acp::AcpParams {
+    let params = makima_acp::AcpParams {
         model,
         config: config.agent,
         permissions_config: config.permissions,
@@ -191,17 +191,17 @@ pub fn run(
         Some((address, shared, token)) => {
             eprintln!("ACP listening on {address}; LAN token: {token}");
             if shared {
-                maki_acp::run_shared(params, address, token)
+                makima_acp::run_shared(params, address, token)
             } else {
-                maki_acp::run_tcp(params, address, token)
+                makima_acp::run_tcp(params, address, token)
             }
         }
-        None => maki_acp::run(params),
+        None => makima_acp::run(params),
     }
 }
 
 /// The token a TCP client must present: `--token`, then `MAKIMA_LAN_TOKEN`,
 /// then the one stored for this machine, generated on first use.
 fn lan_token(storage: &StateDir) -> Result<String> {
-    maki_lan::token(storage.path()).context("read the LAN token")
+    makima_lan::token(storage.path()).context("read the LAN token")
 }

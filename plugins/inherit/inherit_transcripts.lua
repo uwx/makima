@@ -43,7 +43,7 @@ local function decode_jsonl(text)
   local out = {}
   for line in text:gmatch("([^\n]*)\n?") do
     if line ~= "" then
-      local ok, value = pcall(maki.json.decode, line)
+      local ok, value = pcall(makima.json.decode, line)
       if ok and type(value) == "table" then
         out[#out + 1] = value
       end
@@ -165,7 +165,7 @@ function M.codex(text)
         if id and payload.name then
           local input = payload.arguments or payload.input
           if type(input) == "string" then
-            local ok, decoded = pcall(maki.json.decode, input)
+            local ok, decoded = pcall(makima.json.decode, input)
             input = ok and decoded or { input = input }
           end
           push_message(messages, "assistant", {
@@ -232,7 +232,7 @@ end
 
 -- Gemini CLI chat snapshots: a flat `messages` array, role in `type`.
 function M.gemini(text)
-  local ok, data = pcall(maki.json.decode, text)
+  local ok, data = pcall(makima.json.decode, text)
   if not ok or type(data) ~= "table" or type(data.messages) ~= "table" then
     return { messages = {} }
   end
@@ -263,7 +263,7 @@ end
 
 -- Continue's session files keep a `history` array of `{ message = ... }`.
 function M.continue(text)
-  local ok, data = pcall(maki.json.decode, text)
+  local ok, data = pcall(makima.json.decode, text)
   if not ok or type(data) ~= "table" or type(data.history) ~= "table" then
     return { messages = {}, title = type(data) == "table" and data.title or nil }
   end
@@ -290,7 +290,7 @@ end
 -- Cline keeps a UI event log; user turns and assistant text are enough for a
 -- readable transcript, tool chatter is left out on purpose.
 function M.cline(text)
-  local ok, data = pcall(maki.json.decode, text)
+  local ok, data = pcall(makima.json.decode, text)
   if not ok or type(data) ~= "table" then
     return { messages = {} }
   end
@@ -506,11 +506,11 @@ end
 
 -- makima's own writer starts every record with `{"t":"header"`, `{"t":"msg"`
 -- or `{"t":"meta"` and its session scanner matches those bytes as a prefix to
--- count messages and find the title. maki's JSON encoder orders object keys,
+-- count messages and find the title. makima's JSON encoder orders object keys,
 -- so `t` would not come first; the prefix is therefore written by hand and
 -- only the payload goes through the encoder.
 local function string_field(value)
-  return maki.json.encode(value)
+  return makima.json.encode(value)
 end
 
 function M.session_jsonl(converted, id, cwd, model, now)
@@ -531,7 +531,7 @@ function M.session_jsonl(converted, id, cwd, model, now)
         record.created_at
       )
     elseif record.t == "msg" then
-      encoded, err = maki.json.encode(record.d)
+      encoded, err = makima.json.encode(record.d)
       if encoded then
         encoded = '{"t":"msg","d":' .. encoded .. "}"
       end
@@ -540,7 +540,7 @@ function M.session_jsonl(converted, id, cwd, model, now)
       -- then put it back at the front. The loader parses the whole object, but
       -- the session scanner needs the literal prefix to find the title.
       local body = { title = record.title, token_usage = record.token_usage, updated_at = record.updated_at }
-      encoded, err = maki.json.encode(body)
+      encoded, err = makima.json.encode(body)
       if encoded then
         encoded = '{"t":"meta",' .. encoded:sub(2)
       end

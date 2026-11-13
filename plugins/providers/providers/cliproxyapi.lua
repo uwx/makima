@@ -18,7 +18,7 @@ M.BASE_URL_ENV = "CLIPROXYAPI_BASE_URL"
 M.DEFAULT_BASE_URL = "http://127.0.0.1:8317/v1"
 -- Any value works here: asking for a client version is what switches
 -- `/v1/models` to the rich catalog.
-M.CLIENT_VERSION = "maki"
+M.CLIENT_VERSION = "makima"
 M.API_SUFFIX = "/v1"
 M.CHAT_PATH = "/chat/completions"
 M.MODELS_PATH = "/models"
@@ -41,7 +41,7 @@ end
 -- Where the gateway listens: `base_url` in `providers.toml`, then
 -- `CLIPROXYAPI_BASE_URL`. Nil leaves the default port.
 function M.configured_url(config)
-  return text(config.base_url) or text(maki.uv.os_getenv(M.BASE_URL_ENV))
+  return text(config.base_url) or text(makima.uv.os_getenv(M.BASE_URL_ENV))
 end
 
 -- The port is the address CPA users know, but its API lives under `/v1`, so

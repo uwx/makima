@@ -1,6 +1,6 @@
 local compat = require("providers.openai_compat")
 local http = require("providers.http")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local KEY_ENV = "TEST_API_KEY"
 local BASE = "https://api.example.invalid/v1"
@@ -76,6 +76,18 @@ t.case("base_url_precedence", function()
   end)
   t.with_env({ TEST_BASE_URL = "https://env.invalid" }, function()
     t.eq(compat.base_url(d, { base_url = "https://config.invalid" }), "https://env.invalid")
+  end)
+end)
+
+t.case("base_url_trims_trailing_slashes", function()
+  local d = def()
+  t.with_env({}, function()
+    t.eq(compat.base_url(d, { base_url = "https://config.invalid/" }), "https://config.invalid")
+    t.eq(compat.base_url(d, { base_url = "https://config.invalid///" }), "https://config.invalid")
+    t.eq(compat.base_url(d, { base_url = "https://config.invalid/v1/" }), "https://config.invalid/v1")
+  end)
+  t.with_env({ TEST_BASE_URL = "https://env.invalid//" }, function()
+    t.eq(compat.base_url(d, {}), "https://env.invalid")
   end)
 end)
 
@@ -177,7 +189,7 @@ t.case("stream_rotates_keys_and_reclassifies_errors", function()
     t.eq(ctx.requests[2].headers.Authorization, "Bearer b")
     t.eq(ctx.requests[2].url, BASE .. "/chat/completions")
     t.eq(ctx.requests[2].method, "POST")
-    t.eq(maki.json.decode(ctx.requests[2].body).max_tokens, 512)
+    t.eq(makima.json.decode(ctx.requests[2].body).max_tokens, 512)
   end)
 end)
 

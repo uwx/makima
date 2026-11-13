@@ -18,6 +18,7 @@ Commands run in <cwd> by default.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
+| `background` | boolean | no |  | Run in the background and return at once; the result arrives as a message when it ends. |
 | `command` | string | yes |  | The bash command to execute |
 | `description` | string | no |  | Short description (3-5 words) of what the command does |
 | `timeout` | integer | no | 120 | Execution timeout in seconds |
@@ -210,6 +211,14 @@ Permanently close a background subagent and its descendants, discard pending wor
 |-----------|------|----------|-------------|
 | `task_id` | string | yes | Task id returned by task_spawn. |
 
+### `task_stop` {#task_stop}
+
+Stop a background subagent or a tool call moved to the background. A moved call's final result still arrives as a message. Returns { ok = true }.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `task_id` | string | yes | Task id returned by task_spawn, or the call id of a tool moved to the background. |
+
 ### `todo_write` {#todo_write}
 
 Create or update a structured todo list to track tasks.
@@ -257,7 +266,6 @@ Search the web for real-time information using Exa AI.
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
-
 ## Additional tools
 
 ### `inherit` {#inherit}

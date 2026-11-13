@@ -9,21 +9,21 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
 use crossterm::style::Stylize;
 
-use maki_acp_client::Target;
-use maki_agent::command::{self, CustomCommand};
-use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, ProjectDecision, TrustAnswer, policy_grant};
-use maki_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
-use maki_lua::PluginHost;
-use maki_lua::ui_sink::{HeadlessUi, HostUi};
-use maki_providers::login::is_configured;
-use maki_providers::model::{Model, ModelTier};
-use maki_providers::{ProviderRegistry, Timeouts};
-use maki_storage::StateDir;
-use maki_storage::id::MakiId;
-use maki_storage::session_lock;
-use maki_storage::sessions::SESSIONS_DIR;
-use maki_ui::{AppSession, RemoteSession, RunOutcome};
+use makima_acp_client::Target;
+use makima_agent::command::{self, CustomCommand};
+use makima_agent::tools::ToolRegistry;
+use makima_config::project::{self, ProjectDecision, TrustAnswer, policy_grant};
+use makima_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
+use makima_lua::PluginHost;
+use makima_lua::ui_sink::{HeadlessUi, HostUi};
+use makima_providers::login::is_configured;
+use makima_providers::model::{Model, ModelTier};
+use makima_providers::{ProviderRegistry, Timeouts};
+use makima_storage::StateDir;
+use makima_storage::id::MakimaId;
+use makima_storage::session_lock;
+use makima_storage::sessions::SESSIONS_DIR;
+use makima_ui::{AppSession, RemoteSession, RunOutcome};
 
 use crate::cli::Cli;
 use crate::setup;
@@ -107,7 +107,7 @@ fn load_config(
         .unwrap_or_default()
         .into_config()
         .context("invalid config")?;
-    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     config.permissions = load_permissions(project_config)?;
 
     if cli.yolo || config.always_yolo {
@@ -150,7 +150,7 @@ fn build_stack(
 ) -> Result<(Stack, Vec<String>)> {
     let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
 
-    let command_registry = maki_commands::CommandRegistry::new();
+    let command_registry = makima_commands::CommandRegistry::new();
     let mut plugin_host = PluginHost::with_command_registry(
         Arc::clone(ToolRegistry::global_arc()),
         command_registry,
@@ -273,7 +273,9 @@ fn resolve_session(
     }
 }
 
-/// The session this run continues, or nothing when it starts a new one.
+/// The session this run continues, or nothing when it starts a new one. A
+/// stored session is resumed in the current directory; only one open in
+/// another terminal is refused.
 fn load_resumed(
     last_session: bool,
     session_id: Option<&str>,
@@ -282,19 +284,22 @@ fn load_resumed(
 ) -> Result<Option<AppSession>> {
     let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
     if let Some(raw) = session_id {
-        let id: MakiId = raw
+        let id: MakimaId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
-        let session = AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
-        check_resumable(&sessions_dir, &session, cwd)?;
+        let mut session =
+            AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        refuse_when_open_elsewhere(&sessions_dir, &session)?;
+        session.set_cwd(cwd.to_owned());
         return Ok(Some(session));
     }
     if !last_session {
         return Ok(None);
     }
     match AppSession::latest(cwd, storage) {
-        Ok(Some(session)) => {
-            check_resumable(&sessions_dir, &session, cwd)?;
+        Ok(Some(mut session)) => {
+            refuse_when_open_elsewhere(&sessions_dir, &session)?;
+            session.set_cwd(cwd.to_owned());
             Ok(Some(session))
         }
         Ok(None) => {
@@ -308,14 +313,16 @@ fn load_resumed(
     }
 }
 
-/// Refuses a session this run cannot continue: one stored under another
-/// directory, or open in another terminal.
-fn check_resumable(sessions_dir: &Path, session: &AppSession, cwd: &str) -> Result<()> {
-    let locked = session_lock::open_elsewhere(sessions_dir, &session.id);
-    match session_lock::resume_block(&session.cwd, cwd, locked) {
-        Some(block) => Err(color_eyre::eyre::eyre!("session {}: {block}", session.id)),
-        None => Ok(()),
+/// Refuses a session another terminal holds open.
+fn refuse_when_open_elsewhere(sessions_dir: &Path, session: &AppSession) -> Result<()> {
+    if session_lock::open_elsewhere(sessions_dir, &session.id) {
+        return Err(color_eyre::eyre::eyre!(
+            "session {}: {}",
+            session.id,
+            session_lock::OPEN_ELSEWHERE_MSG
+        ));
     }
+    Ok(())
 }
 
 /// Piped stdin follows the `--prompt` text, or stands alone without it.
@@ -436,7 +443,7 @@ fn hosted_session(cwd: &Path, cli: &Cli, resume: Option<String>) -> Result<Remot
         target = target.resuming(id);
     }
     let connection =
-        maki_acp_client::connect(&target).map_err(|error| eyre!("{AGENT_FAILED}: {error}"))?;
+        makima_acp_client::connect(&target).map_err(|error| eyre!("{AGENT_FAILED}: {error}"))?;
     Ok(RemoteSession {
         connection,
         label: HOSTED_LABEL.to_owned(),
@@ -499,22 +506,22 @@ fn hosted_resume(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Option<Stri
     Ok(load_resumed(cli.last_session, id, cwd, storage)?.map(|session| session.id.to_string()))
 }
 
-pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession>) -> Result<()> {
+pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<makima_ui::RemoteSession>) -> Result<()> {
     if cli.print && session_picker_requested(&cli) {
         bail!(PICKER_NEEDS_TUI_ERR);
     }
     let explicit_model = cli.model.is_some();
     let mut apply_explicit_model = explicit_model;
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load_from_storage(&storage);
+    makima_providers::model_registry::load_from_storage(&storage);
     let mut attached = remote.is_some();
     let mut owned = remote.as_ref().is_some_and(|remote| remote.owned);
     let mut listen = cli.share;
     let _instance = (!cli.print)
         .then(|| {
-            maki_storage::instances::InstanceGuard::register(
+            makima_storage::instances::InstanceGuard::register(
                 &storage,
-                maki_storage::instances::InstanceKind::Tui,
+                makima_storage::instances::InstanceKind::Tui,
                 &cwd,
                 None,
             )
@@ -540,7 +547,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
                 TrustAnswer::Trust
             })
             .or_else(|| {
-                (can_ask && stack.config.trust.prompt).then(|| maki_ui::ask_trust(question))
+                (can_ask && stack.config.trust.prompt).then(|| makima_ui::ask_trust(question))
             })
     });
     match answer {
@@ -672,8 +679,8 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
         );
         warnings.extend(warning);
 
-        let outcome = maki_ui::run(
-            maki_ui::EventLoopParams {
+        let outcome = makima_ui::run(
+            makima_ui::EventLoopParams {
                 cwd: cwd.clone(),
                 model,
                 needs_login: stack.needs_login && !attached,
@@ -686,7 +693,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
                 input_history_size: stack.config.storage.input_history_size,
-                permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
+                permissions: Arc::new(makima_agent::permissions::PermissionManager::new(
                     stack.config.permissions.clone(),
                     cwd.clone(),
                     trust.project_config.clone(),
@@ -833,7 +840,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf, mut remote: Option<maki_ui::RemoteSession
 mod tests {
     use super::*;
     use color_eyre::eyre::eyre;
-    use maki_config::RawConfig;
+    use makima_config::RawConfig;
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use test_case::test_case;
@@ -920,7 +927,7 @@ mod tests {
         let session = AppSession::new("anthropic/claude-opus-4-6", "/tmp");
 
         let (resolved, warning) = restored_session_model(
-            &maki_providers::test_util::configured_ids(&["anthropic", "openai"]),
+            &makima_providers::test_util::configured_ids(&["anthropic", "openai"]),
             &StateDir::from_path(PathBuf::from("/tmp")),
             &startup,
             &session,
@@ -938,7 +945,7 @@ mod tests {
         let session = AppSession::new("anthropic/claude-opus-4-6", "/tmp");
 
         let (resolved, warning) = restored_session_model(
-            &maki_providers::test_util::offline_ids(&["anthropic", "openai"]),
+            &makima_providers::test_util::offline_ids(&["anthropic", "openai"]),
             &StateDir::from_path(PathBuf::from("/tmp")),
             &startup,
             &session,
@@ -1005,14 +1012,14 @@ mod tests {
     #[test]
     fn no_plugins_skips_broken_init_lua_but_keeps_host_alive() {
         use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
+        use makima_agent::tools::ToolRegistry;
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir");
-        let maki_dir: PathBuf = dir.path().join(".makima");
-        fs::create_dir_all(&maki_dir).expect("mkdir .makima");
+        let makima_dir: PathBuf = dir.path().join(".makima");
+        fs::create_dir_all(&makima_dir).expect("mkdir .makima");
         fs::write(
-            maki_dir.join("init.lua"),
+            makima_dir.join("init.lua"),
             "error('broken init lua must not run')",
         )
         .expect("write init.lua");
@@ -1079,22 +1086,22 @@ mod tests {
     const FAKE_PID: u32 = u32::MAX - 1;
 
     #[test]
-    fn resolve_session_rejects_session_from_other_cwd() {
+    fn resolve_session_adopts_the_current_cwd() {
         use tempfile::tempdir;
 
         let tmp = tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let mut session = AppSession::new("test-model", OTHER_CWD);
         session.save(&storage).unwrap();
-        let err = resolve_session(
+        let loaded = resolve_session(
             false,
             Some(&session.id.to_string()),
             "test-model",
             THIS_CWD,
             &storage,
         )
-        .expect_err("a session stored under another cwd must be rejected");
-        assert!(err.to_string().contains(OTHER_CWD));
+        .expect("a session stored under another cwd is resumed");
+        assert_eq!(loaded.cwd, THIS_CWD);
     }
 
     #[test_case(true; "valued_continue")]
@@ -1300,14 +1307,14 @@ mod tests {
     #[test]
     fn broken_init_lua_errors_without_no_plugins() {
         use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
+        use makima_agent::tools::ToolRegistry;
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir");
-        let maki_dir: PathBuf = dir.path().join(".makima");
-        fs::create_dir_all(&maki_dir).expect("mkdir .makima");
+        let makima_dir: PathBuf = dir.path().join(".makima");
+        fs::create_dir_all(&makima_dir).expect("mkdir .makima");
         fs::write(
-            maki_dir.join("init.lua"),
+            makima_dir.join("init.lua"),
             "error('broken init lua must not run')",
         )
         .expect("write init.lua");

@@ -1,5 +1,5 @@
 [package]
-name = "maki"
+name = "makima"
 version.workspace = true
 edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
@@ -17,16 +17,16 @@ name = "makima"
 path = "src/main.rs"
 
 [dependencies]
-maki-ui = { workspace = true }
-maki-agent = { workspace = true }
-maki-acp = { workspace = true }
-maki-lan = { workspace = true }
-maki-acp-client = { workspace = true }
-maki-config = { workspace = true }
-maki-commands = { workspace = true }
-maki-providers = { workspace = true }
-maki-storage = { workspace = true }
-maki-lua = { workspace = true }
+makima-lan = { workspace = true }
+makima-acp-client = { workspace = true }
+makima-ui = { workspace = true }
+makima-agent = { workspace = true }
+makima-acp = { workspace = true }
+makima-config = { workspace = true }
+makima-commands = { workspace = true }
+makima-providers = { workspace = true }
+makima-storage = { workspace = true }
+makima-lua = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 crossterm = { workspace = true }
@@ -46,37 +46,37 @@ event-listener = { workspace = true }
 open = { workspace = true }
 
 [dev-dependencies]
-maki-providers = { workspace = true, features = ["test-util"] }
-maki-storage = { workspace = true, features = ["test-util"] }
-maki-config = { workspace = true, features = ["test-util"] }
-maki-lua = { workspace = true, features = ["test-support"] }
+makima-providers = { workspace = true, features = ["test-util"] }
+makima-storage = { workspace = true, features = ["test-util"] }
+makima-config = { workspace = true, features = ["test-util"] }
+makima-lua = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
 
 [workspace]
 members = [
-  "maki-acp",
-  "maki-acp-client",
-  "maki-domain",
-  "maki-agent",
-  "maki-config",
-  "maki-commands",
-  "maki-desktop",
-  "maki-docgen",
-  "maki-highlight",
-  "maki-interpreter",
-  "maki-lan",
-  "maki-lua",
-  "maki-markdown",
-  "maki-match",
-  "maki-providers",
-  "maki-storage",
-  "maki-config-macro",
-  "maki-lua-macro",
-  "maki-ui",
-  "maki-chat",
-  "maki-mobile",
+  "makima-acp",
+  "makima-acp-client",
+  "makima-domain",
+  "makima-agent",
+  "makima-config",
+  "makima-commands",
+  "makima-desktop",
+  "makima-docgen",
+  "makima-highlight",
+  "makima-interpreter",
+  "makima-lan",
+  "makima-lua",
+  "makima-markdown",
+  "makima-match",
+  "makima-providers",
+  "makima-storage",
+  "makima-config-macro",
+  "makima-lua-macro",
+  "makima-ui",
+  "makima-chat",
+  "makima-mobile",
 ]
 # Forked from longbridge/gpui-mobile: upstream pins its own gpui-pre snapshot,
 # which gpui-kit cannot match. Built only for Android/iOS targets.
@@ -84,6 +84,9 @@ exclude = ["vendor/gpui-mobile"]
 resolver = "3"
 
 [workspace.package]
+# When changing the version, also update the "v<version>" cells on row 0 of
+# makima-ui/src/splash_golden.txt (right-aligned, ending at x=78), or
+# splash::tests::test_splash_lua_matches_rust_golden fails.
 version = "0.5.5-makima"
 edition = "2024"
 authors = ["Luna <luna@l4.pm", "Tony Solomonik <tony.solomonik@gmail.com>"]
@@ -92,24 +95,24 @@ repository = "https://github.com/lun-4/makima"
 rust-version = "1.88"
 
 [workspace.dependencies]
-maki-agent = { path = "maki-agent" }
-maki-domain = { path = "maki-domain" }
-maki-acp = { path = "maki-acp" }
-maki-acp-client = { path = "maki-acp-client" }
-maki-config = { path = "maki-config" }
-maki-commands = { path = "maki-commands" }
-maki-interpreter = { path = "maki-interpreter" }
-maki-providers = { path = "maki-providers" }
-maki-storage = { path = "maki-storage" }
-maki-ui = { path = "maki-ui" }
-maki-chat = { path = "maki-chat" }
-maki-lan = { path = "maki-lan" }
-maki-lua = { path = "maki-lua" }
-maki-config-macro = { path = "maki-config-macro" }
-maki-lua-macro = { path = "maki-lua-macro" }
-maki-highlight = { path = "maki-highlight" }
-maki-markdown = { path = "maki-markdown" }
-maki-match = { path = "maki-match" }
+makima-agent = { path = "makima-agent" }
+makima-domain = { path = "makima-domain" }
+makima-acp = { path = "makima-acp" }
+makima-acp-client = { path = "makima-acp-client" }
+makima-config = { path = "makima-config" }
+makima-commands = { path = "makima-commands" }
+makima-interpreter = { path = "makima-interpreter" }
+makima-providers = { path = "makima-providers" }
+makima-storage = { path = "makima-storage" }
+makima-ui = { path = "makima-ui" }
+makima-chat = { path = "makima-chat" }
+makima-lan = { path = "makima-lan" }
+makima-lua = { path = "makima-lua" }
+makima-config-macro = { path = "makima-config-macro" }
+makima-lua-macro = { path = "makima-lua-macro" }
+makima-highlight = { path = "makima-highlight" }
+makima-markdown = { path = "makima-markdown" }
+makima-match = { path = "makima-match" }
 gpui-kit = "0.9"
 # The same GPUI snapshot gpui-kit pins; a mobile app has to name it directly so
 # `#[gpui::...]` resolves.
@@ -228,11 +231,12 @@ shell-words = "1"
 agent-client-protocol-schema = { version = "0.13", features = ["unstable_boolean_config", "unstable_elicitation"] }
 
 wait-timeout = "0.2"
+
 # Incremental compilation costs ~600MB per session for a workspace member: rustc
 # keeps 256 CGU object files with full debug info plus the dep graph and query
 # cache, and never prunes sessions from build configurations you no longer use.
-# maki-lua alone had 29 sessions (11GB), the workspace 37GB. A full non-incremental
-# maki-lua rebuild is ~30s against ~5s incremental, which is a fair trade.
+# makima-lua alone had 29 sessions (11GB), the workspace 37GB. A full non-incremental
+# makima-lua rebuild is ~30s against ~5s incremental, which is a fair trade.
 
 [profile.dev]
 incremental = false

@@ -44,6 +44,8 @@ local PLAN_MODELS_PATH = "/models?client_version="
 local RESPONSES_PATH = "/responses"
 local CHAT_PATH = "/chat/completions"
 local ACCOUNT_HEADER = "chatgpt-account-id"
+local PROMPT_CACHE_KEY = "prompt_cache_key"
+local SESSION_HEADERS = { "session-id", "x-client-request-id" }
 local AUTH_CLAIMS = "https://api.openai.com/auth"
 local JSON_TYPE = "application/json"
 local FORM_TYPE = "application/x-www-form-urlencoded"
@@ -156,13 +158,13 @@ M.def = {
 
 -- Waits {seconds} without blocking the Lua thread. Specs replace it.
 function M.sleep(seconds)
-  maki.async.await(1, function(done)
-    maki.defer_fn(done, math.ceil(seconds * MILLIS))
+  makima.async.await(1, function(done)
+    makima.defer_fn(done, math.ceil(seconds * MILLIS))
   end)
 end
 
 local function now_ms()
-  local now = maki.time.now()
+  local now = makima.time.now()
   return now.secs * MILLIS + math.floor(now.nanosecs / NANOS_PER_MILLI)
 end
 
@@ -197,8 +199,8 @@ function M.account_id(token)
     return nil
   end
   payload = payload:gsub("%-", "+"):gsub("_", "/")
-  local ok, decoded = pcall(maki.base64.decode, payload .. string.rep("=", -#payload % 4))
-  local claims = ok and maki.json.decode(decoded)
+  local ok, decoded = pcall(makima.base64.decode, payload .. string.rep("=", -#payload % 4))
+  local claims = ok and makima.json.decode(decoded)
   if type(claims) ~= "table" then
     return nil
   end
@@ -281,7 +283,7 @@ end
 -- at the server's interval. Nothing is stored until the tokens arrive, so a
 -- cancelled login leaves the credentials as they were.
 local function chatgpt_login(ctx, ui)
-  local device, err = post(ctx, M.DEVICE_CODE_URL, JSON_TYPE, assert(maki.json.encode({ client_id = CLIENT_ID })))
+  local device, err = post(ctx, M.DEVICE_CODE_URL, JSON_TYPE, assert(makima.json.encode({ client_id = CLIENT_ID })))
   if err then
     return nil, err
   end
@@ -297,7 +299,7 @@ local function chatgpt_login(ctx, ui)
   if not shown then
     return nil, show_err
   end
-  local body = assert(maki.json.encode({ device_auth_id = device.device_auth_id, user_code = device.user_code }))
+  local body = assert(makima.json.encode({ device_auth_id = device.device_auth_id, user_code = device.user_code }))
   local deadline = now_ms() + POLL_TIMEOUT * MILLIS
   while now_ms() < deadline do
     M.sleep(interval)
@@ -389,6 +391,16 @@ local function headers(state, extra, plan)
   end
   for name, value in pairs(state.configured) do
     http.set_header(out, name, value)
+  end
+  return out
+end
+
+-- A stable key keeps one session's requests on the same cache shards, so an
+-- unchanged prefix keeps hitting instead of being spread across them.
+local function session_headers(session)
+  local out = {}
+  for _, name in ipairs(SESSION_HEADERS) do
+    out[name] = session
   end
   return out
 end
@@ -534,10 +546,15 @@ local function stream(state, config, model, ctx, request, emit)
     -- Checked against the live tokens, which may have changed accounts since
     -- the model was prepared.
     body.service_tier = request.fast and fast_eligible(model, state.tokens) and FAST_TIER or nil
+    local extra
+    if state.tokens and request.session_id then
+      body[PROMPT_CACHE_KEY] = request.session_id
+      extra = session_headers(request.session_id)
+    end
     -- The ChatGPT backend keeps its fixed URL; base URL overrides apply to
     -- the platform API only.
     local base = state.tokens and M.BACKEND_URL or state.base
-    return http.post_stream(ctx, base .. RESPONSES_PATH, headers(state, nil, true), body, responses.stream, emit)
+    return http.post_stream(ctx, base .. RESPONSES_PATH, headers(state, extra, true), body, responses.stream, emit)
   end)
 end
 

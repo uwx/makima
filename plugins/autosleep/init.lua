@@ -17,7 +17,7 @@ local RESUME_GAP_SECS = 60
 local DIR_NAME = "autosleep"
 local HEARTBEAT = "working"
 
-local opts = maki.api.register_options({
+local opts = makima.api.register_options({
   idle_secs = {
     default = 120,
     min = 5,
@@ -25,13 +25,13 @@ local opts = maki.api.register_options({
   },
 })
 
-local seed = maki.time.now()
+local seed = makima.time.now()
 local token = seed.secs .. "-" .. seed.nanosecs
-local state_dir = maki.env.state_dir()
-local dir = state_dir and maki.fs.joinpath(state_dir, DIR_NAME)
-local heartbeat = dir and maki.fs.joinpath(dir, token)
+local state_dir = makima.env.state_dir()
+local dir = state_dir and makima.fs.joinpath(state_dir, DIR_NAME)
+local heartbeat = dir and makima.fs.joinpath(dir, token)
 if dir then
-  maki.fs.mkdir(dir, { parents = true })
+  makima.fs.mkdir(dir, { parents = true })
 end
 
 local armed = false
@@ -39,14 +39,14 @@ local quiet_since = nil
 local last_tick = nil
 
 local function now_secs()
-  local t = maki.time.now()
+  local t = makima.time.now()
   return t.secs + t.nanosecs / 1e9
 end
 
 -- No UI (print, ACP) reports no sessions, so a headless run never holds the
 -- sleep back.
 local function local_working()
-  for _, session in ipairs(maki.session.live() or {}) do
+  for _, session in ipairs(makima.session.live() or {}) do
     if session.status == "working" then
       return true
     end
@@ -59,36 +59,36 @@ local function publish(working)
     return
   end
   if working then
-    local _, err = maki.fs.write(heartbeat, HEARTBEAT)
+    local _, err = makima.fs.write(heartbeat, HEARTBEAT)
     if err then
-      maki.log.warn("autosleep: cannot publish heartbeat: " .. tostring(err))
+      makima.log.warn("autosleep: cannot publish heartbeat: " .. tostring(err))
     end
   else
-    maki.fs.rm(heartbeat, { force = true })
+    makima.fs.rm(heartbeat, { force = true })
   end
 end
 
 local function others_working(now)
-  for _, entry in ipairs(maki.fs.dir(dir) or {}) do
+  for _, entry in ipairs(makima.fs.dir(dir) or {}) do
     local name = entry[1]
     if name ~= token then
-      local meta = maki.fs.metadata(maki.fs.joinpath(dir, name))
+      local meta = makima.fs.metadata(makima.fs.joinpath(dir, name))
       if meta and meta.mtime and helpers.is_fresh(meta.mtime, now, STALE_SECS) then
         return true
       end
-      maki.fs.rm(maki.fs.joinpath(dir, name), { force = true })
+      makima.fs.rm(makima.fs.joinpath(dir, name), { force = true })
     end
   end
   return false
 end
 
 local function suspend_command()
-  if maki.uv.os_getenv("OS") == "Windows_NT" then
+  if makima.uv.os_getenv("OS") == "Windows_NT" then
     -- shortcut: hibernates while hibernation is enabled; `powercfg -h off`
     -- turns this into a plain sleep.
     return { "rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0" }
   end
-  if maki.fn.executable("pmset") == 1 then
+  if makima.fn.executable("pmset") == 1 then
     return { "pmset", "sleepnow" }
   end
   return { "systemctl", "suspend" }
@@ -97,16 +97,16 @@ end
 -- A command that cannot start or exits non-zero leaves the machine awake, so
 -- warn and stay disarmed instead of retrying every quiet period.
 local function suspend()
-  local ok, err = pcall(maki.fn.jobstart, suspend_command(), {
+  local ok, err = pcall(makima.fn.jobstart, suspend_command(), {
     owner = "plugin",
     on_exit = function(_, code)
       if code ~= 0 then
-        maki.log.warn("autosleep: suspend command exited with " .. code)
+        makima.log.warn("autosleep: suspend command exited with " .. code)
       end
     end,
   })
   if not ok then
-    maki.log.warn("autosleep: cannot run the suspend command: " .. tostring(err))
+    makima.log.warn("autosleep: cannot run the suspend command: " .. tostring(err))
   end
 end
 
@@ -130,23 +130,23 @@ local function tick()
   end
 end
 
-maki.timer.set(TICK_SECS, tick)
+makima.timer.set(TICK_SECS, tick)
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/autosleep",
   description = "Sleep the machine once every makima instance finishes working",
   tui_only = true,
   handler = function()
     if not dir then
-      maki.ui.flash("autosleep: state dir unavailable, cannot coordinate instances")
+      makima.ui.flash("autosleep: state dir unavailable, cannot coordinate instances")
       return
     end
     armed = not armed
     quiet_since = nil
     if armed then
-      maki.ui.flash("autosleep: sleeping after " .. opts.idle_secs .. "s of idle")
+      makima.ui.flash("autosleep: sleeping after " .. opts.idle_secs .. "s of idle")
     else
-      maki.ui.flash("autosleep: disarmed")
+      makima.ui.flash("autosleep: disarmed")
     end
   end,
 })

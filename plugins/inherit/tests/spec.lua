@@ -6,7 +6,7 @@
 
 local H = require("inherit_helpers")
 local T = require("inherit_transcripts")
-local th = require("maki.test_helpers")
+local th = require("makima.test_helpers")
 
 local case, eq = th.case, th.eq
 
@@ -164,7 +164,7 @@ case("session_jsonl_has_header_messages_meta", function()
   eq(raw[3]:sub(1, #'{"t":"meta",'), '{"t":"meta",')
   local lines = {}
   for i, line in ipairs(raw) do
-    lines[i] = maki.json.decode(line)
+    lines[i] = makima.json.decode(line)
   end
   eq(lines[1].cwd, "C:/tmp")
   eq(lines[1].id, "8AQGAut7N92awznwCnjuR")
@@ -242,7 +242,7 @@ case("preview_title_reads_the_transcript_head", function()
 end)
 
 case("preview_title_reads_a_whole_json_transcript", function()
-  local continue_json = maki.json.encode({ title = "Wire the picker", history = {} })
+  local continue_json = makima.json.encode({ title = "Wire the picker", history = {} })
   eq(T.preview_title("continue", continue_json), "Wire the picker")
   -- The same file cut short does not parse, so there is no title to show.
   eq(T.preview_title("continue", continue_json:sub(1, 20)), nil)

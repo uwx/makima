@@ -14,38 +14,38 @@ local M = {}
 M.MAX_TRANSCRIPT_BYTES = 24 * 1024 * 1024
 
 local function home()
-  return maki.uv.os_homedir()
+  return makima.uv.os_homedir()
 end
 
 local function env(name)
-  local ok, value = pcall(maki.uv.os_getenv, name)
+  local ok, value = pcall(makima.uv.os_getenv, name)
   return ok and value or nil
 end
 
 local function exists(path)
-  local ok = path and maki.fs.metadata(path)
+  local ok = path and makima.fs.metadata(path)
   return ok ~= nil
 end
 
 local function is_dir(path)
-  local meta = path and maki.fs.metadata(path)
+  local meta = path and makima.fs.metadata(path)
   return meta ~= nil and meta.is_dir == true
 end
 
 local function is_file(path)
-  local meta = path and maki.fs.metadata(path)
+  local meta = path and makima.fs.metadata(path)
   return meta ~= nil and meta.is_file == true
 end
 
 local function join(...)
-  return maki.fs.joinpath(...)
+  return makima.fs.joinpath(...)
 end
 
 local function read(path)
   if not is_file(path) then
     return nil
   end
-  return maki.fs.read(path)
+  return makima.fs.read(path)
 end
 
 local function trim(text)
@@ -57,12 +57,12 @@ local function read_json(path)
   if not text then
     return nil
   end
-  local ok, value = pcall(maki.json.decode, text)
+  local ok, value = pcall(makima.json.decode, text)
   return ok and value or nil
 end
 
 local function sorted_entries(path, kind)
-  local entries = maki.fs.dir(path)
+  local entries = makima.fs.dir(path)
   if not entries then
     return {}
   end
@@ -88,7 +88,7 @@ local function ancestors(dir)
     if exists(join(current, ".git")) then
       break
     end
-    local parent = maki.fs.dirname(current)
+    local parent = makima.fs.dirname(current)
     if not parent or parent == current then
       break
     end
@@ -138,7 +138,7 @@ local function parse_skill(path)
   local name = frontmatter:match("\nname:%s*([^\r\n]*)")
   local description = frontmatter:match("\ndescription:%s*([^\r\n]*)") or ""
   return {
-    name = unquote(name or maki.fs.basename(maki.fs.dirname(path)) or "skill"),
+    name = unquote(name or makima.fs.basename(makima.fs.dirname(path)) or "skill"),
     description = unquote(trim(description)),
     content = body,
     frontmatter = has_frontmatter and frontmatter or nil,
@@ -453,7 +453,7 @@ function M.makima_mcp_names(cwd)
       names[name] = true
     end
   end
-  local config = maki.env.config_dir()
+  local config = makima.env.config_dir()
   if config then
     add_from(join(config, "mcp.toml"))
   end
@@ -472,7 +472,7 @@ function M.rules(cwd)
   local function add(source, path, label)
     if is_file(path) and not seen[path] then
       seen[path] = true
-      out[#out + 1] = { source = source, path = path, label = label or maki.fs.basename(path) }
+      out[#out + 1] = { source = source, path = path, label = label or makima.fs.basename(path) }
     end
   end
 
@@ -518,7 +518,7 @@ function M.rules(cwd)
       add("copilot", join(root, ".github", "copilot-instructions.md"), "copilot-instructions.md")
     end
     if is_dir(join(root, ".github", "instructions")) then
-      local nested = maki.fs.dir(join(root, ".github", "instructions"), { depth = 3 })
+      local nested = makima.fs.dir(join(root, ".github", "instructions"), { depth = 3 })
       for _, entry in ipairs(nested or {}) do
         if entry[2] == "file" and entry[1]:match("%.instructions%.md$") then
           add("copilot", join(root, ".github", "instructions", entry[1]), entry[1])
@@ -712,7 +712,7 @@ function M.conversations.claude(cwd)
     for _, name in ipairs(sorted_entries(dir, "file")) do
       if name:match("%.jsonl$") then
         local path = join(dir, name)
-        local meta = maki.fs.metadata(path)
+        local meta = makima.fs.metadata(path)
         out[#out + 1] = {
           source = "claude",
           id = name:gsub("%.jsonl$", ""),
@@ -742,7 +742,7 @@ function M.conversations.codex(cwd)
         for _, name in ipairs(sorted_entries(join(root, year, month, day), "file")) do
           if name:match("%.jsonl$") then
             local path = join(root, year, month, day, name)
-            local meta = maki.fs.metadata(path)
+            local meta = makima.fs.metadata(path)
             out[#out + 1] = {
               source = "codex",
               id = name:gsub("%.jsonl$", ""),
@@ -770,7 +770,7 @@ function M.conversations.omp(cwd)
     for _, name in ipairs(sorted_entries(join(root, project_dir), "file")) do
       if name:match("%.jsonl$") then
         local path = join(root, project_dir, name)
-        local meta = maki.fs.metadata(path)
+        local meta = makima.fs.metadata(path)
         out[#out + 1] = {
           source = "omp",
           id = name:gsub("%.jsonl$", ""),
@@ -803,7 +803,7 @@ function M.conversations.gemini(cwd)
     for _, name in ipairs(sorted_entries(join(dir, "chats"), "file")) do
       if name:match("^session%-.+%.json$") then
         local path = join(dir, "chats", name)
-        local meta = maki.fs.metadata(path)
+        local meta = makima.fs.metadata(path)
         out[#out + 1] = {
           source = "gemini",
           id = name:gsub("%.json$", ""),
@@ -830,7 +830,7 @@ function M.conversations.cline(cwd)
     for _, task in ipairs(sorted_entries(root, "directory")) do
       local history = join(root, task, "ui_messages.json")
       if is_file(history) then
-        local meta = maki.fs.metadata(history)
+        local meta = makima.fs.metadata(history)
         out[#out + 1] = {
           source = "cline",
           id = task,
@@ -859,7 +859,7 @@ function M.conversations.copilot(cwd)
       for _, name in ipairs(sorted_entries(dir, "file")) do
         if name:match("%.jsonl$") or name:match("%.json$") then
           local path = join(dir, name)
-          local meta = maki.fs.metadata(path)
+          local meta = makima.fs.metadata(path)
           out[#out + 1] = {
             source = "copilot",
             id = name:gsub("%.jsonl$", ""):gsub("%.json$", ""),
@@ -886,7 +886,7 @@ function M.conversations.continue(cwd)
   for _, name in ipairs(sorted_entries(root, "file")) do
     if name:match("%.json$") and name ~= "sessions.json" then
       local path = join(root, name)
-      local meta = maki.fs.metadata(path)
+      local meta = makima.fs.metadata(path)
       local doc = read_json(path)
       out[#out + 1] = {
         source = "continue",

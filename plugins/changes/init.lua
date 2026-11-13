@@ -30,13 +30,13 @@ local function git(cwd, argv)
   for _, arg in ipairs(argv) do
     command[#command + 1] = arg
   end
-  local ok, id = pcall(maki.fn.jobstart, command, { owner = "plugin" })
+  local ok, id = pcall(makima.fn.jobstart, command, { owner = "plugin" })
   if not ok then
     return nil
   end
-  local result = maki.fn.jobwait(id, GIT_TIMEOUT_MS)
+  local result = makima.fn.jobwait(id, GIT_TIMEOUT_MS)
   if not result then
-    maki.fn.jobstop(id)
+    makima.fn.jobstop(id)
     return nil
   end
   if result.exit_code ~= 0 then
@@ -54,7 +54,7 @@ local function branch_of(cwd)
 end
 
 local function read_untracked(path)
-  local ok, text = pcall(maki.fs.read, path)
+  local ok, text = pcall(makima.fs.read, path)
   if not ok or type(text) ~= "string" then
     return ""
   end
@@ -170,13 +170,13 @@ local function handle_key(state, key)
 end
 
 local function open()
-  local cwd = maki.uv.cwd()
+  local cwd = makima.uv.cwd()
   if not cwd then
-    maki.ui.flash(NO_CWD)
+    makima.ui.flash(NO_CWD)
     return
   end
-  local buf = maki.ui.buf()
-  local win = maki.ui.open_win(buf, {
+  local buf = makima.ui.buf()
+  local win = makima.ui.open_win(buf, {
     split = "right",
     width = PANEL_WIDTH,
     title = " Changes ",
@@ -221,7 +221,7 @@ local function toggle()
   end
 end
 
-maki.api.create_autocmd("ToolDone", {
+makima.api.create_autocmd("ToolDone", {
   callback = function()
     if not panel then
       return
@@ -232,11 +232,11 @@ maki.api.create_autocmd("ToolDone", {
   end,
 })
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/changes",
   description = "Show the working tree changes and their diff",
   tui_only = true,
   handler = toggle,
 })
 
-maki.keymap.set("n", "<C-g>", toggle, { desc = "Toggle changes panel" })
+makima.keymap.set("n", "<C-g>", toggle, { desc = "Toggle changes panel" })

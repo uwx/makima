@@ -11,7 +11,7 @@ local ERROR_BODY_TRUNCATED = "\n[response body truncated]"
 local RETRY_AFTER_HEADER = "retry-after"
 local CONTENT_TYPE = "Content-Type"
 local JSON_TYPE = "application/json"
--- How `maki.net.send` reports a connection never made and a stalled read.
+-- How `makima.net.send` reports a connection never made and a stalled read.
 local CONNECT_FAILED = "could not connect"
 local IDLE_TIMEOUT = "idle timeout"
 
@@ -27,15 +27,16 @@ function M.config_error(message)
   return { kind = M.CONFIG_KIND, message = message }
 end
 
--- The text of an error, whether a string or a table.
+-- The text of an error, whether a string, a table, or a host value such as
+-- an mlua error userdata.
 function M.message(err)
-  return type(err) == "table" and err.message or err
+  return tostring(type(err) == "table" and err.message or err)
 end
 
 -- {err} with the retry class the host reads. A table that names one, and a
 -- config error, stay as they are. A status names it through
 -- `codec.status_retry`; anything else is a transport failure, classed by
--- the `maki.net.send` text it carries, even inside a provider's own words:
+-- the `makima.net.send` text it carries, even inside a provider's own words:
 -- a connection never made, a stalled read, or else a transient failure.
 function M.classify(err)
   if type(err) ~= "table" then
@@ -76,7 +77,7 @@ end
 
 local function env_keys(env_var)
   local keys = {}
-  for part in (maki.uv.os_getenv(env_var) or ""):gmatch("[^,]+") do
+  for part in (makima.uv.os_getenv(env_var) or ""):gmatch("[^,]+") do
     local key = trim(part)
     if key ~= "" then
       keys[#keys + 1] = key
@@ -138,7 +139,7 @@ function M.key_pool(keys)
   }
 end
 
--- Expands `${VAR}` from the environment, like `maki_config::expand_env`. An
+-- Expands `${VAR}` from the environment, like `makima_config::expand_env`. An
 -- unset or empty variable returns nil plus its name. An unterminated `${`
 -- stays literal.
 function M.expand_env(value)
@@ -150,7 +151,7 @@ function M.expand_env(value)
       break
     end
     local name = value:sub(start + 2, finish - 1)
-    local replacement = maki.uv.os_getenv(name)
+    local replacement = makima.uv.os_getenv(name)
     if not replacement or replacement == "" then
       return nil, name
     end
@@ -268,7 +269,7 @@ function M.post_stream(ctx, url, headers, body, stream, emit)
   headers = table.clone(headers)
   M.set_header(headers, CONTENT_TYPE, JSON_TYPE)
   local response, err =
-    M.send(ctx, { url = url, method = "POST", headers = headers, body = assert(maki.json.encode(body)) })
+    M.send(ctx, { url = url, method = "POST", headers = headers, body = assert(makima.json.encode(body)) })
   if not response then
     return nil, err
   end
@@ -304,7 +305,7 @@ function M.read_json(response, max_bytes)
   if not body then
     return nil, err
   end
-  local value, decode_err = maki.json.decode(body)
+  local value, decode_err = makima.json.decode(body)
   if decode_err then
     return nil, "invalid JSON response: " .. decode_err
   end

@@ -1,6 +1,6 @@
 local cliproxyapi = require("providers.cliproxyapi")
 local http = require("providers.http")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local ROOT = "http://127.0.0.1:8317"
 local BASE = ROOT .. "/v1"
@@ -30,7 +30,7 @@ local function sse()
 end
 
 local function json(value)
-  return t.response({ assert(maki.json.encode(value)) })
+  return t.response({ assert(makima.json.encode(value)) })
 end
 
 local function request(thinking)
@@ -104,7 +104,7 @@ t.case("discovery_asks_for_a_client_version", function()
   t.with_env({ CLIPROXYAPI_API_KEY = "k" }, function()
     models = spec.discover(ctx, {})
   end)
-  t.eq(ctx.requests[1].url, BASE .. "/models?client_version=maki")
+  t.eq(ctx.requests[1].url, BASE .. "/models?client_version=makima")
   t.eq(ctx.requests[1].headers.Authorization, "Bearer k")
   t.eq(#models, 1)
   t.eq(models[1].id, MODEL_ID)
@@ -116,7 +116,7 @@ t.case("discovery_reads_the_plain_shape_and_sorts", function()
   t.with_env({}, function()
     models = spec.discover(ctx, { base_url = ROOT })
   end)
-  t.eq(ctx.requests[1].url, BASE .. "/models?client_version=maki")
+  t.eq(ctx.requests[1].url, BASE .. "/models?client_version=makima")
   t.eq(models[1].id, "a")
   t.eq(models[2].id, "b")
 end)
@@ -151,24 +151,24 @@ end)
 t.case("the_advertised_ladder_caps_the_effort_sent", function()
   local model = cliproxyapi.parse_model(RICH.models[1])
   local function effort(thinking)
-    return maki.json.decode(sent({ CLIPROXYAPI_API_KEY = "k" }, {}, thinking, model).body).reasoning_effort
+    return makima.json.decode(sent({ CLIPROXYAPI_API_KEY = "k" }, {}, thinking, model).body).reasoning_effort
   end
   t.eq(effort({ kind = "adaptive" }), "high")
   t.eq(effort({ kind = "effort", level = "max" }), "max")
   t.eq(effort({ kind = "off" }), nil)
   local low = cliproxyapi.parse_model({ slug = MODEL_ID, supported_reasoning_levels = { { effort = "low" } } })
-  local body = maki.json.decode(sent({ CLIPROXYAPI_API_KEY = "k" }, {}, { kind = "adaptive" }, low).body)
+  local body = makima.json.decode(sent({ CLIPROXYAPI_API_KEY = "k" }, {}, { kind = "adaptive" }, low).body)
   t.eq(body.reasoning_effort, "low")
 end)
 
 t.case("an_unknown_model_takes_the_shared_ladder", function()
   local model = { id = MODEL_ID, supports_thinking = true }
-  local body = maki.json.decode(sent({ CLIPROXYAPI_API_KEY = "k" }, {}, { kind = "adaptive" }, model).body)
+  local body = makima.json.decode(sent({ CLIPROXYAPI_API_KEY = "k" }, {}, { kind = "adaptive" }, model).body)
   t.eq(body.reasoning_effort, "high")
 end)
 
 t.case("thinking_is_not_sent_to_models_that_lack_it", function()
-  local body = maki.json.decode(sent({ CLIPROXYAPI_API_KEY = "k" }, {}, { kind = "adaptive" }).body)
+  local body = makima.json.decode(sent({ CLIPROXYAPI_API_KEY = "k" }, {}, { kind = "adaptive" }).body)
   t.eq(body.reasoning_effort, nil)
   t.eq(body.max_tokens, 16384)
   t.eq(body.stream_options.include_usage, true)

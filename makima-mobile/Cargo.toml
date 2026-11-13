@@ -1,0 +1,30 @@
+[package]
+name = "makima-mobile"
+description = "makima on a phone, drawn with GPUI"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "makima_mobile"
+crate-type = ["cdylib"]
+
+[dependencies]
+log = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+gpui = { workspace = true }
+gpui-kit = { workspace = true }
+gpui-mobile = { workspace = true }
+makima-acp-client = { workspace = true }
+makima-chat = { workspace = true }
+serde = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { workspace = true }
+android_logger = { workspace = true }

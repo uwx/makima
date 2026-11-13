@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
-use maki_acp_client::{
+use makima_acp_client::{
     Connection, ContentBlock, Event, PermissionOption, PermissionPrompt, PickOutcome, PickPrompt,
     SessionUpdate, StopReason, Target, ToolCallStatus,
 };
-use maki_lan::discovery::{Browser, Discovered, Found};
-use maki_storage::StateDir;
-use maki_ui::{SharedSession, pick_shared_session};
+use makima_lan::discovery::{Browser, Discovered, Found};
+use makima_storage::StateDir;
+use makima_ui::{SharedSession, pick_shared_session};
 
 use crate::cli::Cli;
 use crate::cmd::tui;
@@ -61,14 +61,14 @@ pub fn run(
     };
     let token = token_for(token, &storage)?;
     let target = Target::lan(&with_scheme(&link), Some(&token)).map_err(|error| eyre!(error))?;
-    let connection = maki_acp_client::connect(&target).map_err(|error| eyre!(error))?;
+    let connection = makima_acp_client::connect(&target).map_err(|error| eyre!(error))?;
     if interactive {
         let label = target.label().to_owned();
         let cwd = std::env::current_dir().context(CWD_ERR)?;
         return tui::run(
             cli,
             cwd,
-            Some(maki_ui::RemoteSession {
+            Some(makima_ui::RemoteSession {
                 connection,
                 label,
                 owned: false,
@@ -97,7 +97,7 @@ fn choose(given: &Option<String>, interactive: bool) -> Result<Option<(String, O
         Some(token) => Some(token.clone()),
         None => ask_token()?,
     };
-    Ok(Some((maki_lan::link(session.address), token)))
+    Ok(Some((makima_lan::link(session.address), token)))
 }
 
 /// The announced session the user names: a full-screen pick on a terminal that
@@ -196,15 +196,15 @@ fn token_for(flag: Option<String>, storage: &StateDir) -> Result<String> {
     if let Some(token) = flag {
         return Ok(token);
     }
-    maki_lan::token(storage.path()).context("read the LAN token")
+    makima_lan::token(storage.path()).context("read the LAN token")
 }
 
 /// A pasted `host:port` reaches the same place as a full link.
 fn with_scheme(link: &str) -> String {
-    if link.starts_with(maki_lan::LINK_SCHEME) {
+    if link.starts_with(makima_lan::LINK_SCHEME) {
         link.to_owned()
     } else {
-        format!("{}{link}", maki_lan::LINK_SCHEME)
+        format!("{}{link}", makima_lan::LINK_SCHEME)
     }
 }
 
@@ -244,7 +244,7 @@ impl Session {
         let mut printer = Printer::new();
         let mut attached = format!(
             "attached to session {}",
-            maki_acp_client::short_session(&connection.session)
+            makima_acp_client::short_session(&connection.session)
         );
         if !connection.model.is_empty() {
             attached.push_str(&format!(" on {}", connection.model));
@@ -294,7 +294,7 @@ impl Session {
         let prompt = text.to_owned();
         let (finished, finish) = flume::bounded(1);
         thread::Builder::new()
-            .name("maki-attach-prompt".into())
+            .name("makima-attach-prompt".into())
             .spawn(move || {
                 let _ = finished.send(client.prompt(&prompt));
             })

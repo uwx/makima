@@ -23,8 +23,8 @@ local UNTITLED = "(untitled)"
 local NO_PROJECT = "project not recorded"
 
 local function flash(msg)
-  maki.ui.flash(msg)
-  maki.log.info(msg)
+  makima.ui.flash(msg)
+  makima.log.info(msg)
 end
 
 -- A command or keymap invocation may have no agent target, so fall back to the
@@ -36,7 +36,7 @@ local function cwd_of(ctx)
       return dir
     end
   end
-  return maki.uv.cwd()
+  return makima.uv.cwd()
 end
 
 -- The model an imported session records. A command may run with no agent, and
@@ -126,19 +126,19 @@ end
 
 -- A block already there is replaced, so re-running is idempotent.
 local function import_rule(rule)
-  local dir = maki.env.config_dir()
+  local dir = makima.env.config_dir()
   if not dir then
     return nil, "cannot resolve makima config dir"
   end
-  local text, err = maki.fs.read(rule.path)
+  local text, err = makima.fs.read(rule.path)
   if not text then
     return nil, "read error: " .. tostring(err)
   end
   if #text > MAX_RULE_BYTES then
     return nil, "larger than " .. MAX_RULE_BYTES .. " bytes"
   end
-  local path = maki.fs.joinpath(dir, RULE_FILE)
-  local existing = maki.fs.read(path) or ""
+  local path = makima.fs.joinpath(dir, RULE_FILE)
+  local existing = makima.fs.read(path) or ""
   local marker = IMPORT_MARKER .. rule.path .. " -->"
   local block = marker .. "\n" .. text:gsub("%s+$", "") .. "\n<!-- /imported -->\n"
   local start_at = existing:find(marker, 1, true)
@@ -153,8 +153,8 @@ local function import_rule(rule)
   else
     existing = existing .. (existing == "" and "" or "\n") .. block
   end
-  maki.fs.mkdir(dir, { parents = true })
-  local ok, werr = maki.fs.atomic_write(path, existing)
+  makima.fs.mkdir(dir, { parents = true })
+  local ok, werr = makima.fs.atomic_write(path, existing)
   if not ok then
     return nil, "write error: " .. tostring(werr)
   end
@@ -164,8 +164,8 @@ end
 -- Skills go to `<project>/.claude/skills/<name>/SKILL.md`, a tree makima's own
 -- skill tool already scans. Source frontmatter is kept as it was.
 local function import_skill(skill, cwd)
-  local target = maki.fs.joinpath(cwd, PROJECT_SKILL_DIR, skill.name, "SKILL.md")
-  if maki.fs.metadata(target) then
+  local target = makima.fs.joinpath(cwd, PROJECT_SKILL_DIR, skill.name, "SKILL.md")
+  if makima.fs.metadata(target) then
     return nil, "already exists"
   end
   local body = skill.content
@@ -179,9 +179,9 @@ local function import_skill(skill, cwd)
   elseif not skill.frontmatter:match("\ndescription:") and skill.description ~= "" then
     body = "---\n" .. skill.frontmatter .. "\ndescription: " .. skill.description .. "\n---\n" .. body
   end
-  local ok, err = maki.fs.mkdir(maki.fs.dirname(target), { parents = true })
+  local ok, err = makima.fs.mkdir(makima.fs.dirname(target), { parents = true })
   if ok then
-    ok, err = maki.fs.atomic_write(target, body)
+    ok, err = makima.fs.atomic_write(target, body)
   end
   if not ok then
     return nil, "write error: " .. tostring(err)
@@ -196,20 +196,20 @@ local function import_memory(memory)
   if not ok then
     return nil, "memory plugin is disabled"
   end
-  local state = maki.env.state_dir()
+  local state = makima.env.state_dir()
   if not state then
     return nil, "cannot resolve makima state dir"
   end
-  local root = maki.fs.root(maki.uv.cwd(), ".git") or maki.uv.cwd()
-  local memories = maki.fs.joinpath(state, "projects", helpers.project_id(root), "memories")
+  local root = makima.fs.root(makima.uv.cwd(), ".git") or makima.uv.cwd()
+  local memories = makima.fs.joinpath(state, "projects", helpers.project_id(root), "memories")
   local name = memory.name:gsub("[^%w%-_]", "-"):sub(1, 60) .. ".md"
-  local path = maki.fs.joinpath(memories, name)
-  if maki.fs.metadata(path) then
+  local path = makima.fs.joinpath(memories, name)
+  if makima.fs.metadata(path) then
     return nil, "already exists"
   end
-  maki.fs.mkdir(memories, { parents = true })
+  makima.fs.mkdir(memories, { parents = true })
   local content = helpers.encode_frontmatter({ "imported" }) .. memory.content
-  local wok, err = maki.fs.atomic_write(path, content)
+  local wok, err = makima.fs.atomic_write(path, content)
   if not wok then
     return nil, "write error: " .. tostring(err)
   end
@@ -217,8 +217,8 @@ local function import_memory(memory)
 end
 
 local function sessions_dir()
-  local state = maki.env.state_dir()
-  return state and maki.fs.joinpath(state, "sessions")
+  local state = makima.env.state_dir()
+  return state and makima.fs.joinpath(state, "sessions")
 end
 
 -- Writes one converted transcript as a fresh session and returns its id. The
@@ -238,15 +238,15 @@ local function import_conversation(conversation, cwd, model, require_project)
     return nil, "cannot resolve makima state dir"
   end
   local id = session_id_for(conversation.path)
-  local target = maki.fs.joinpath(dir, id .. ".jsonl")
-  if maki.fs.metadata(target) then
+  local target = makima.fs.joinpath(dir, id .. ".jsonl")
+  if makima.fs.metadata(target) then
     return nil, "already imported"
   end
-  local text, err = maki.fs.read(conversation.path)
+  local text, err = makima.fs.read(conversation.path)
   if not text then
     return nil, "read error: " .. tostring(err)
   end
-  maki.fs.mkdir(dir, { parents = true })
+  makima.fs.mkdir(dir, { parents = true })
   local converted = convert(text) or {}
   -- Gemini keeps the project beside the transcript rather than inside it, so a
   -- scan that found one hands it over.
@@ -258,7 +258,7 @@ local function import_conversation(conversation, cwd, model, require_project)
   if not jsonl then
     return nil, title
   end
-  local ok, werr = maki.fs.atomic_write(target, jsonl)
+  local ok, werr = makima.fs.atomic_write(target, jsonl)
   if not ok then
     return nil, "write error: " .. tostring(werr)
   end
@@ -301,22 +301,22 @@ local function import_mcp(servers)
   if #servers == 0 then
     return nil, "no new MCP servers found"
   end
-  local dir = maki.env.config_dir()
+  local dir = makima.env.config_dir()
   if not dir then
     return nil, "cannot resolve makima config dir"
   end
-  local path = maki.fs.joinpath(dir, "mcp.toml")
+  local path = makima.fs.joinpath(dir, "mcp.toml")
   local by_name = {}
   for _, server in ipairs(servers) do
     by_name[server.name] = server
   end
-  local existing = maki.fs.read(path) or ""
+  local existing = makima.fs.read(path) or ""
   local merged, added = H.merge_mcp_toml(existing, by_name)
   if #added == 0 then
     return nil, "already configured"
   end
-  maki.fs.mkdir(dir, { parents = true })
-  local ok, err = maki.fs.atomic_write(path, merged)
+  makima.fs.mkdir(dir, { parents = true })
+  local ok, err = makima.fs.atomic_write(path, merged)
   if not ok then
     return nil, "write error: " .. tostring(err)
   end
@@ -417,7 +417,7 @@ end
 
 local function pick_and_apply(cwd, items, apply, describe)
   if #items == 0 then
-    maki.ui.flash("Nothing to inherit here")
+    makima.ui.flash("Nothing to inherit here")
     return
   end
   local rows = {}
@@ -429,7 +429,7 @@ local function pick_and_apply(cwd, items, apply, describe)
       age = item.age,
     }
   end
-  local event = maki.ui.open_list_picker(rows, {
+  local event = makima.ui.open_list_picker(rows, {
     title = " Import ",
     footer = { { "Enter", "import" }, { "Esc", "close" } },
   })
@@ -461,12 +461,12 @@ local SUBCOMMANDS = {
     if summary:find("mcp: %d+ added") then
       summary = summary .. ". Restart makima to connect the new MCP servers"
     end
-    maki.log.info("inherit all: " .. summary)
+    makima.log.info("inherit all: " .. summary)
     flash(summary)
   end,
   conversations = function(_, model)
     local summary = import_every_conversation(model)
-    maki.log.info("inherit conversations: " .. summary)
+    makima.log.info("inherit conversations: " .. summary)
     flash(summary)
   end,
 }
@@ -480,7 +480,7 @@ local function run_picker(cwd, model)
     { label = "Memories (" .. #plan.memories .. ")", detail = "Claude Code project memories" },
     { label = "Conversations (" .. #plan.conversations .. ")", detail = "import as resumable sessions" },
   }
-  local event = maki.ui.open_list_picker(items, {
+  local event = makima.ui.open_list_picker(items, {
     title = " Inherit from other harnesses ",
     footer = { { "Enter", "choose" }, { "Esc", "close" } },
   })
@@ -512,9 +512,9 @@ local function run_picker(cwd, model)
     -- The label is the title the imported session will carry, read from the
     -- transcript's head; the id is a UUID and says nothing about the chat.
     for _, conversation in ipairs(plan.conversations) do
-      local head = maki.fs.read_head(conversation.path, PREVIEW_BYTES)
+      local head = makima.fs.read_head(conversation.path, PREVIEW_BYTES)
       conversation.label = (head and T.preview_title(conversation.source, head)) or UNTITLED
-      conversation.age = conversation.mtime > 0 and maki.time.at(math.floor(conversation.mtime)) or nil
+      conversation.age = conversation.mtime > 0 and makima.time.at(math.floor(conversation.mtime)) or nil
     end
     pick_and_apply(cwd, plan.conversations, function(conversation)
       return import_conversation(conversation, cwd, model)
@@ -524,7 +524,7 @@ local function run_picker(cwd, model)
   end
 end
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/inherit",
   description = "Import rules, skills, MCP servers, memories and conversations left by other coding harnesses",
   tui_only = true,
@@ -561,7 +561,7 @@ maki.api.register_command({
 
 -- -- model-facing tool -------------------------------------------------------
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "inherit",
   kind = "read",
   description = "Discover and import configuration and history left on this machine by other coding agents (Claude Code, Cursor, Windsurf, Gemini CLI, Codex, Cline, Copilot Chat, oh-my-pi, Continue).\n\n"
